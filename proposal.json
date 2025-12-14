@@ -1,0 +1,154 @@
+{
+  "system_name": "LLM-Assisted 0DTE Options Auto-Trading",
+  "version": "1.0",
+  "objective": "Safely automate 0DTE options trading by combining deterministic indicator-based entries with LLM-based alert interpretation, context awareness, and risk control.",
+  "target_instruments": ["SPXW_0DTE", "SPY_0DTE"],
+  "broker": "Interactive Brokers",
+  "execution_mode": "Paper trading first, then live with micro size",
+
+  "core_principles": [
+    "Indicators decide entries; LLM never decides entries or exits.",
+    "LLM is used only for parsing alerts, labeling events, and adding conservative constraints.",
+    "All execution is deterministic and rule-based.",
+    "LLM can only reduce risk, never increase it.",
+    "Any ambiguity, parsing failure, or rule violation results in NO TRADE."
+  ],
+
+  "architecture": {
+    "flow": [
+      "Discord alerts / indicator signals",
+      "LLM parses each message into structured Event JSON",
+      "Event is linked to an existing TradeSession (stateful)",
+      "Risk gate validates session + event",
+      "Order planner builds deterministic orders",
+      "IBKR API executes (paper or live)"
+    ],
+    "llm_position": "Pre-execution only, never in hot execution path"
+  },
+
+  "components": {
+    "indicator_engine": {
+      "role": "Generate deterministic entry signals",
+      "indicators": ["VWAP", "EMA20", "EMA50", "ATR", "ORH_ORL", "RSI2"],
+      "outputs": "Structured entry signals only"
+    },
+    "llm_parser": {
+      "role": "Convert unstructured Discord messages into structured events",
+      "temperature": 0,
+      "failure_policy": "Schema failure or ambiguity => NO TRADE"
+    },
+    "risk_gate": {
+      "role": "Final deterministic approval before execution",
+      "checks": [
+        "Daily max loss",
+        "Loss streak limit",
+        "Time-of-day filters",
+        "Economic event blocks",
+        "Bid-ask spread thresholds",
+        "Max contracts",
+        "Max adds per trade"
+      ]
+    },
+    "execution_engine": {
+      "role": "Place and manage trades",
+      "rules": [
+        "Limit orders only",
+        "Bracket/OCO required",
+        "Idempotent order submission",
+        "Kill switch enforced"
+      ]
+    }
+  },
+
+  "trade_session_model": {
+    "description": "Each trade idea is a stateful session composed of multiple message events.",
+    "session_lifecycle": ["PENDING", "OPEN", "CLOSED", "CANCELLED"],
+    "correlation_rules": [
+      "Same author",
+      "Same underlying (SPY/SPX)",
+      "Same direction (CALL/PUT)",
+      "Same trading day",
+      "Most recent open session wins"
+    ]
+  },
+
+  "event_types": {
+    "NEW": "Initial trade idea",
+    "PLAN": "Intent or permission (e.g., may average down later)",
+    "ADD": "Explicit scale-in or average-down action",
+    "TARGETS": "Profit targets",
+    "TRIM": "Partial exit",
+    "MOVE_STOP": "Tighten stop",
+    "TP": "Target hit",
+    "SL": "Stop hit",
+    "EXIT": "Close entire position",
+    "CANCEL": "Invalidate trade before entry",
+    "RISK_NOTE": "Contextual warning or commentary",
+    "IGNORE": "Chatter or irrelevant message"
+  },
+
+  "example_thread_interpretation": {
+    "message_1": "Parsed as NEW (SPY 685 CALL, entry 0.43, HIGH_RISK)",
+    "message_2": "Parsed as PLAN (averaging allowed only if explicitly announced)",
+    "message_3": "Parsed as TARGETS (underlying price targets 684, 685)",
+    "message_4": "Parsed as RISK_NOTE (theta risk reminder)",
+    "important_rule": "PLAN does NOT trigger execution; only explicit ADD messages do"
+  },
+
+  "averaging_down_policy": {
+    "allowed_only_if": [
+      "Explicit ADD message received",
+      "Max adds not exceeded",
+      "Total risk remains within cap",
+      "Underlying invalidation not broken",
+      "Within defined time window",
+      "Risk state is not RED"
+    ],
+    "disallowed": [
+      "Rescue martingale behavior",
+      "Unlimited averaging",
+      "Adds after stop invalidation"
+    ],
+    "default_max_adds": 1
+  },
+
+  "risk_parameters": {
+    "risk_per_trade_percent": {
+      "min": 0.25,
+      "max": 0.5
+    },
+    "daily_max_loss_percent": {
+      "min": 1.0,
+      "max": 2.0
+    },
+    "starting_max_contracts": 1,
+    "high_risk_tag_effect": "Further reduce size or block if conditions poor"
+  },
+
+  "account_guidelines": {
+    "spy_minimum": "10000-15000 USD",
+    "spxw_minimum": "25000 USD",
+    "recommended_comfortable": "40000+ USD"
+  },
+
+  "paper_trading_policy": {
+    "required": true,
+    "goals": [
+      "Validate alert parsing",
+      "Validate session state transitions",
+      "Ensure brackets always attach",
+      "Verify kill switch and shutdown behavior"
+    ],
+    "known_limitations": [
+      "Optimistic fills",
+      "Underestimated slippage"
+    ]
+  },
+
+  "global_fail_safe": {
+    "rule": "Any error, ambiguity, missing field, or rule violation results in NO TRADE",
+    "priority": "Highest"
+  },
+
+  "one_sentence_summary": "This system uses indicators for precision, an LLM for structured understanding and restraint, and deterministic rules for execution to safely automate 0DTE options trading."
+}

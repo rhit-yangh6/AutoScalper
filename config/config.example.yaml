@@ -1,0 +1,63 @@
+# Example configuration file for AutoScalper
+
+system:
+  name: "LLM-Assisted 0DTE Options Auto-Trading"
+  version: "1.0"
+  paper_mode: true  # ALWAYS start with paper trading
+
+llm:
+  provider: "anthropic"
+  model: "claude-opus-4-5-20251101"
+  temperature: 0.0
+  max_tokens: 1024
+
+discord:
+  # Your Discord user token (see GET_DISCORD_TOKEN.md)
+  user_token: "${DISCORD_USER_TOKEN}"
+  # Channel IDs to monitor (right-click channel, Copy ID)
+  channel_ids:
+    - 123456789
+    - 987654321
+  # Only monitor these users (leave empty to monitor all)
+  monitored_users:
+    - "trader_username_1"
+    - "trader_username_2"
+
+ibkr:
+  host: "127.0.0.1"
+  port: 7497  # 7497 for paper, 7496 for live
+  client_id: 1
+
+risk:
+  account_balance: 10000.0
+
+  # Position sizing
+  risk_per_trade_percent: 0.5  # 0.5% of account per trade
+  max_contracts: 1
+
+  # Daily limits
+  daily_max_loss_percent: 2.0  # Stop trading if down 2%
+  max_loss_streak: 3  # Stop after 3 consecutive losses
+
+  # Adds/averaging
+  max_adds_per_trade: 1
+
+  # Trading hours (UTC)
+  trading_hours_start: "13:30"  # 9:30 AM ET
+  trading_hours_end: "20:00"    # 4:00 PM ET
+
+  # Execution quality
+  max_bid_ask_spread_percent: 10.0
+
+  # Risk level adjustments
+  high_risk_size_reduction: 0.5      # 50% size for HIGH risk
+  extreme_risk_size_reduction: 0.25  # 25% size for EXTREME risk
+
+logging:
+  level: "INFO"
+  file: "logs/autoscalper.log"
+
+monitoring:
+  enable_alerts: true
+  alert_on_rejection: true
+  alert_on_execution: true
