@@ -20,6 +20,9 @@ pytz>=2023.3
 # Logging and monitoring
 structlog>=23.1.0
 
+# Notifications
+aiohttp>=3.9.0
+
 # Configuration
 pyyaml>=6.0
 

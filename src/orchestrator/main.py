@@ -1,6 +1,6 @@
 import asyncio
 import os
-from datetime import datetime
+from datetime import datetime, time
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from ..discord_listener import DiscordListener
 from .session_manager import SessionManager
 from ..models import Event, EventType
 from ..logging import init_logger, get_logger
+from ..notifications import init_notifier, get_notifier
 
 
 class TradingOrchestrator:
@@ -36,6 +37,19 @@ class TradingOrchestrator:
         log_dir = config.get("log_dir", "logs")
         self.logger = init_logger(base_dir=log_dir)
         print(f"Logger initialized (log_dir={log_dir})")
+
+        # Initialize Telegram notifier
+        telegram_config = config.get("telegram", {})
+        if telegram_config.get("enabled", False):
+            self.notifier = init_notifier(
+                bot_token=telegram_config.get("bot_token", ""),
+                chat_id=telegram_config.get("chat_id", ""),
+                enabled=True,
+            )
+            print("Telegram notifications enabled")
+        else:
+            self.notifier = None
+            print("Telegram notifications disabled")
 
         self.parser = LLMParser(
             api_key=config["anthropic_api_key"],
@@ -80,16 +94,24 @@ class TradingOrchestrator:
 
         self.running = True
 
-        # Connect to IBKR
-        print("Connecting to IBKR...")
-        connected = await self.executor.connect()
-        if not connected:
-            print("ERROR: Failed to connect to IBKR. Exiting.")
-            return
+        # Connect to IBKR (only if not in paper mode)
+        if not self.paper_mode:
+            print("Connecting to IBKR...")
+            connected = await self.executor.connect()
+            if not connected:
+                print("ERROR: Failed to connect to IBKR. Exiting.")
+                return
+        else:
+            print("Skipping IBKR connection (paper mode - no orders will be sent)")
 
         # Start Discord listener
         print("Starting Discord listener...")
         asyncio.create_task(self.discord_listener.start())
+
+        # Start daily summary task if Telegram enabled
+        if self.notifier:
+            print("Starting daily summary scheduler...")
+            asyncio.create_task(self._daily_summary_task())
 
         # Keep running
         try:
@@ -106,13 +128,64 @@ class TradingOrchestrator:
         self.running = False
 
         await self.discord_listener.stop()
-        await self.executor.disconnect()
+
+        # Only disconnect from IBKR if we connected
+        if not self.paper_mode:
+            await self.executor.disconnect()
 
         # Flush all logs
         print("Flushing logs...")
         self.logger.flush_all()
 
         print("Orchestrator stopped.")
+
+    async def _daily_summary_task(self):
+        """
+        Background task that sends daily summary after trading hours end.
+
+        Uses TRADING_HOURS_END from config (default: 20:00 UTC = 4:00 PM ET)
+        """
+        summary_time_str = self.config["risk"]["trading_hours_end"]
+        try:
+            hour, minute = map(int, summary_time_str.split(":"))
+            summary_time = time(hour=hour, minute=minute)
+        except:
+            # Default to 8 PM UTC (4 PM ET)
+            summary_time = time(hour=20, minute=0)
+
+        print(f"Daily summary will be sent at {summary_time_str} UTC (after trading hours close)")
+
+        while self.running:
+            now = datetime.utcnow()
+            target_time = datetime.combine(now.date(), summary_time)
+
+            # If target time already passed today, schedule for tomorrow
+            if now > target_time:
+                from datetime import timedelta
+                target_time += timedelta(days=1)
+
+            # Calculate seconds until target time
+            seconds_until_summary = (target_time - now).total_seconds()
+
+            # Wait until summary time
+            await asyncio.sleep(seconds_until_summary)
+
+            # Send daily summary
+            if self.running and self.notifier:
+                try:
+                    print(f"\nSending daily summary at {datetime.utcnow().strftime('%H:%M:%S UTC')}...")
+
+                    # Get all sessions for today
+                    all_sessions = list(self.session_manager.sessions.values())
+
+                    await self.notifier.send_daily_summary(all_sessions)
+
+                    print("✓ Daily summary sent")
+                except Exception as e:
+                    print(f"✗ Failed to send daily summary: {e}")
+
+            # Wait a bit to avoid sending multiple times
+            await asyncio.sleep(60)
 
     async def on_discord_message(
         self, message: str, author: str, message_id: str, timestamp: datetime
@@ -249,6 +322,15 @@ class TradingOrchestrator:
                     order_details=order_details,
                 )
 
+                # Send Telegram notification for order submission
+                if self.notifier:
+                    await self.notifier.notify_order_submitted(
+                        session=session,
+                        event_type=event.event_type,
+                        order_details=order_details,
+                        paper_mode=True,
+                    )
+
                 # Log simulated result
                 from ..execution.executor import OrderResult, OrderStatus
                 simulated_result = OrderResult(
@@ -262,6 +344,15 @@ class TradingOrchestrator:
                     event_type=event.event_type,
                     result=simulated_result,
                 )
+
+                # Send Telegram notification for order fill
+                if self.notifier:
+                    await self.notifier.notify_order_filled(
+                        session=session,
+                        event_type=event.event_type,
+                        result=simulated_result,
+                        paper_mode=True,
+                    )
             else:
                 # Log order submission
                 order_details = {
@@ -280,6 +371,15 @@ class TradingOrchestrator:
                     order_details=order_details,
                 )
 
+                # Send Telegram notification for order submission
+                if self.notifier:
+                    await self.notifier.notify_order_submitted(
+                        session=session,
+                        event_type=event.event_type,
+                        order_details=order_details,
+                        paper_mode=False,
+                    )
+
                 # Execute the order
                 result = await self.executor.execute_event(
                     event=event,
@@ -293,6 +393,15 @@ class TradingOrchestrator:
                     event_type=event.event_type,
                     result=result,
                 )
+
+                # Send Telegram notification for order fill
+                if self.notifier:
+                    await self.notifier.notify_order_filled(
+                        session=session,
+                        event_type=event.event_type,
+                        result=result,
+                        paper_mode=False,
+                    )
 
                 if result.success:
                     print(f"✓ Order executed successfully")
@@ -376,6 +485,11 @@ async def main():
             "risk_reward_ratio": float(
                 os.getenv("RISK_REWARD_RATIO", "2.0")
             ),
+        },
+        "telegram": {
+            "enabled": os.getenv("TELEGRAM_ENABLED", "false").lower() == "true",
+            "bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            "chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
         },
         "paper_mode": os.getenv("PAPER_MODE", "true").lower() == "true",
     }
