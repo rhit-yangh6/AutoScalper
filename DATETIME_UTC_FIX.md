@@ -54,6 +54,26 @@ from datetime import datetime, timezone
 ✅ **Best practice** - Follows modern Python standards
 ✅ **No functional change** - Same behavior, just proper API
 
+## Additional Fix: Timezone Awareness Mismatch
+
+After initial fix, encountered error:
+```
+TypeError: can't compare offset-naive and offset-aware datetimes
+```
+
+**Cause:** `datetime.combine()` creates naive datetime by default
+
+**Fix:**
+```python
+# Before (causes error)
+target_time = datetime.combine(now.date(), summary_time)
+
+# After (timezone-aware)
+target_time = datetime.combine(now.date(), summary_time, tzinfo=timezone.utc)
+```
+
+**Location:** `src/orchestrator/main.py:165`
+
 ## Verification
 
 All files compile without syntax errors:
@@ -66,6 +86,11 @@ No remaining deprecated calls:
 ```bash
 grep -r "datetime\.utcnow()" src/
 # No results ✓
+```
+
+No timezone mismatch errors:
+```bash
+# Daily summary task now works correctly ✓
 ```
 
 ## Deployment

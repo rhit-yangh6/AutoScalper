@@ -162,7 +162,7 @@ class TradingOrchestrator:
 
         while self.running:
             now = datetime.now(timezone.utc)
-            target_time = datetime.combine(now.date(), summary_time)
+            target_time = datetime.combine(now.date(), summary_time, tzinfo=timezone.utc)
 
             # If target time already passed today, schedule for tomorrow
             if now > target_time:
