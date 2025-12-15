@@ -186,6 +186,9 @@
   },
   "active": "b98d20507c559b6f",
   "lastOpenFiles": [
+    "TELEGRAM_COMMANDS.md",
+    "TARGET_STRATEGY_COMPARISON.md",
+    "STOP_LOSS_GUIDE.md",
     "CLEANUP_SUMMARY.md",
     "CODE_REVIEW_FINDINGS.md",
     "CHECK_IBKR_STATUS.md",

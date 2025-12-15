@@ -113,6 +113,11 @@ class TradingOrchestrator:
             print("Starting daily summary scheduler...")
             asyncio.create_task(self._daily_summary_task())
 
+            # Register and start Telegram command polling
+            print("Starting Telegram command handler...")
+            self.notifier.register_command_handler("status", self._handle_status_command)
+            asyncio.create_task(self._telegram_command_polling_task())
+
         # Keep running
         try:
             while self.running:
@@ -191,6 +196,122 @@ class TradingOrchestrator:
 
             # Wait a bit to avoid sending multiple times
             await asyncio.sleep(60)
+
+    async def _telegram_command_polling_task(self):
+        """
+        Background task that polls for Telegram commands.
+
+        Checks for commands every 5 seconds.
+        """
+        print("Telegram command polling active (send /status to check positions)")
+
+        while self.running:
+            try:
+                await self.notifier.process_commands()
+                await asyncio.sleep(5)  # Poll every 5 seconds
+            except Exception as e:
+                print(f"⚠️  Error in Telegram command polling: {e}")
+                await asyncio.sleep(5)
+
+    async def _handle_status_command(self, cmd: dict) -> str:
+        """
+        Handle /status command from Telegram.
+
+        Returns formatted status message with positions and account info.
+        """
+        try:
+            mode = "📝 PAPER" if self.paper_mode else "🔴 LIVE"
+
+            # Get account balance
+            account_balance = None
+            if not self.paper_mode and self.executor.connected:
+                account_balance = await self.executor.get_account_balance()
+
+            # Get positions
+            positions = []
+            if not self.paper_mode and self.executor.connected:
+                positions = await self.executor.get_positions()
+
+            # Get open orders
+            open_orders = []
+            if not self.paper_mode and self.executor.connected:
+                open_orders = await self.executor.get_open_orders()
+
+            # Get active sessions
+            open_sessions = [s for s in self.session_manager.sessions.values() if s.state == "OPEN"]
+
+            # Build response
+            text = f"<b>📊 {mode} STATUS</b>\n\n"
+
+            # Account balance
+            if account_balance:
+                text += f"<b>💰 Account Balance:</b> ${account_balance:,.2f}\n\n"
+            else:
+                text += f"<b>💰 Account Balance:</b> Not available\n\n"
+
+            # Positions
+            text += f"<b>🔓 Open Positions ({len(positions)}):</b>\n"
+            if positions:
+                for pos in positions:
+                    contract = pos.contract
+                    symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
+                    qty = pos.position
+                    avg_cost = pos.avgCost
+
+                    # Try to calculate current P&L
+                    pnl_text = ""
+                    try:
+                        unrealized_pnl = pos.unrealizedPNL
+                        if unrealized_pnl:
+                            pnl_pct = (unrealized_pnl / (avg_cost * abs(qty) * 100)) * 100 if avg_cost > 0 else 0
+                            pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
+                            pnl_text = f" {pnl_emoji} {unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
+                    except:
+                        pass
+
+                    text += f"• {symbol}: {qty} @ ${avg_cost:.2f}{pnl_text}\n"
+            else:
+                text += "  No open positions\n"
+
+            text += "\n"
+
+            # Open orders
+            text += f"<b>📋 Open Orders ({len(open_orders)}):</b>\n"
+            if open_orders:
+                for trade in open_orders:
+                    contract = trade.contract
+                    order = trade.order
+                    symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
+                    action = order.action
+                    qty = order.totalQuantity
+                    price = order.lmtPrice
+                    status = trade.orderStatus.status
+
+                    text += f"• {action} {qty} {symbol} @ ${price:.2f} - {status}\n"
+            else:
+                text += "  No open orders\n"
+
+            text += "\n"
+
+            # Open sessions
+            text += f"<b>🔄 Active Sessions ({len(open_sessions)}):</b>\n"
+            if open_sessions:
+                for session in open_sessions[:5]:  # Show first 5
+                    symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "?"
+                    qty = session.total_quantity
+                    text += f"• {symbol} - {qty} contracts\n"
+                if len(open_sessions) > 5:
+                    text += f"  ... and {len(open_sessions) - 5} more\n"
+            else:
+                text += "  No active sessions\n"
+
+            # Timestamp
+            text += f"\n<i>Updated: {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
+
+            return text
+
+        except Exception as e:
+            return f"❌ Error getting status: {str(e)}"
 
     async def on_discord_message(
         self, message: str, author: str, message_id: str, timestamp: datetime

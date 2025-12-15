@@ -56,6 +56,10 @@ class TelegramNotifier:
         self.daily_orders: List[Dict] = []
         self.daily_fills: List[Dict] = []
 
+        # Command handling
+        self.last_update_id: Optional[int] = None
+        self.command_handlers: Dict = {}
+
     async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         """
         Send a message to Telegram.
@@ -302,6 +306,94 @@ class TelegramNotifier:
         text += f"\n<i>Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
 
         await self.send_message(text)
+
+    def register_command_handler(self, command: str, handler):
+        """
+        Register a command handler function.
+
+        Args:
+            command: Command name without slash (e.g., "status")
+            handler: Async function to handle the command
+        """
+        self.command_handlers[command] = handler
+
+    async def poll_commands(self) -> List[Dict]:
+        """
+        Poll for new Telegram commands using getUpdates.
+
+        Returns:
+            List of command messages
+        """
+        if not self.enabled or not self.bot_token:
+            return []
+
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+            params = {
+                "timeout": 10,
+                "allowed_updates": ["message"]
+            }
+
+            if self.last_update_id:
+                params["offset"] = self.last_update_id + 1
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=15) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("ok") and data.get("result"):
+                            updates = data["result"]
+
+                            # Update last_update_id
+                            if updates:
+                                self.last_update_id = max(u["update_id"] for u in updates)
+
+                            # Filter for commands from our chat
+                            commands = []
+                            for update in updates:
+                                message = update.get("message", {})
+                                text = message.get("text", "")
+                                chat_id = str(message.get("chat", {}).get("id", ""))
+
+                                # Only process messages from our chat
+                                if chat_id == self.chat_id and text.startswith("/"):
+                                    commands.append({
+                                        "command": text.split()[0][1:],  # Remove leading /
+                                        "args": text.split()[1:],
+                                        "message": message
+                                    })
+
+                            return commands
+                    return []
+        except Exception as e:
+            print(f"⚠️  Error polling Telegram commands: {e}")
+            return []
+
+    async def process_commands(self):
+        """
+        Poll and process Telegram commands.
+
+        This should be called periodically in a background loop.
+        """
+        commands = await self.poll_commands()
+
+        for cmd in commands:
+            command_name = cmd["command"]
+            handler = self.command_handlers.get(command_name)
+
+            if handler:
+                try:
+                    # Call the handler
+                    response = await handler(cmd)
+                    if response:
+                        await self.send_message(response)
+                except Exception as e:
+                    error_msg = f"❌ Error executing /{command_name}: {str(e)}"
+                    await self.send_message(error_msg)
+                    print(f"⚠️  Error executing /{command_name}: {e}")
+            else:
+                # Unknown command
+                await self.send_message(f"❓ Unknown command: /{command_name}\n\nAvailable commands:\n/status - Check positions and account")
 
     def get_daily_stats(self) -> dict:
         """Get current daily statistics."""
