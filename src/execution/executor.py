@@ -261,6 +261,18 @@ class ExecutionEngine:
         # Similar to entry but no bracket needed (uses session's existing stops)
         try:
             contract = self._build_contract_from_session(session)
+
+            # Qualify contract with IBKR
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if not qualified:
+                return OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    message=f"Contract not found: {contract.symbol} {contract.strike}{contract.right}",
+                )
+            contract = qualified[0]
+            print(f"  ✓ Qualified contract: {contract.localSymbol}")
+
             add_price = event.entry_price or await self._get_market_price(
                 contract
             )
@@ -273,6 +285,7 @@ class ExecutionEngine:
                 )
 
             order = LimitOrder("BUY", quantity, add_price)
+            order.tif = "DAY"  # Explicit Time In Force
             trade = self.ib.placeOrder(contract, order)
 
             filled = await self._wait_for_fill(trade, timeout=30)
@@ -315,6 +328,18 @@ class ExecutionEngine:
                 )
 
             contract = self._build_contract_from_session(session)
+
+            # Qualify contract with IBKR
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if not qualified:
+                return OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    message=f"Contract not found: {contract.symbol} {contract.strike}{contract.right}",
+                )
+            contract = qualified[0]
+            print(f"  ✓ Qualified contract: {contract.localSymbol}")
+
             exit_price = await self._get_market_price(contract)
 
             if not exit_price:
@@ -325,6 +350,7 @@ class ExecutionEngine:
                 )
 
             order = LimitOrder("SELL", total_quantity, exit_price)
+            order.tif = "DAY"  # Explicit Time In Force
             trade = self.ib.placeOrder(contract, order)
 
             filled = await self._wait_for_fill(trade, timeout=30)
@@ -428,6 +454,7 @@ class ExecutionEngine:
         parent = LimitOrder(action, quantity, entry_price)
         parent.orderId = self.ib.client.getReqId()
         parent.transmit = False  # Don't transmit until children are attached
+        parent.tif = "DAY"  # Explicit Time In Force
         orders.append(parent)
 
         # Child orders only activate when parent fills
@@ -439,6 +466,7 @@ class ExecutionEngine:
             stop.orderId = self.ib.client.getReqId()
             stop.parentId = parent.orderId  # Link to parent
             stop.transmit = not target_price  # Transmit only if it's the last order
+            stop.tif = "DAY"  # Explicit Time In Force
             orders.append(stop)
 
         # Profit target child (if provided)
@@ -447,6 +475,7 @@ class ExecutionEngine:
             target.orderId = self.ib.client.getReqId()
             target.parentId = parent.orderId  # Link to parent
             target.transmit = True  # Last order - transmit all
+            target.tif = "DAY"  # Explicit Time In Force
             orders.append(target)
 
         # If no children, transmit the parent order
@@ -458,7 +487,11 @@ class ExecutionEngine:
     async def _get_market_price(self, contract: Option) -> Optional[float]:
         """Get current market price for contract."""
         try:
-            self.ib.qualifyContracts(contract)
+            # Use async qualification (contract should already be qualified, but ensure)
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if qualified:
+                contract = qualified[0]
+
             ticker = self.ib.reqMktData(contract)
             await asyncio.sleep(1)  # Wait for data
 
@@ -479,15 +512,40 @@ class ExecutionEngine:
         """
         Wait for order to fill.
 
-        Returns True if filled, False if timeout.
+        Returns True if filled, False if cancelled/timeout.
         """
-        for _ in range(timeout):
+        # Check initial status immediately
+        if trade.orderStatus.status == "Filled":
+            return True
+        if trade.orderStatus.status in ["Cancelled", "ApiCancelled", "Inactive"]:
+            print(f"  ✗ Order cancelled: {trade.orderStatus.status}")
+            return False
+
+        # Wait for status changes
+        for i in range(timeout):
             await asyncio.sleep(1)
-            if trade.orderStatus.status == "Filled":
+
+            status = trade.orderStatus.status
+
+            # Check for fill
+            if status == "Filled":
                 return True
-            if trade.orderStatus.status in ["Cancelled", "ApiCancelled"]:
+
+            # Check for cancellations/errors
+            if status in ["Cancelled", "ApiCancelled", "Inactive", "PendingCancel"]:
+                print(f"  ✗ Order cancelled: {status}")
+                if trade.log:
+                    # Print last log entry for debugging
+                    last_log = trade.log[-1]
+                    if last_log.message:
+                        print(f"    Reason: {last_log.message}")
                 return False
 
+            # Log progress every 5 seconds
+            if i % 5 == 0 and i > 0:
+                print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status})")
+
+        print(f"  ✗ Order timed out after {timeout}s (status: {trade.orderStatus.status})")
         return False
 
     async def get_account_balance(self) -> Optional[float]:

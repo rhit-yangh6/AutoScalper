@@ -226,76 +226,10 @@ class DiscordWebSocketListener:
             if author_name not in self.monitored_users:
                 return
 
-        # Debug: Check for embeds or attachments if content is empty
+        # Skip empty content
         if not content:
-            embeds = data.get('embeds', [])
-            attachments = data.get('attachments', [])
-            stickers = data.get('sticker_items', [])
-            message_type = data.get('type', 0)
-            referenced_message = data.get('referenced_message')
-
-            print(f"[DEBUG] Empty message from {author_name} in channel {channel_id}")
-            print(f"  Message ID: {message_id}")
-            print(f"  Message type: {message_type}")
-            print(f"  Has embeds: {len(embeds) > 0}")
-            print(f"  Has attachments: {len(attachments) > 0}")
-            print(f"  Has stickers: {len(stickers) > 0}")
-            print(f"  Is reply: {referenced_message is not None}")
-
-            # If it's a reply, check the referenced message for content
-            if message_type == 19 and referenced_message:
-                ref_content = referenced_message.get('content', '')
-                ref_embeds = referenced_message.get('embeds', [])
-
-                print(f"  Referenced message has content: {bool(ref_content)}")
-
-                # Try to get content from referenced message
-                if ref_content:
-                    content = ref_content
-                    print(f"  Using content from referenced message: {content[:100]}...")
-                elif ref_embeds:
-                    # Extract from referenced message embeds
-                    embed_texts = []
-                    for embed in ref_embeds:
-                        if 'description' in embed:
-                            embed_texts.append(embed['description'])
-                        if 'title' in embed:
-                            embed_texts.append(embed['title'])
-                    if embed_texts:
-                        content = '\n'.join(embed_texts)
-                        print(f"  Extracted from referenced embeds: {content[:100]}...")
-
-            # Try to extract text from embeds
-            if not content and embeds:
-                embed_texts = []
-                for embed in embeds:
-                    if 'description' in embed:
-                        embed_texts.append(embed['description'])
-                    if 'title' in embed:
-                        embed_texts.append(embed['title'])
-
-                if embed_texts:
-                    content = '\n'.join(embed_texts)
-                    print(f"  Extracted from embeds: {content[:100]}...")
-
-            # Check if it's a sticker-only message
-            if not content and stickers:
-                print(f"  Message is a sticker (not supported)")
-
-            # If still no content, log for investigation
-            if not content:
-                print(f"  WARNING: Message appears in Discord but has no extractable content")
-
-                # Check if referenced message was edited
-                if message_type == 19 and referenced_message and referenced_message.get('edited_timestamp'):
-                    print(f"  NOTE: The referenced message was edited - Discord API doesn't always")
-                    print(f"        include edited content in reply references.")
-                    print(f"  SOLUTION: Monitor the original message channel directly, not replies")
-                else:
-                    print(f"  This could be a Discord client-side rendering issue")
-
-                print(f"  Skipping: no text content found")
-                return
+            print(f"[DEBUG] Empty message from {author_name} - skipping")
+            return
 
         # Parse timestamp
         try:

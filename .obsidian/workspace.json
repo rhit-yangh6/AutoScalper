@@ -53,7 +53,7 @@
             "state": {
               "type": "search",
               "state": {
-                "query": "",
+                "query": "source",
                 "matchingCase": false,
                 "explainSearch": false,
                 "collapseAll": false,
@@ -74,7 +74,8 @@
               "title": "Bookmarks"
             }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "horizontal",
@@ -185,6 +186,8 @@
   },
   "active": "b98d20507c559b6f",
   "lastOpenFiles": [
+    "CLEANUP_SUMMARY.md",
+    "CODE_REVIEW_FINDINGS.md",
     "CHECK_IBKR_STATUS.md",
     "check_ibkr_status.py",
     "src/discord_listener/listener_simple.py",

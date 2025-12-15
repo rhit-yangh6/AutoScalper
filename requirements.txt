@@ -6,8 +6,8 @@ python-dotenv>=1.0.0
 anthropic>=0.30.0
 openai>=1.0.0
 
-# Discord integration (user account)
-discord.py-self>=2.0.0
+# Discord integration (WebSocket-based, no external library)
+# Uses aiohttp for WebSocket connections
 
 # IBKR integration
 ib-insync>=0.9.86
