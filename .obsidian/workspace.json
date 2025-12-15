@@ -185,6 +185,8 @@
   },
   "active": "b98d20507c559b6f",
   "lastOpenFiles": [
+    "CHECK_IBKR_STATUS.md",
+    "check_ibkr_status.py",
     "src/discord_listener/listener_simple.py",
     "DEPLOY_BOT.md",
     "IBKR_GATEWAY_TROUBLESHOOTING.md",
@@ -196,8 +198,6 @@
     "src/notifications/__pycache__",
     "venv/lib/python3.12/site-packages/discord.py_self-2.0.1.dist-info/REQUESTED",
     "venv/lib/python3.12/site-packages/discord.py_self-2.0.1.dist-info/INSTALLER",
-    "venv/lib/python3.12/site-packages/discord/__pycache__/widget.cpython-312.pyc",
-    "venv/lib/python3.12/site-packages/discord/__pycache__/welcome_screen.cpython-312.pyc",
     "FEATURE_TELEGRAM.md",
     "TELEGRAM_SETUP.md",
     "FEATURE_LOGGING.md",

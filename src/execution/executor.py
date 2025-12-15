@@ -536,3 +536,78 @@ class ExecutionEngine:
                 print("Account Balance: Unable to retrieve (data may not be ready yet)")
         except Exception as e:
             print(f"Could not retrieve account balance: {e}")
+
+    async def get_positions(self) -> list:
+        """
+        Get current positions from IBKR.
+
+        Returns:
+            List of Position objects with contract and quantity info
+        """
+        if not self.connected:
+            return []
+
+        try:
+            await asyncio.sleep(1)  # Wait for data to populate
+            positions = self.ib.positions()
+            return positions
+        except Exception as e:
+            print(f"Error getting positions: {e}")
+            return []
+
+    async def get_open_orders(self) -> list:
+        """
+        Get current open orders from IBKR.
+
+        Returns:
+            List of Trade objects with order info
+        """
+        if not self.connected:
+            return []
+
+        try:
+            await asyncio.sleep(1)  # Wait for data to populate
+            open_orders = self.ib.openTrades()
+            return open_orders
+        except Exception as e:
+            print(f"Error getting open orders: {e}")
+            return []
+
+    async def display_account_status(self):
+        """Display complete account status: balance, positions, and open orders."""
+        print("\n" + "="*60)
+        print("IBKR ACCOUNT STATUS")
+        print("="*60)
+
+        # Balance
+        balance = await self.get_account_balance()
+        if balance:
+            print(f"\n💰 Account Balance: ${balance:,.2f}")
+        else:
+            print("\n💰 Account Balance: Unable to retrieve")
+
+        # Positions
+        positions = await self.get_positions()
+        print(f"\n📊 Current Positions ({len(positions)}):")
+        if positions:
+            for pos in positions:
+                contract = pos.contract
+                symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
+                print(f"  • {symbol}: {pos.position} contracts @ avg ${pos.avgCost:.2f}")
+        else:
+            print("  No open positions")
+
+        # Open Orders
+        open_orders = await self.get_open_orders()
+        print(f"\n📋 Open Orders ({len(open_orders)}):")
+        if open_orders:
+            for trade in open_orders:
+                contract = trade.contract
+                order = trade.order
+                symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
+                status = trade.orderStatus.status
+                print(f"  • {order.action} {order.totalQuantity} {symbol} @ ${order.lmtPrice:.2f} - {status}")
+        else:
+            print("  No open orders")
+
+        print("="*60 + "\n")
