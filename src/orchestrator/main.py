@@ -1,6 +1,6 @@
 import asyncio
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -161,7 +161,7 @@ class TradingOrchestrator:
         print(f"Daily summary will be sent at {summary_time_str} UTC (after trading hours close)")
 
         while self.running:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             target_time = datetime.combine(now.date(), summary_time)
 
             # If target time already passed today, schedule for tomorrow
@@ -178,7 +178,7 @@ class TradingOrchestrator:
             # Send daily summary
             if self.running and self.notifier:
                 try:
-                    print(f"\nSending daily summary at {datetime.utcnow().strftime('%H:%M:%S UTC')}...")
+                    print(f"\nSending daily summary at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}...")
 
                     # Get all sessions for today
                     all_sessions = list(self.session_manager.sessions.values())
@@ -306,7 +306,7 @@ class TradingOrchestrator:
                 text += "  No active sessions\n"
 
             # Timestamp
-            text += f"\n<i>Updated: {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
+            text += f"\n<i>Updated: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
 
             return text
 

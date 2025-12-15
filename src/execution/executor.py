@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel
@@ -218,7 +218,7 @@ class ExecutionEngine:
             if filled:
                 # Update session
                 session.state = "OPEN"
-                session.opened_at = datetime.utcnow()
+                session.opened_at = datetime.now(timezone.utc)
 
                 # Log the bracket structure
                 msg = f"Entry filled at ${parent_trade.orderStatus.avgFillPrice:.2f}"
@@ -363,7 +363,7 @@ class ExecutionEngine:
 
             if filled:
                 session.state = "CLOSED"
-                session.closed_at = datetime.utcnow()
+                session.closed_at = datetime.now(timezone.utc)
 
                 return OrderResult(
                     success=True,

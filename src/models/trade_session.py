@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel, Field
 from .enums import SessionState, Direction
@@ -77,7 +77,7 @@ class TradeSession(BaseModel):
         """Add an event to this session and update state."""
         event.session_id = self.session_id
         self.all_events.append(event)
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
 
         # State transitions
         if event.event_type.value == "NEW" and self.state == SessionState.PENDING:
@@ -88,7 +88,7 @@ class TradeSession(BaseModel):
         elif event.event_type.value in ["EXIT", "SL", "TP"]:
             if self.state == SessionState.OPEN:
                 self.state = SessionState.CLOSED
-                self.closed_at = datetime.utcnow()
+                self.closed_at = datetime.now(timezone.utc)
         elif event.event_type.value == "ADD":
             self.num_adds += 1
 

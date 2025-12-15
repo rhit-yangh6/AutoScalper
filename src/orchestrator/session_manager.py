@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from ..models import Event, TradeSession, EventType, SessionState
 
@@ -166,7 +166,7 @@ class SessionManager:
 
     def _get_today_expiry(self) -> str:
         """Get today's date as expiry (for 0DTE)."""
-        return datetime.utcnow().date().isoformat()
+        return datetime.now(timezone.utc).date().isoformat()
 
     def cleanup_old_sessions(self, days: int = 7) -> int:
         """
@@ -174,7 +174,7 @@ class SessionManager:
 
         Returns number of sessions removed.
         """
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         old_sessions = [
             sid
             for sid, session in self.sessions.items()

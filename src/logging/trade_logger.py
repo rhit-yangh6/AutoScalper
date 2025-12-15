@@ -198,7 +198,7 @@ class TradeLogger:
         """Log an order submission to IBKR."""
         txt_path, json_path = self._get_session_log_files(session)
 
-        timestamp = datetime.utcnow()
+        timestamp = datetime.now(timezone.utc)
         time_str = timestamp.strftime('%H:%M:%S')
 
         # Format for text log
@@ -233,7 +233,7 @@ class TradeLogger:
         """Log the result of an order execution."""
         txt_path, json_path = self._get_session_log_files(session)
 
-        timestamp = datetime.utcnow()
+        timestamp = datetime.now(timezone.utc)
         time_str = timestamp.strftime('%H:%M:%S')
 
         # result.status is already a string value (Pydantic's use_enum_values = True)
@@ -290,7 +290,7 @@ class TradeLogger:
         """Log session closure."""
         txt_path, json_path = self._get_session_log_files(session)
 
-        timestamp = datetime.utcnow()
+        timestamp = datetime.now(timezone.utc)
 
         # Write footer to text log
         with open(txt_path, 'a') as f:
@@ -324,7 +324,7 @@ class TradeLogger:
         error_message: str,
     ):
         """Log an error."""
-        timestamp = datetime.utcnow()
+        timestamp = datetime.now(timezone.utc)
         time_str = timestamp.strftime('%H:%M:%S')
 
         # Log to day's error log

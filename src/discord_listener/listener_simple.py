@@ -7,7 +7,7 @@ This uses plain JSON instead of zlib compression for better reliability.
 import asyncio
 import json
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
 
@@ -254,7 +254,7 @@ class DiscordSimpleListener:
             try:
                 timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
             except:
-                timestamp = datetime.utcnow()
+                timestamp = datetime.now(timezone.utc)
 
             # Log message
             print(f"[{timestamp.strftime('%H:%M:%S')}] {author_name}: {content}")

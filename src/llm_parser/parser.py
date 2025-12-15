@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 import anthropic
 from pydantic import ValidationError
@@ -62,7 +62,7 @@ class LLMParser:
                          or validation fails
         """
         if timestamp is None:
-            timestamp = datetime.utcnow()
+            timestamp = datetime.now(timezone.utc)
 
         # Build prompt
         user_prompt = build_user_prompt(

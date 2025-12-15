@@ -9,7 +9,7 @@ Sends notifications via Telegram Bot API for:
 
 import asyncio
 import aiohttp
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional, List, Dict
 from enum import Enum
 
@@ -120,7 +120,7 @@ class TelegramNotifier:
         """
         # Track for daily summary
         self.daily_orders.append({
-            'time': datetime.utcnow(),
+            'time': datetime.now(timezone.utc),
             'session_id': session.session_id,
             'event_type': event_type.value,
             'details': order_details,
@@ -149,7 +149,7 @@ class TelegramNotifier:
             text += f"<b>Targets:</b> {targets_str}\n"
 
         text += f"\n<i>Session: {session.session_id[:8]}...</i>"
-        text += f"\n<i>Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
+        text += f"\n<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
 
         await self.send_message(text)
 
@@ -171,7 +171,7 @@ class TelegramNotifier:
         """
         # Track for daily summary
         self.daily_fills.append({
-            'time': datetime.utcnow(),
+            'time': datetime.now(timezone.utc),
             'session_id': session.session_id,
             'event_type': event_type.value,
             'result': {
@@ -213,7 +213,7 @@ class TelegramNotifier:
             text += f"\n<i>{result.message}</i>\n"
 
         text += f"\n<i>Session: {session.session_id[:8]}...</i>"
-        text += f"\n<i>Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
+        text += f"\n<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
 
         await self.send_message(text)
 
@@ -284,7 +284,7 @@ class TelegramNotifier:
                 text += f"• {symbol} - {qty} contracts\n"
             text += "\n"
 
-        text += f"<i>Summary generated at {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
+        text += f"<i>Summary generated at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
 
         await self.send_message(text)
 
@@ -303,7 +303,7 @@ class TelegramNotifier:
         text = f"<b>🚨 ERROR ALERT</b>\n\n"
         text += f"<b>Type:</b> {error_type}\n"
         text += f"<b>Message:</b> {error_message}\n"
-        text += f"\n<i>Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
+        text += f"\n<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
 
         await self.send_message(text)
 

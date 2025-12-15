@@ -1,4 +1,4 @@
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel
@@ -150,7 +150,7 @@ class RiskGate:
 
     def _check_trading_hours(self) -> bool:
         """Check if current time is within allowed trading hours."""
-        now = datetime.utcnow().time()
+        now = datetime.now(timezone.utc).time()
 
         start_str = self.config.get("trading_hours_start", "13:30")  # 9:30 AM ET
         end_str = self.config.get("trading_hours_end", "20:00")  # 4:00 PM ET
@@ -257,7 +257,7 @@ class RiskGate:
         Updates daily PnL and loss streak.
         """
         self.daily_pnl += pnl
-        self.trades_today.append({"pnl": pnl, "timestamp": datetime.utcnow()})
+        self.trades_today.append({"pnl": pnl, "timestamp": datetime.now(timezone.utc)})
 
         # Update loss streak
         if pnl < 0:

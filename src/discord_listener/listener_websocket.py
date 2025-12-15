@@ -3,7 +3,7 @@ import json
 import zlib
 from typing import Callable, Optional
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class DiscordWebSocketListener:
@@ -235,7 +235,7 @@ class DiscordWebSocketListener:
         try:
             timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
         except:
-            timestamp = datetime.utcnow()
+            timestamp = datetime.now(timezone.utc)
 
         # Log message
         print(f"[{timestamp}] {author_name}: {content}")
