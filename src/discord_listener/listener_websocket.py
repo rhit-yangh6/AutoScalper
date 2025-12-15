@@ -37,27 +37,43 @@ class DiscordWebSocketListener:
         self.inflator = zlib.decompressobj()
 
     async def start(self):
-        """Start the WebSocket connection."""
-        try:
-            self.running = True
-            self.session = aiohttp.ClientSession()
+        """Start the WebSocket connection with auto-reconnect."""
+        self.running = True
+        self.session = aiohttp.ClientSession()
 
-            # Connect to Discord Gateway
-            gateway_url = "wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream"
+        reconnect_delay = 5  # seconds
+        max_reconnect_delay = 60
 
-            async with self.session.ws_connect(gateway_url) as ws:
-                self.ws = ws
-                print("Connected to Discord Gateway")
+        while self.running:
+            try:
+                # Connect to Discord Gateway
+                gateway_url = "wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream"
 
-                # Handle messages
-                await self._handle_messages()
+                async with self.session.ws_connect(gateway_url) as ws:
+                    self.ws = ws
+                    print("Connected to Discord Gateway")
 
-        except Exception as e:
-            print(f"Discord WebSocket error: {e}")
-            raise
-        finally:
-            if self.session:
-                await self.session.close()
+                    # Reset reconnect delay on successful connection
+                    reconnect_delay = 5
+
+                    # Handle messages
+                    await self._handle_messages()
+
+            except Exception as e:
+                if self.running:
+                    print(f"Discord WebSocket error: {e}")
+                    print(f"Reconnecting in {reconnect_delay} seconds...")
+                    await asyncio.sleep(reconnect_delay)
+
+                    # Exponential backoff
+                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+                else:
+                    # Stop requested, don't reconnect
+                    break
+
+        # Clean up
+        if self.session:
+            await self.session.close()
 
     async def stop(self):
         """Stop the WebSocket connection."""
@@ -141,16 +157,25 @@ class DiscordWebSocketListener:
         """Send periodic heartbeats."""
         while self.running:
             await asyncio.sleep(self.heartbeat_interval)
-            await self._send_heartbeat()
+            try:
+                await self._send_heartbeat()
+            except Exception as e:
+                print(f"Heartbeat error: {e}")
+                # Connection lost, will be handled by main loop
+                break
 
     async def _send_heartbeat(self):
         """Send heartbeat to keep connection alive."""
-        if self.ws:
-            payload = {
-                "op": 1,
-                "d": self.sequence
-            }
-            await self.ws.send_json(payload)
+        if self.ws and not self.ws.closed:
+            try:
+                payload = {
+                    "op": 1,
+                    "d": self.sequence
+                }
+                await self.ws.send_json(payload)
+            except Exception as e:
+                print(f"Failed to send heartbeat: {e}")
+                raise  # Re-raise to be caught by heartbeat_loop
 
     async def _handle_dispatch(self, event_type: str, data: dict):
         """Handle dispatch events."""
