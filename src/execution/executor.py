@@ -340,6 +340,12 @@ class ExecutionEngine:
             contract = qualified[0]
             print(f"  ✓ Qualified contract: {contract.localSymbol}")
 
+            # CRITICAL: Cancel all existing orders for this contract (bracket orders)
+            # This prevents race conditions between EXIT and existing stop/target orders
+            cancelled_orders = await self._cancel_orders_for_contract(contract)
+            if cancelled_orders > 0:
+                print(f"  ✓ Cancelled {cancelled_orders} existing order(s) (bracket stop/target)")
+
             exit_price = await self._get_market_price(contract)
 
             if not exit_price:
@@ -483,6 +489,42 @@ class ExecutionEngine:
             parent.transmit = True
 
         return orders
+
+    async def _cancel_orders_for_contract(self, contract: Option) -> int:
+        """
+        Cancel all open orders for a given contract.
+
+        This is essential before placing EXIT orders to avoid race conditions
+        with existing bracket orders (stop loss / take profit).
+
+        Returns:
+            Number of orders cancelled
+        """
+        try:
+            # Get all open trades
+            open_trades = self.ib.openTrades()
+
+            cancelled_count = 0
+            for trade in open_trades:
+                # Check if this trade is for the same contract
+                if (trade.contract.symbol == contract.symbol and
+                    trade.contract.strike == contract.strike and
+                    trade.contract.right == contract.right and
+                    trade.contract.lastTradeDateOrContractMonth == contract.lastTradeDateOrContractMonth):
+
+                    # Cancel the order
+                    self.ib.cancelOrder(trade.order)
+                    cancelled_count += 1
+                    print(f"    Cancelled order {trade.order.orderId}: {trade.order.action} {trade.order.totalQuantity} @ ${trade.order.lmtPrice}")
+
+            # Give IBKR a moment to process cancellations
+            if cancelled_count > 0:
+                await asyncio.sleep(0.5)
+
+            return cancelled_count
+        except Exception as e:
+            print(f"  ⚠️  Error cancelling orders: {e}")
+            return 0
 
     async def _get_market_price(self, contract: Option) -> Optional[float]:
         """Get current market price for contract."""
