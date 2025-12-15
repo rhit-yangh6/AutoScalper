@@ -236,18 +236,19 @@ class TradeLogger:
         timestamp = datetime.utcnow()
         time_str = timestamp.strftime('%H:%M:%S')
 
-        # Determine status emoji
+        # result.status is already a string value (Pydantic's use_enum_values = True)
+        # Determine status emoji based on string value
         status_symbol = {
-            OrderStatus.FILLED: "✓",
-            OrderStatus.CANCELLED: "✗",
-            OrderStatus.REJECTED: "⚠",
-            OrderStatus.PENDING: "⏳",
-            OrderStatus.SUBMITTED: "→"
+            "FILLED": "✓",
+            "CANCELLED": "✗",
+            "REJECTED": "⚠",
+            "PENDING": "⏳",
+            "SUBMITTED": "→"
         }.get(result.status, "?")
 
         # Format for text log
         with open(txt_path, 'a') as f:
-            f.write(f"[{time_str}] [ORDER RESULT: {event_type.value}] {status_symbol} {result.status.value}\n")
+            f.write(f"[{time_str}] [ORDER RESULT: {event_type.value}] {status_symbol} {result.status}\n")
             if result.order_id:
                 f.write(f"  Order ID: {result.order_id}\n")
             if result.filled_price:
@@ -259,7 +260,7 @@ class TradeLogger:
         # Log to all_orders.log
         all_orders_path = self.current_day_dir / "all_orders.log"
         with open(all_orders_path, 'a') as f:
-            f.write(f"[{time_str}] [{event_type.value}] {status_symbol} {result.status.value}\n")
+            f.write(f"[{time_str}] [{event_type.value}] {status_symbol} {result.status}\n")
             if result.order_id:
                 f.write(f"  Order ID: {result.order_id}\n")
             if result.filled_price:
@@ -273,7 +274,7 @@ class TradeLogger:
             'type': 'order_result',
             'timestamp': timestamp.isoformat(),
             'event_type': event_type.value,
-            'status': result.status.value,
+            'status': result.status,
             'success': result.success,
             'order_id': result.order_id,
             'filled_price': result.filled_price,

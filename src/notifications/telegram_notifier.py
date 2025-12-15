@@ -171,25 +171,26 @@ class TelegramNotifier:
             'session_id': session.session_id,
             'event_type': event_type.value,
             'result': {
-                'status': result.status.value,
+                'status': result.status,  # Already a string value
                 'filled_price': result.filled_price,
                 'order_id': result.order_id,
             }
         })
 
-        # Determine emoji and color based on status
-        if result.status == OrderStatus.FILLED:
+        # result.status is already a string value (Pydantic's use_enum_values = True)
+        # Determine emoji and color based on status string
+        if result.status == "FILLED":
             emoji = "✅"
             status_text = "FILLED"
-        elif result.status == OrderStatus.REJECTED:
+        elif result.status == "REJECTED":
             emoji = "❌"
             status_text = "REJECTED"
-        elif result.status == OrderStatus.CANCELLED:
+        elif result.status == "CANCELLED":
             emoji = "⚠️"
             status_text = "CANCELLED"
         else:
             emoji = "ℹ️"
-            status_text = result.status.value
+            status_text = result.status
 
         mode = "📝 PAPER" if paper_mode else "🔴 LIVE"
         symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "UNKNOWN"

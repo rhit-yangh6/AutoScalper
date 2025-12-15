@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "IBKR_GATEWAY_TROUBLESHOOTING.md",
+                "file": "DEPLOYMENT.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "IBKR_GATEWAY_TROUBLESHOOTING"
+              "title": "DEPLOYMENT"
             }
           }
         ]
@@ -94,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "IBKR_GATEWAY_TROUBLESHOOTING.md",
+                "file": "DEPLOYMENT.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for IBKR_GATEWAY_TROUBLESHOOTING"
+              "title": "Backlinks for DEPLOYMENT"
             }
           },
           {
@@ -113,12 +113,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "IBKR_GATEWAY_TROUBLESHOOTING.md",
+                "file": "DEPLOYMENT.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links from IBKR_GATEWAY_TROUBLESHOOTING"
+              "title": "Outgoing links from DEPLOYMENT"
             }
           },
           {
@@ -156,13 +156,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "IBKR_GATEWAY_TROUBLESHOOTING.md",
+                "file": "DEPLOYMENT.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline of IBKR_GATEWAY_TROUBLESHOOTING"
+              "title": "Outline of DEPLOYMENT"
             }
           }
         ]
@@ -185,6 +185,8 @@
   },
   "active": "b98d20507c559b6f",
   "lastOpenFiles": [
+    "DEPLOY_BOT.md",
+    "IBKR_GATEWAY_TROUBLESHOOTING.md",
     "logs/2025-12-15/session_131546_SPY_CALL.json",
     "logs/2025-12-15/session_131546_SPY_CALL.log",
     "logs/2025-12-15/all_messages.log",
@@ -195,14 +197,11 @@
     "venv/lib/python3.12/site-packages/discord.py_self-2.0.1.dist-info/INSTALLER",
     "venv/lib/python3.12/site-packages/discord/__pycache__/widget.cpython-312.pyc",
     "venv/lib/python3.12/site-packages/discord/__pycache__/welcome_screen.cpython-312.pyc",
-    "venv/lib/python3.12/site-packages/discord/webhook/__pycache__/sync.cpython-312.pyc",
     "FEATURE_TELEGRAM.md",
     "TELEGRAM_SETUP.md",
     "FEATURE_LOGGING.md",
     "LOGGING.md",
-    "DEPLOY_BOT.md",
     "DEPLOYMENT.md",
-    "IBKR_GATEWAY_TROUBLESHOOTING.md",
     "SETUP_CHECKLIST.md",
     "get_token_helper.md"
   ]
