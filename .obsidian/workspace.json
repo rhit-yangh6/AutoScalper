@@ -185,6 +185,7 @@
   },
   "active": "b98d20507c559b6f",
   "lastOpenFiles": [
+    "src/discord_listener/listener_simple.py",
     "DEPLOY_BOT.md",
     "IBKR_GATEWAY_TROUBLESHOOTING.md",
     "logs/2025-12-15/session_131546_SPY_CALL.json",

@@ -193,6 +193,10 @@ class DiscordWebSocketListener:
         elif event_type == "MESSAGE_CREATE":
             await self._handle_message(data)
 
+        elif event_type == "MESSAGE_UPDATE":
+            # Handle edited messages
+            await self._handle_message(data)
+
     async def _handle_message(self, data: dict):
         """Handle MESSAGE_CREATE event."""
         # Get message details
@@ -238,11 +242,31 @@ class DiscordWebSocketListener:
             print(f"  Has stickers: {len(stickers) > 0}")
             print(f"  Is reply: {referenced_message is not None}")
 
-            # Print all fields in the message for debugging
-            print(f"  Message fields: {list(data.keys())}")
+            # If it's a reply, check the referenced message for content
+            if message_type == 19 and referenced_message:
+                ref_content = referenced_message.get('content', '')
+                ref_embeds = referenced_message.get('embeds', [])
+
+                print(f"  Referenced message has content: {bool(ref_content)}")
+
+                # Try to get content from referenced message
+                if ref_content:
+                    content = ref_content
+                    print(f"  Using content from referenced message: {content[:100]}...")
+                elif ref_embeds:
+                    # Extract from referenced message embeds
+                    embed_texts = []
+                    for embed in ref_embeds:
+                        if 'description' in embed:
+                            embed_texts.append(embed['description'])
+                        if 'title' in embed:
+                            embed_texts.append(embed['title'])
+                    if embed_texts:
+                        content = '\n'.join(embed_texts)
+                        print(f"  Extracted from referenced embeds: {content[:100]}...")
 
             # Try to extract text from embeds
-            if embeds:
+            if not content and embeds:
                 embed_texts = []
                 for embed in embeds:
                     if 'description' in embed:
@@ -255,12 +279,21 @@ class DiscordWebSocketListener:
                     print(f"  Extracted from embeds: {content[:100]}...")
 
             # Check if it's a sticker-only message
-            if stickers:
+            if not content and stickers:
                 print(f"  Message is a sticker (not supported)")
 
-            # If still no content, print raw data for investigation
+            # If still no content, log for investigation
             if not content:
-                print(f"  Raw message data: {data}")
+                print(f"  WARNING: Message appears in Discord but has no extractable content")
+
+                # Check if referenced message was edited
+                if message_type == 19 and referenced_message and referenced_message.get('edited_timestamp'):
+                    print(f"  NOTE: The referenced message was edited - Discord API doesn't always")
+                    print(f"        include edited content in reply references.")
+                    print(f"  SOLUTION: Monitor the original message channel directly, not replies")
+                else:
+                    print(f"  This could be a Discord client-side rendering issue")
+
                 print(f"  Skipping: no text content found")
                 return
 
