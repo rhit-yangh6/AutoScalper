@@ -168,7 +168,6 @@ class ExecutionEngine:
                 print(f"  ⚠️  Contract not found for expiry {contract.lastTradeDateOrContractMonth}")
                 print(f"  Trying 0DTE (same-day expiry)...")
 
-                from datetime import datetime
                 today = datetime.now().strftime('%Y%m%d')
                 contract.lastTradeDateOrContractMonth = today
 
