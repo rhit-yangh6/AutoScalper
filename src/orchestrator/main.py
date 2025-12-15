@@ -1,5 +1,6 @@
 import asyncio
 import os
+import platform
 from datetime import datetime, time, timezone
 from typing import Optional
 
@@ -13,6 +14,13 @@ from .session_manager import SessionManager
 from ..models import Event, EventType
 from ..logging import init_logger, get_logger
 from ..notifications import init_notifier, get_notifier
+
+# Optional psutil for system monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 
 class TradingOrchestrator:
@@ -393,56 +401,57 @@ class TradingOrchestrator:
             text += f"\n"
 
             # System Resources (if psutil available)
-            try:
-                cpu_percent = psutil.cpu_percent(interval=0.1)
-                memory = psutil.virtual_memory()
-                disk = psutil.disk_usage('/')
+            if PSUTIL_AVAILABLE:
+                try:
+                    cpu_percent = psutil.cpu_percent(interval=0.1)
+                    memory = psutil.virtual_memory()
+                    disk = psutil.disk_usage('/')
 
-                text += f"<b>💻 System Resources</b>\n"
+                    text += f"<b>💻 System Resources</b>\n"
 
-                # CPU
-                if cpu_percent < 50:
-                    cpu_emoji = "✅"
-                elif cpu_percent < 80:
-                    cpu_emoji = "⚠️"
-                else:
-                    cpu_emoji = "🔴"
-                text += f"• CPU: {cpu_emoji} {cpu_percent:.1f}%\n"
+                    # CPU
+                    if cpu_percent < 50:
+                        cpu_emoji = "✅"
+                    elif cpu_percent < 80:
+                        cpu_emoji = "⚠️"
+                    else:
+                        cpu_emoji = "🔴"
+                    text += f"• CPU: {cpu_emoji} {cpu_percent:.1f}%\n"
 
-                # Memory
-                mem_percent = memory.percent
-                if mem_percent < 70:
-                    mem_emoji = "✅"
-                elif mem_percent < 90:
-                    mem_emoji = "⚠️"
-                else:
-                    mem_emoji = "🔴"
-                text += f"• Memory: {mem_emoji} {mem_percent:.1f}% ({memory.used / (1024**3):.1f}GB / {memory.total / (1024**3):.1f}GB)\n"
+                    # Memory
+                    mem_percent = memory.percent
+                    if mem_percent < 70:
+                        mem_emoji = "✅"
+                    elif mem_percent < 90:
+                        mem_emoji = "⚠️"
+                    else:
+                        mem_emoji = "🔴"
+                    text += f"• Memory: {mem_emoji} {mem_percent:.1f}% ({memory.used / (1024**3):.1f}GB / {memory.total / (1024**3):.1f}GB)\n"
 
-                # Disk
-                disk_percent = disk.percent
-                if disk_percent < 70:
-                    disk_emoji = "✅"
-                elif disk_percent < 90:
-                    disk_emoji = "⚠️"
-                else:
-                    disk_emoji = "🔴"
-                text += f"• Disk: {disk_emoji} {disk_percent:.1f}% ({disk.used / (1024**3):.1f}GB / {disk.total / (1024**3):.1f}GB)\n"
-                text += f"\n"
+                    # Disk
+                    disk_percent = disk.percent
+                    if disk_percent < 70:
+                        disk_emoji = "✅"
+                    elif disk_percent < 90:
+                        disk_emoji = "⚠️"
+                    else:
+                        disk_emoji = "🔴"
+                    text += f"• Disk: {disk_emoji} {disk_percent:.1f}% ({disk.used / (1024**3):.1f}GB / {disk.total / (1024**3):.1f}GB)\n"
+                    text += f"\n"
 
-                # System Info
-                text += f"<b>🖥️ System Info</b>\n"
-                text += f"• OS: {platform.system()} {platform.release()}\n"
-                text += f"• Python: {platform.python_version()}\n"
+                    # System Info
+                    text += f"<b>🖥️ System Info</b>\n"
+                    text += f"• OS: {platform.system()} {platform.release()}\n"
+                    text += f"• Python: {platform.python_version()}\n"
 
-            except ImportError:
+                except Exception as e:
+                    text += f"<b>💻 System Resources</b>\n"
+                    text += f"• Error: ⚠️ {str(e)}\n"
+                    text += f"\n"
+            else:
                 # psutil not available
                 text += f"<b>💻 System Resources</b>\n"
                 text += f"• Status: ⚠️ Not available (install psutil)\n"
-                text += f"\n"
-            except Exception as e:
-                text += f"<b>💻 System Resources</b>\n"
-                text += f"• Error: ⚠️ {str(e)}\n"
                 text += f"\n"
 
             # Risk Gate Status
