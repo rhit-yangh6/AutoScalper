@@ -226,11 +226,20 @@ class DiscordWebSocketListener:
         if not content:
             embeds = data.get('embeds', [])
             attachments = data.get('attachments', [])
+            stickers = data.get('sticker_items', [])
+            message_type = data.get('type', 0)
+            referenced_message = data.get('referenced_message')
 
             print(f"[DEBUG] Empty message from {author_name} in channel {channel_id}")
             print(f"  Message ID: {message_id}")
+            print(f"  Message type: {message_type}")
             print(f"  Has embeds: {len(embeds) > 0}")
             print(f"  Has attachments: {len(attachments) > 0}")
+            print(f"  Has stickers: {len(stickers) > 0}")
+            print(f"  Is reply: {referenced_message is not None}")
+
+            # Print all fields in the message for debugging
+            print(f"  Message fields: {list(data.keys())}")
 
             # Try to extract text from embeds
             if embeds:
@@ -245,8 +254,13 @@ class DiscordWebSocketListener:
                     content = '\n'.join(embed_texts)
                     print(f"  Extracted from embeds: {content[:100]}...")
 
-            # If still no content, skip the message
+            # Check if it's a sticker-only message
+            if stickers:
+                print(f"  Message is a sticker (not supported)")
+
+            # If still no content, print raw data for investigation
             if not content:
+                print(f"  Raw message data: {data}")
                 print(f"  Skipping: no text content found")
                 return
 
