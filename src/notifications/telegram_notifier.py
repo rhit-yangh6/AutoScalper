@@ -213,12 +213,13 @@ class TelegramNotifier:
 
         await self.send_message(text)
 
-    async def send_daily_summary(self, sessions: List[TradeSession]):
+    async def send_daily_summary(self, sessions: List[TradeSession], account_balance: Optional[float] = None):
         """
         Send end-of-day summary of all trades.
 
         Args:
             sessions: List of all sessions for the day
+            account_balance: Current account balance from IBKR (optional)
         """
         today = date.today().strftime('%Y-%m-%d')
 
@@ -242,7 +243,13 @@ class TelegramNotifier:
 
         # Build message
         text = f"<b>📊 DAILY TRADING SUMMARY</b>\n"
-        text += f"<b>Date:</b> {today}\n\n"
+        text += f"<b>Date:</b> {today}\n"
+
+        # Add account balance if available
+        if account_balance is not None:
+            text += f"<b>💰 Account Balance:</b> ${account_balance:,.2f}\n"
+
+        text += "\n"
 
         text += f"<b>📈 Sessions</b>\n"
         text += f"• Total: {total_sessions}\n"

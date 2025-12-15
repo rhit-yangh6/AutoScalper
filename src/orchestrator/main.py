@@ -178,7 +178,12 @@ class TradingOrchestrator:
                     # Get all sessions for today
                     all_sessions = list(self.session_manager.sessions.values())
 
-                    await self.notifier.send_daily_summary(all_sessions)
+                    # Get account balance if connected to IBKR
+                    account_balance = None
+                    if not self.paper_mode and self.executor.connected:
+                        account_balance = await self.executor.get_account_balance()
+
+                    await self.notifier.send_daily_summary(all_sessions, account_balance)
 
                     print("✓ Daily summary sent")
                 except Exception as e:

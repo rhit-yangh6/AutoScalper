@@ -66,6 +66,10 @@ class ExecutionEngine:
             )
             self.connected = True
             print(f"Connected to IBKR at {self.host}:{self.port}")
+
+            # Get and display account balance
+            await self._display_account_balance()
+
             return True
         except Exception as e:
             print(f"Failed to connect to IBKR: {e}")
@@ -486,3 +490,41 @@ class ExecutionEngine:
                 return False
 
         return False
+
+    async def get_account_balance(self) -> Optional[float]:
+        """
+        Get current account balance from IBKR.
+
+        Returns:
+            Account net liquidation value, or None if unavailable
+        """
+        if not self.connected:
+            return None
+
+        try:
+            # Request account summary
+            account_values = self.ib.accountSummary()
+
+            # Wait for data to populate
+            await asyncio.sleep(1)
+
+            # Find NetLiquidation value
+            for item in account_values:
+                if item.tag == 'NetLiquidation':
+                    return float(item.value)
+
+            return None
+        except Exception as e:
+            print(f"Error getting account balance: {e}")
+            return None
+
+    async def _display_account_balance(self):
+        """Display account balance on connection."""
+        try:
+            balance = await self.get_account_balance()
+            if balance:
+                print(f"Account Balance: ${balance:,.2f}")
+            else:
+                print("Account Balance: Unable to retrieve")
+        except Exception as e:
+            print(f"Could not retrieve account balance: {e}")
