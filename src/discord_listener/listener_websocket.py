@@ -222,6 +222,34 @@ class DiscordWebSocketListener:
             if author_name not in self.monitored_users:
                 return
 
+        # Debug: Check for embeds or attachments if content is empty
+        if not content:
+            embeds = data.get('embeds', [])
+            attachments = data.get('attachments', [])
+
+            print(f"[DEBUG] Empty message from {author_name} in channel {channel_id}")
+            print(f"  Message ID: {message_id}")
+            print(f"  Has embeds: {len(embeds) > 0}")
+            print(f"  Has attachments: {len(attachments) > 0}")
+
+            # Try to extract text from embeds
+            if embeds:
+                embed_texts = []
+                for embed in embeds:
+                    if 'description' in embed:
+                        embed_texts.append(embed['description'])
+                    if 'title' in embed:
+                        embed_texts.append(embed['title'])
+
+                if embed_texts:
+                    content = '\n'.join(embed_texts)
+                    print(f"  Extracted from embeds: {content[:100]}...")
+
+            # If still no content, skip the message
+            if not content:
+                print(f"  Skipping: no text content found")
+                return
+
         # Parse timestamp
         try:
             timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
