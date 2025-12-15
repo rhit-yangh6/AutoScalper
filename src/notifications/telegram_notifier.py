@@ -393,7 +393,7 @@ class TelegramNotifier:
                     print(f"⚠️  Error executing /{command_name}: {e}")
             else:
                 # Unknown command
-                await self.send_message(f"❓ Unknown command: /{command_name}\n\nAvailable commands:\n/status - Check positions and account")
+                await self.send_message(f"❓ Unknown command: /{command_name}\n\nAvailable commands:\n📊 /status - Check positions and account\n🖥️ /server - Check bot and IBKR health")
 
     def get_daily_stats(self) -> dict:
         """Get current daily statistics."""

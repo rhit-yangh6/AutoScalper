@@ -76,6 +76,7 @@ class TradingOrchestrator:
         # State
         self.running = False
         self.paper_mode = config.get("paper_mode", True)
+        self.start_time = None  # Will be set when bot starts
 
         print(
             f"Orchestrator initialized (paper_mode={self.paper_mode})"
@@ -93,6 +94,7 @@ class TradingOrchestrator:
         print("=" * 60 + "\n")
 
         self.running = True
+        self.start_time = datetime.now(timezone.utc)
 
         # Connect to IBKR (only if not in paper mode)
         if not self.paper_mode:
@@ -116,6 +118,7 @@ class TradingOrchestrator:
             # Register and start Telegram command polling
             print("Starting Telegram command handler...")
             self.notifier.register_command_handler("status", self._handle_status_command)
+            self.notifier.register_command_handler("server", self._handle_server_command)
             asyncio.create_task(self._telegram_command_polling_task())
 
         # Keep running
@@ -312,6 +315,162 @@ class TradingOrchestrator:
 
         except Exception as e:
             return f"❌ Error getting status: {str(e)}"
+
+    async def _handle_server_command(self, cmd: dict) -> str:
+        """
+        Handle /server command from Telegram.
+
+        Returns bot health and IBKR connection status.
+        """
+        try:
+            import psutil
+            import platform
+
+            mode = "📝 PAPER" if self.paper_mode else "🔴 LIVE"
+
+            # Calculate uptime
+            uptime_str = "Unknown"
+            if self.start_time:
+                uptime_delta = datetime.now(timezone.utc) - self.start_time
+                hours = int(uptime_delta.total_seconds() // 3600)
+                minutes = int((uptime_delta.total_seconds() % 3600) // 60)
+                uptime_str = f"{hours}h {minutes}m"
+
+            # Build response
+            text = f"<b>🖥️ {mode} SERVER HEALTH</b>\n\n"
+
+            # Bot Status
+            text += f"<b>🤖 Bot Status</b>\n"
+            if self.running:
+                text += f"• Status: ✅ Running\n"
+            else:
+                text += f"• Status: ⚠️ Stopped\n"
+            text += f"• Uptime: ⏱️ {uptime_str}\n"
+            text += f"• Mode: {mode}\n"
+            text += f"\n"
+
+            # IBKR Connection
+            text += f"<b>🏦 IBKR Connection</b>\n"
+            if self.paper_mode:
+                text += f"• Status: ⏸️ Disconnected (Paper Mode)\n"
+                text += f"• Port: {self.config['ibkr']['port']}\n"
+            else:
+                if self.executor.connected:
+                    text += f"• Status: ✅ Connected\n"
+                    text += f"• Host: {self.config['ibkr']['host']}\n"
+                    text += f"• Port: {self.config['ibkr']['port']}\n"
+
+                    # Get account balance
+                    balance = await self.executor.get_account_balance()
+                    if balance:
+                        text += f"• Account: 💰 ${balance:,.2f}\n"
+                else:
+                    text += f"• Status: ❌ Disconnected\n"
+                    text += f"• Host: {self.config['ibkr']['host']}\n"
+                    text += f"• Port: {self.config['ibkr']['port']}\n"
+            text += f"\n"
+
+            # Discord Listener
+            text += f"<b>💬 Discord Listener</b>\n"
+            if self.discord_listener.running:
+                text += f"• Status: ✅ Running\n"
+                text += f"• Channels: {len(self.discord_listener.channel_ids)}\n"
+                if self.discord_listener.monitored_users:
+                    text += f"• Users: {len(self.discord_listener.monitored_users)}\n"
+                else:
+                    text += f"• Users: All\n"
+            else:
+                text += f"• Status: ❌ Stopped\n"
+            text += f"\n"
+
+            # Session Manager
+            text += f"<b>📊 Session Manager</b>\n"
+            total_sessions = len(self.session_manager.sessions)
+            open_sessions = len([s for s in self.session_manager.sessions.values() if s.state == "OPEN"])
+            closed_sessions = len([s for s in self.session_manager.sessions.values() if s.state == "CLOSED"])
+            text += f"• Total Sessions: {total_sessions}\n"
+            text += f"• Open: 🟢 {open_sessions}\n"
+            text += f"• Closed: ⚪ {closed_sessions}\n"
+            text += f"\n"
+
+            # System Resources (if psutil available)
+            try:
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                memory = psutil.virtual_memory()
+                disk = psutil.disk_usage('/')
+
+                text += f"<b>💻 System Resources</b>\n"
+
+                # CPU
+                if cpu_percent < 50:
+                    cpu_emoji = "✅"
+                elif cpu_percent < 80:
+                    cpu_emoji = "⚠️"
+                else:
+                    cpu_emoji = "🔴"
+                text += f"• CPU: {cpu_emoji} {cpu_percent:.1f}%\n"
+
+                # Memory
+                mem_percent = memory.percent
+                if mem_percent < 70:
+                    mem_emoji = "✅"
+                elif mem_percent < 90:
+                    mem_emoji = "⚠️"
+                else:
+                    mem_emoji = "🔴"
+                text += f"• Memory: {mem_emoji} {mem_percent:.1f}% ({memory.used / (1024**3):.1f}GB / {memory.total / (1024**3):.1f}GB)\n"
+
+                # Disk
+                disk_percent = disk.percent
+                if disk_percent < 70:
+                    disk_emoji = "✅"
+                elif disk_percent < 90:
+                    disk_emoji = "⚠️"
+                else:
+                    disk_emoji = "🔴"
+                text += f"• Disk: {disk_emoji} {disk_percent:.1f}% ({disk.used / (1024**3):.1f}GB / {disk.total / (1024**3):.1f}GB)\n"
+                text += f"\n"
+
+                # System Info
+                text += f"<b>🖥️ System Info</b>\n"
+                text += f"• OS: {platform.system()} {platform.release()}\n"
+                text += f"• Python: {platform.python_version()}\n"
+
+            except ImportError:
+                # psutil not available
+                text += f"<b>💻 System Resources</b>\n"
+                text += f"• Status: ⚠️ Not available (install psutil)\n"
+                text += f"\n"
+            except Exception as e:
+                text += f"<b>💻 System Resources</b>\n"
+                text += f"• Error: ⚠️ {str(e)}\n"
+                text += f"\n"
+
+            # Risk Gate Status
+            text += f"<b>🛡️ Risk Gate</b>\n"
+            if self.risk_gate.kill_switch_active:
+                text += f"• Kill Switch: 🔴 ACTIVE\n"
+            else:
+                text += f"• Kill Switch: ✅ Inactive\n"
+            text += f"• Daily P&L: ${self.risk_gate.daily_pnl:,.2f}\n"
+            text += f"• Loss Streak: {self.risk_gate.current_loss_streak}\n"
+            text += f"\n"
+
+            # Telegram Status
+            text += f"<b>📱 Telegram Bot</b>\n"
+            if self.notifier and self.notifier.enabled:
+                text += f"• Status: ✅ Enabled\n"
+                text += f"• Chat ID: {self.notifier.chat_id}\n"
+            else:
+                text += f"• Status: ⚠️ Disabled\n"
+
+            # Timestamp
+            text += f"\n<i>🕐 Updated: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
+
+            return text
+
+        except Exception as e:
+            return f"❌ Error getting server health: {str(e)}"
 
     async def on_discord_message(
         self, message: str, author: str, message_id: str, timestamp: datetime

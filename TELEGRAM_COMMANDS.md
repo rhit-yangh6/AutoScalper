@@ -8,7 +8,7 @@ Your AutoScalper bot now supports **interactive commands** via Telegram! Send co
 
 ## Available Commands
 
-### `/status` - Check Current Positions
+### 📊 `/status` - Check Current Positions
 
 Get instant snapshot of your trading status.
 
@@ -49,6 +49,86 @@ Updated: 16:30:15 UTC
 - Verify entry filled
 - Check unrealized P&L
 - Monitor pending orders
+
+---
+
+### 🖥️ `/server` - Check Bot & IBKR Health
+
+Get comprehensive health check of the entire system.
+
+**Usage:**
+```
+/server
+```
+
+**Response Example:**
+```
+🖥️ 🔴 LIVE SERVER HEALTH
+
+🤖 Bot Status
+• Status: ✅ Running
+• Uptime: ⏱️ 5h 32m
+• Mode: 🔴 LIVE
+
+🏦 IBKR Connection
+• Status: ✅ Connected
+• Host: 127.0.0.1
+• Port: 4001
+• Account: 💰 $10,523.45
+
+💬 Discord Listener
+• Status: ✅ Running
+• Channels: 2
+• Users: All
+
+📊 Session Manager
+• Total Sessions: 12
+• Open: 🟢 2
+• Closed: ⚪ 10
+
+💻 System Resources
+• CPU: ✅ 15.3%
+• Memory: ✅ 42.8% (1.7GB / 4.0GB)
+• Disk: ✅ 35.2% (14.1GB / 40.0GB)
+
+🖥️ System Info
+• OS: Linux 5.15.0
+• Python: 3.11.5
+
+🛡️ Risk Gate
+• Kill Switch: ✅ Inactive
+• Daily P&L: $125.50
+• Loss Streak: 0
+
+📱 Telegram Bot
+• Status: ✅ Enabled
+• Chat ID: -5031664746
+
+🕐 Updated: 16:30:15 UTC
+```
+
+**What It Shows:**
+- 🤖 Bot running status & uptime
+- 🏦 IBKR connection & account balance
+- 💬 Discord listener health
+- 📊 Session statistics
+- 💻 CPU, Memory, Disk usage
+- 🛡️ Risk gate status & P&L
+- 📱 Telegram bot status
+- 🖥️ System information
+
+**When to Use:**
+- Daily health check
+- Troubleshoot connection issues
+- Monitor system resources
+- Verify bot is running correctly
+- Check if IBKR is connected
+
+**Status Indicators:**
+- ✅ Green = Healthy/Normal
+- ⚠️ Yellow = Warning
+- 🔴 Red = Critical/Error
+- ⏸️ Paused/Disabled
 
 ---
 
@@ -323,10 +403,16 @@ Processing command: /status from chat -5031664746
 
 ## Summary
 
-✅ **Added `/status` command** for instant position checks
-✅ **Shows real-time P&L** from IBKR positions
+✅ **Two commands available:**
+- 📊 `/status` - Check positions and P&L
+- 🖥️ `/server` - Check bot and IBKR health
+
+✅ **Shows real-time data** from IBKR and system
 ✅ **5-10 second response time** via polling
 ✅ **Secure** - only works for your chat ID
 ✅ **Works in paper and live mode**
+✅ **Full system monitoring** - CPU, memory, disk, uptime
 
-**Try it now:** Send `/status` to your bot!
+**Try them now:**
+- Send `/status` to check your positions
+- Send `/server` to check bot health
