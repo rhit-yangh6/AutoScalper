@@ -447,12 +447,13 @@ class TradingOrchestrator:
 
             # Risk Gate Status
             text += f"<b>🛡️ Risk Gate</b>\n"
-            if self.risk_gate.kill_switch_active:
+            # Kill switch is on executor, not risk_gate
+            if self.executor.kill_switch_active:
                 text += f"• Kill Switch: 🔴 ACTIVE\n"
             else:
                 text += f"• Kill Switch: ✅ Inactive\n"
             text += f"• Daily P&L: ${self.risk_gate.daily_pnl:,.2f}\n"
-            text += f"• Loss Streak: {self.risk_gate.current_loss_streak}\n"
+            text += f"• Loss Streak: {self.risk_gate.loss_streak}\n"
             text += f"\n"
 
             # Telegram Status
