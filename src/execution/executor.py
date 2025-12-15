@@ -502,14 +502,20 @@ class ExecutionEngine:
             return None
 
         try:
-            # Request account summary
-            account_values = self.ib.accountSummary()
-
-            # Wait for data to populate
+            # Wait a moment for initial data to populate after connection
             await asyncio.sleep(1)
+
+            # Get account values (already populated by ib_insync after connection)
+            account_values = self.ib.accountValues()
 
             # Find NetLiquidation value
             for item in account_values:
+                if item.tag == 'NetLiquidation':
+                    return float(item.value)
+
+            # If not found, try accountSummary
+            account_summary = self.ib.accountSummary()
+            for item in account_summary:
                 if item.tag == 'NetLiquidation':
                     return float(item.value)
 
@@ -521,10 +527,13 @@ class ExecutionEngine:
     async def _display_account_balance(self):
         """Display account balance on connection."""
         try:
+            # Give IBKR extra time to populate account data after connection
+            await asyncio.sleep(2)
+
             balance = await self.get_account_balance()
             if balance:
                 print(f"Account Balance: ${balance:,.2f}")
             else:
-                print("Account Balance: Unable to retrieve")
+                print("Account Balance: Unable to retrieve (data may not be ready yet)")
         except Exception as e:
             print(f"Could not retrieve account balance: {e}")
