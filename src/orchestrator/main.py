@@ -11,6 +11,7 @@ from ..execution import ExecutionEngine
 from ..discord_listener import DiscordListener
 from .session_manager import SessionManager
 from ..models import Event, EventType
+from ..logging import init_logger, get_logger
 
 
 class TradingOrchestrator:
@@ -30,6 +31,11 @@ class TradingOrchestrator:
 
         # Initialize components
         print("Initializing Trading Orchestrator...")
+
+        # Initialize logger
+        log_dir = config.get("log_dir", "logs")
+        self.logger = init_logger(base_dir=log_dir)
+        print(f"Logger initialized (log_dir={log_dir})")
 
         self.parser = LLMParser(
             api_key=config["anthropic_api_key"],
@@ -102,6 +108,10 @@ class TradingOrchestrator:
         await self.discord_listener.stop()
         await self.executor.disconnect()
 
+        # Flush all logs
+        print("Flushing logs...")
+        self.logger.flush_all()
+
         print("Orchestrator stopped.")
 
     async def on_discord_message(
@@ -112,6 +122,7 @@ class TradingOrchestrator:
 
         This is the main processing pipeline.
         """
+        session = None
         try:
             print(f"\n{'='*60}")
             print(f"NEW MESSAGE from {author}")
@@ -133,15 +144,29 @@ class TradingOrchestrator:
             except Exception as e:
                 print(f"✗ Parsing failed: {e}")
                 print("  ACTION: NO TRADE (parsing failure)")
+                # Log error
+                self.logger.log_error(None, "PARSING_ERROR", str(e))
                 return
 
             # Step 2: Correlate to session
             print("\n[2/5] Correlating to trade session...")
             session = self.session_manager.process_event(event)
 
+            # Log Discord message (even if not actionable)
+            self.logger.log_discord_message(
+                session=session,
+                author=author,
+                message=message,
+                timestamp=timestamp,
+                message_id=message_id,
+            )
+
             if not session:
                 print("✓ Event processed (non-actionable or ignored)")
                 return
+
+            # Log parsed event
+            self.logger.log_parsed_event(session=session, event=event)
 
             print(f"✓ Linked to session {session.session_id[:8]}...")
             print(f"  Session state: {session.state}")
@@ -209,11 +234,64 @@ class TradingOrchestrator:
                 if event.stop_loss:
                     print(f"    Stop: ${event.stop_loss}")
                 print("  ACTION: SIMULATED (paper trading)")
+
+                # Log simulated order
+                order_details = {
+                    "quantity": quantity,
+                    "entry_price": event.entry_price,
+                    "stop_loss": event.stop_loss,
+                    "targets": event.targets,
+                    "mode": "PAPER"
+                }
+                self.logger.log_order_submitted(
+                    session=session,
+                    event_type=event.event_type,
+                    order_details=order_details,
+                )
+
+                # Log simulated result
+                from ..execution.executor import OrderResult, OrderStatus
+                simulated_result = OrderResult(
+                    success=True,
+                    status=OrderStatus.FILLED,
+                    filled_price=event.entry_price,
+                    message="Simulated fill (paper mode)"
+                )
+                self.logger.log_order_result(
+                    session=session,
+                    event_type=event.event_type,
+                    result=simulated_result,
+                )
             else:
+                # Log order submission
+                order_details = {
+                    "quantity": quantity,
+                    "entry_price": event.entry_price,
+                    "stop_loss": event.stop_loss,
+                    "targets": event.targets,
+                    "underlying": session.underlying,
+                    "strike": session.strike,
+                    "expiry": session.expiry,
+                    "direction": session.direction.value if session.direction else None
+                }
+                self.logger.log_order_submitted(
+                    session=session,
+                    event_type=event.event_type,
+                    order_details=order_details,
+                )
+
+                # Execute the order
                 result = await self.executor.execute_event(
                     event=event,
                     session=session,
                     quantity=quantity,
+                )
+
+                # Log order result
+                self.logger.log_order_result(
+                    session=session,
+                    event_type=event.event_type,
+                    result=result,
                 )
 
                 if result.success:
@@ -228,8 +306,12 @@ class TradingOrchestrator:
         except Exception as e:
             print(f"\nCRITICAL ERROR in message processing: {e}")
             print("ACTION: NO TRADE (system error)")
-            import traceback
 
+            # Log critical error
+            if session:
+                self.logger.log_error(session, "CRITICAL_ERROR", str(e))
+
+            import traceback
             traceback.print_exc()
 
 
