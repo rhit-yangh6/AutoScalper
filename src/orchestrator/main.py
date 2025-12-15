@@ -323,7 +323,6 @@ class TradingOrchestrator:
         Returns bot health and IBKR connection status.
         """
         try:
-            import psutil
             import platform
 
             mode = "📝 PAPER" if self.paper_mode else "🔴 LIVE"
