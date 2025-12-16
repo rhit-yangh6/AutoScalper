@@ -58,6 +58,10 @@ class TelegramNotifier:
         self.last_update_id: Optional[int] = None
         self.command_handlers: Dict = {}
 
+        # Daily tracking for statistics
+        self.daily_orders: List[Dict] = []
+        self.daily_fills: List[Dict] = []
+
     async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         """
         Send a message to Telegram.

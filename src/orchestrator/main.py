@@ -12,7 +12,7 @@ from ..execution import ExecutionEngine
 from ..execution.executor import OrderResult
 from ..discord_listener import DiscordListener
 from .session_manager import SessionManager
-from ..models import Event, EventType
+from ..models import Event, EventType, SessionState
 from ..logging import init_logger, get_logger, DailySnapshotManager
 from ..notifications import init_notifier, get_notifier
 
@@ -197,9 +197,10 @@ class TradingOrchestrator:
         try:
             hour, minute = map(int, snapshot_time_str.split(":"))
             snapshot_time = time(hour=hour, minute=minute)
-        except:
+        except (ValueError, TypeError, AttributeError) as e:
             # Default to 9:30 AM ET (13:30 UTC)
             snapshot_time = time(hour=13, minute=30)
+            print(f"Invalid snapshot time format: {e}")
 
         print(f"Daily snapshot will be taken at {snapshot_time_str} UTC (trading hours start)")
 
@@ -263,9 +264,10 @@ class TradingOrchestrator:
         try:
             hour, minute = map(int, summary_time_str.split(":"))
             summary_time = time(hour=hour, minute=minute)
-        except:
+        except (ValueError, TypeError, AttributeError) as e:
             # Default to 8 PM UTC (4 PM ET)
             summary_time = time(hour=20, minute=0)
+            print(f"Invalid summary time format: {e}")
 
         print(f"Daily summary will be sent at {summary_time_str} UTC (after trading hours close)")
 
@@ -357,7 +359,7 @@ class TradingOrchestrator:
                 open_orders = await self.executor.get_open_orders()
 
             # Get active sessions
-            open_sessions = [s for s in self.session_manager.sessions.values() if s.state == "OPEN"]
+            open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
 
             # Build response
             text = f"<b>📊 {mode} STATUS</b>\n\n"
@@ -381,11 +383,11 @@ class TradingOrchestrator:
                     pnl_text = ""
                     try:
                         unrealized_pnl = pos.unrealizedPNL
-                        if unrealized_pnl:
-                            pnl_pct = (unrealized_pnl / (avg_cost * abs(qty) * 100)) * 100 if avg_cost > 0 else 0
+                        if unrealized_pnl and avg_cost > 0 and abs(qty) > 0:
+                            pnl_pct = (unrealized_pnl / (avg_cost * abs(qty) * 100)) * 100
                             pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
                             pnl_text = f" {pnl_emoji} {unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
-                    except:
+                    except (ZeroDivisionError, TypeError, AttributeError):
                         pass
 
                     text += f"• {symbol}: {qty} @ ${avg_cost:.2f}{pnl_text}\n"
@@ -501,8 +503,8 @@ class TradingOrchestrator:
             # Session Manager
             text += f"<b>📊 Session Manager</b>\n"
             total_sessions = len(self.session_manager.sessions)
-            open_sessions = len([s for s in self.session_manager.sessions.values() if s.state == "OPEN"])
-            closed_sessions = len([s for s in self.session_manager.sessions.values() if s.state == "CLOSED"])
+            open_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN])
+            closed_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.CLOSED])
             text += f"• Total Sessions: {total_sessions}\n"
             text += f"• Open: 🟢 {open_sessions}\n"
             text += f"• Closed: ⚪ {closed_sessions}\n"

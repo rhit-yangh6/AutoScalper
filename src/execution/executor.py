@@ -5,7 +5,7 @@ from typing import Optional
 from pydantic import BaseModel
 from ib_insync import IB, Option, LimitOrder, Order, Trade
 
-from ..models import Event, TradeSession, EventType, Direction
+from ..models import Event, TradeSession, EventType, Direction, SessionState
 
 
 class OrderStatus(str, Enum):
@@ -445,7 +445,7 @@ class ExecutionEngine:
 
             if filled:
                 # Update session
-                session.state = "OPEN"
+                session.state = SessionState.OPEN
                 session.opened_at = datetime.now(timezone.utc)
 
                 # Store bracket order IDs for monitoring
@@ -603,7 +603,7 @@ class ExecutionEngine:
             filled = await self._wait_for_fill(trade, timeout=30)
 
             if filled:
-                session.state = "CLOSED"
+                session.state = SessionState.CLOSED
                 session.closed_at = datetime.now(timezone.utc)
 
                 return OrderResult(
