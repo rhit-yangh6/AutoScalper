@@ -9,7 +9,9 @@ Sends notifications via Telegram Bot API for:
 
 import asyncio
 import aiohttp
+import json
 from datetime import datetime, date, timezone
+from pathlib import Path
 from typing import Optional, List, Dict
 from enum import Enum
 
@@ -51,10 +53,6 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.enabled = enabled
         self.api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-
-        # Track daily stats
-        self.daily_orders: List[Dict] = []
-        self.daily_fills: List[Dict] = []
 
         # Command handling
         self.last_update_id: Optional[int] = None
@@ -169,18 +167,6 @@ class TelegramNotifier:
             result: Order result
             paper_mode: Whether in paper trading mode
         """
-        # Track for daily summary
-        self.daily_fills.append({
-            'time': datetime.now(timezone.utc),
-            'session_id': session.session_id,
-            'event_type': event_type.value,
-            'result': {
-                'status': result.status,  # Already a string value
-                'filled_price': result.filled_price,
-                'order_id': result.order_id,
-            }
-        })
-
         # result.status is already a string value (Pydantic's use_enum_values = True)
         # Determine emoji and color based on status string
         if result.status == "FILLED":
@@ -209,6 +195,13 @@ class TelegramNotifier:
         if result.filled_price:
             text += f"<b>Fill Price:</b> ${result.filled_price:.2f}\n"
 
+        # Add P&L for exits
+        if event_type in [EventType.SL, EventType.TP, EventType.EXIT]:
+            if hasattr(session, 'realized_pnl') and session.realized_pnl is not None:
+                pnl = session.realized_pnl
+                pnl_emoji = "💰" if pnl > 0 else "📉" if pnl < 0 else "⚪"
+                text += f"<b>P&L:</b> {pnl_emoji} ${pnl:+,.2f}\n"
+
         if result.message:
             text += f"\n<i>{result.message}</i>\n"
 
@@ -217,80 +210,196 @@ class TelegramNotifier:
 
         await self.send_message(text)
 
-    async def send_daily_summary(self, sessions: List[TradeSession], account_balance: Optional[float] = None):
+    async def send_daily_summary(
+        self,
+        date_str: str,
+        snapshot: Optional[dict] = None,
+        account_balance: Optional[float] = None,
+        log_dir: str = "logs"
+    ):
         """
-        Send end-of-day summary of all trades.
+        Send end-of-day summary using snapshot + session logs.
+
+        This implementation is resilient to bot restarts - it reads from
+        the snapshot file and session JSON logs instead of in-memory state.
 
         Args:
-            sessions: List of all sessions for the day
+            date_str: Date to summarize (YYYY-MM-DD format)
+            snapshot: Snapshot data (or None to read from file)
             account_balance: Current account balance from IBKR (optional)
+            log_dir: Base directory for logs
         """
-        today = date.today().strftime('%Y-%m-%d')
+        # Load snapshot from file if not provided
+        if not snapshot:
+            from ..logging import DailySnapshotManager
+            snapshot_manager = DailySnapshotManager(log_dir)
+            snapshot = snapshot_manager.get_snapshot_for_date(date_str)
 
-        # Calculate stats
-        total_sessions = len(sessions)
-        closed_sessions = [s for s in sessions if s.state == "CLOSED"]
-        open_sessions = [s for s in sessions if s.state == "OPEN"]
+        starting_balance = snapshot["account_balance"] if snapshot else None
 
-        total_fills = len(self.daily_fills)
-        total_orders = len(self.daily_orders)
+        # Read session logs for the day
+        day_dir = Path(log_dir) / date_str
+        sessions_data = []
 
-        # Calculate P&L (simplified - would need actual fill prices from session)
+        if day_dir.exists():
+            session_files = list(day_dir.glob("session_*.json"))
+            for session_file in session_files:
+                try:
+                    with open(session_file, 'r') as f:
+                        sessions_data.append(json.load(f))
+                except Exception as e:
+                    print(f"⚠️ Failed to read session log {session_file}: {e}")
+
+        # Calculate stats from session logs
+        total_sessions = len(sessions_data)
+        total_orders = 0
+        total_fills = 0
         total_pnl = 0.0
         winning_trades = 0
         losing_trades = 0
 
-        for session in closed_sessions:
-            # This is a placeholder - you'd calculate actual P&L from fills
-            # For now, we'll skip P&L calculation
-            pass
+        closed_sessions = []
+        open_sessions = []
 
-        # Build message
+        for session_data in sessions_data:
+            entries = session_data.get("entries", [])
+
+            # Count orders and fills
+            for entry in entries:
+                if entry.get("type") == "order_submitted":
+                    total_orders += 1
+                elif entry.get("type") == "order_result":
+                    if entry.get("status") == "FILLED":
+                        total_fills += 1
+
+            # Get session closure info
+            session_closed_entry = next(
+                (e for e in entries if e.get("type") == "session_closed"),
+                None
+            )
+
+            if session_closed_entry:
+                closed_sessions.append(session_data)
+                final_pnl = session_closed_entry.get("final_pnl", 0.0)
+                if final_pnl is not None:
+                    total_pnl += final_pnl
+                    if final_pnl > 0:
+                        winning_trades += 1
+                    elif final_pnl < 0:
+                        losing_trades += 1
+            else:
+                open_sessions.append(session_data)
+
+        # Build summary message
         text = f"<b>📊 DAILY TRADING SUMMARY</b>\n"
-        text += f"<b>Date:</b> {today}\n"
+        text += f"<b>Date:</b> {date_str}\n\n"
 
-        # Add account balance if available
+        # Starting balance from snapshot
+        if snapshot:
+            text += f"<b>💰 Starting Balance:</b> ${starting_balance:,.2f}\n"
+            snapshot_time = snapshot.get("timestamp", "")[:19].replace("T", " ")
+            text += f"    <i>Snapshot: {snapshot_time} UTC ({snapshot.get('balance_source', 'UNKNOWN')})</i>\n"
+        else:
+            text += f"<b>⚠️ Starting Balance:</b> Not available (no snapshot taken)\n"
+            text += f"    <i>Bot was not running at trading_hours_start</i>\n"
+
+        # Current balance
         if account_balance is not None:
-            text += f"<b>💰 Account Balance:</b> ${account_balance:,.2f}\n"
+            text += f"<b>💰 Current Balance:</b> ${account_balance:,.2f}\n"
+            if starting_balance is not None:
+                daily_change = account_balance - starting_balance
+                daily_pct = (daily_change / starting_balance) * 100 if starting_balance > 0 else 0
+                emoji = "📈" if daily_change >= 0 else "📉"
+                text += f"    {emoji} <b>Daily Change:</b> ${daily_change:+,.2f} ({daily_pct:+.2f}%)\n"
 
         text += "\n"
 
-        text += f"<b>📈 Sessions</b>\n"
+        # Performance stats
+        total_closed = winning_trades + losing_trades
+        win_rate_pct = (winning_trades / total_closed * 100) if total_closed > 0 else 0
+
+        text += f"<b>📈 Performance</b>\n"
+        text += f"• Total P&L: ${total_pnl:+,.2f}\n"
+        if total_closed > 0:
+            text += f"• Win Rate: {win_rate_pct:.1f}% ({winning_trades}/{total_closed})\n"
+            text += f"• Winning Trades: {winning_trades}\n"
+            text += f"• Losing Trades: {losing_trades}\n"
+        else:
+            text += f"• No closed trades\n"
+        text += "\n"
+
+        # Session stats
+        text += f"<b>📋 Sessions</b>\n"
         text += f"• Total: {total_sessions}\n"
         text += f"• Closed: {len(closed_sessions)}\n"
         text += f"• Open: {len(open_sessions)}\n\n"
 
-        text += f"<b>📋 Activity</b>\n"
+        # Activity stats
+        text += f"<b>📊 Activity</b>\n"
         text += f"• Orders Submitted: {total_orders}\n"
         text += f"• Orders Filled: {total_fills}\n\n"
 
-        # List sessions
+        # List closed positions
         if closed_sessions:
             text += f"<b>🔒 Closed Positions</b>\n"
-            for session in closed_sessions[:5]:  # Show first 5
-                symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "?"
-                events_count = len(session.events)
-                text += f"• {symbol} - {events_count} events\n"
+            for session_data in closed_sessions[:5]:  # Show first 5
+                # Extract session info from entries
+                parsed_event = next(
+                    (e for e in session_data.get("entries", []) if e.get("type") == "parsed_event"),
+                    None
+                )
+                session_closed = next(
+                    (e for e in session_data.get("entries", []) if e.get("type") == "session_closed"),
+                    None
+                )
+
+                if parsed_event:
+                    underlying = parsed_event.get("underlying", "?")
+                    strike = parsed_event.get("strike", 0)
+                    direction = parsed_event.get("direction", "?")
+                    direction_short = direction[0] if direction else "?"
+                    symbol = f"{underlying} {strike}{direction_short}"
+
+                    pnl = session_closed.get("final_pnl", 0.0) if session_closed else 0.0
+                    pnl_emoji = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
+                    text += f"• {symbol} - {pnl_emoji} ${pnl:+.2f}\n"
 
             if len(closed_sessions) > 5:
                 text += f"<i>... and {len(closed_sessions) - 5} more</i>\n"
             text += "\n"
 
+        # List open positions
         if open_sessions:
             text += f"<b>🔓 Open Positions</b>\n"
-            for session in open_sessions:
-                symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "?"
-                qty = session.total_quantity
-                text += f"• {symbol} - {qty} contracts\n"
+            for session_data in open_sessions[:5]:  # Show first 5
+                parsed_event = next(
+                    (e for e in session_data.get("entries", []) if e.get("type") == "parsed_event"),
+                    None
+                )
+
+                if parsed_event:
+                    underlying = parsed_event.get("underlying", "?")
+                    strike = parsed_event.get("strike", 0)
+                    direction = parsed_event.get("direction", "?")
+                    direction_short = direction[0] if direction else "?"
+                    symbol = f"{underlying} {strike}{direction_short}"
+
+                    # Count filled orders to get quantity
+                    filled_orders = [
+                        e for e in session_data.get("entries", [])
+                        if e.get("type") == "order_result" and e.get("status") == "FILLED"
+                    ]
+                    qty = len(filled_orders)  # Simplified - each fill is 1 contract
+
+                    text += f"• {symbol} - {qty} contracts\n"
+
+            if len(open_sessions) > 5:
+                text += f"<i>... and {len(open_sessions) - 5} more</i>\n"
             text += "\n"
 
         text += f"<i>Summary generated at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
 
         await self.send_message(text)
-
-        # Reset daily counters
-        self.daily_orders = []
-        self.daily_fills = []
 
     async def notify_error(self, error_type: str, error_message: str):
         """

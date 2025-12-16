@@ -168,6 +168,23 @@ class SessionManager:
         """Get today's date as expiry (for 0DTE)."""
         return datetime.now(timezone.utc).date().isoformat()
 
+    def get_sessions_for_date_str(self, date_str: str) -> list:
+        """
+        Get all sessions for a specific date.
+
+        Args:
+            date_str: Date in YYYY-MM-DD format
+
+        Returns:
+            List of sessions created on that date
+        """
+        target_date = datetime.fromisoformat(date_str).date()
+
+        return [
+            s for s in self.sessions.values()
+            if s.created_at.date() == target_date
+        ]
+
     def cleanup_old_sessions(self, days: int = 7) -> int:
         """
         Remove sessions older than specified days.

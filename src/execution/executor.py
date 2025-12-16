@@ -47,6 +47,7 @@ class ExecutionEngine:
         host: str = "127.0.0.1",
         port: int = 7497,  # 7497 = paper, 7496 = live
         client_id: int = 1,
+        session_manager=None,  # For bracket order monitoring
     ):
         self.host = host
         self.port = port
@@ -54,6 +55,7 @@ class ExecutionEngine:
         self.ib = IB()
         self.connected = False
         self.kill_switch_active = False
+        self.session_manager = session_manager
 
         # Track submitted orders for idempotency
         self.submitted_orders: dict[str, Trade] = {}
@@ -65,7 +67,12 @@ class ExecutionEngine:
                 host=self.host, port=self.port, clientId=self.client_id
             )
             self.connected = True
+
+            # Register order monitoring callback
+            self.ib.orderStatusEvent += self._on_order_status_change
+
             print(f"Connected to IBKR at {self.host}:{self.port}")
+            print("Order monitoring active (bracket fills will be detected)")
 
             # Get and display account balance
             await self._display_account_balance()
@@ -99,6 +106,175 @@ class ExecutionEngine:
         """Deactivate kill switch (use with caution)."""
         self.kill_switch_active = False
         print("Kill switch deactivated")
+
+    def _on_order_status_change(self, trade):
+        """
+        Callback when ANY order status changes.
+
+        Detects bracket child order fills (stop loss / take profit) and
+        updates session state, calculates P&L, and sends notifications.
+        """
+        order_id = trade.order.orderId
+        status = trade.orderStatus.status
+        parent_id = trade.orderStatus.parentId
+
+        # Only care about filled orders
+        if status != "Filled":
+            return
+
+        # Only care about child orders (parent_id > 0)
+        if parent_id == 0:
+            return
+
+        # Find session by order ID
+        if not self.session_manager:
+            return
+
+        session = self._find_session_by_order_id(order_id)
+
+        if not session:
+            return
+
+        # Ensure session is still open
+        from ..models import SessionState
+        if session.state != SessionState.OPEN:
+            return
+
+        # Determine if this is stop or target
+        if order_id == session.stop_order_id:
+            # Stop loss filled
+            asyncio.create_task(self._handle_stop_filled(session, trade))
+        elif order_id in session.target_order_ids:
+            # Take profit filled
+            asyncio.create_task(self._handle_target_filled(session, trade))
+
+    def _find_session_by_order_id(self, order_id: int):
+        """Find session by stop or target order ID."""
+
+        if not self.session_manager:
+            return None
+
+        for session in self.session_manager.sessions.values():
+            if session.stop_order_id == order_id:
+                return session
+            if order_id in session.target_order_ids:
+                return session
+
+        return None
+
+    def _calculate_session_pnl(
+        self,
+        session,
+        exit_price: float
+    ) -> float:
+        """
+        Calculate realized P&L for a session.
+
+        P&L = (Exit Price - Avg Entry Price) × Total Quantity × 100
+
+        Options have 100 multiplier (each contract = 100 shares).
+        """
+
+        if session.total_quantity == 0:
+            return 0.0
+
+        price_diff = exit_price - session.avg_entry_price
+        contract_multiplier = 100
+        pnl = price_diff * session.total_quantity * contract_multiplier
+
+        return round(pnl, 2)
+
+    async def _handle_stop_filled(self, session, trade):
+        """Handle stop loss bracket order fill."""
+
+        fill_price = trade.orderStatus.avgFillPrice
+        pnl = self._calculate_session_pnl(session, fill_price)
+
+        # Update session
+        from ..models import SessionState
+        session.state = SessionState.CLOSED
+        session.closed_at = datetime.now(timezone.utc)
+        session.exit_reason = "STOP_HIT"
+        session.exit_order_id = trade.order.orderId
+        session.exit_price = fill_price
+        session.realized_pnl = pnl
+
+        # Cancel remaining target orders
+        await self._cancel_sibling_orders(session.target_order_ids)
+
+        # Log to console
+        symbol = f"{session.underlying} {session.strike}{session.direction.value[0] if session.direction else '?'}"
+        print(f"🛑 STOP HIT: {symbol} @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
+
+        # Create OrderResult for notification
+        result = OrderResult(
+            success=True,
+            order_id=trade.order.orderId,
+            status=OrderStatus.FILLED,
+            filled_price=fill_price,
+            message=f"Stop loss triggered at ${fill_price:.2f} | P&L: ${pnl:+,.2f}"
+        )
+
+        # Send Telegram notification (via orchestrator callback)
+        if hasattr(self, 'on_bracket_filled'):
+            from ..models import EventType
+            await self.on_bracket_filled(session, EventType.SL, result)
+
+    async def _handle_target_filled(self, session, trade):
+        """Handle take profit bracket order fill."""
+
+        fill_price = trade.orderStatus.avgFillPrice
+        pnl = self._calculate_session_pnl(session, fill_price)
+
+        # Update session
+        from ..models import SessionState
+        session.state = SessionState.CLOSED
+        session.closed_at = datetime.now(timezone.utc)
+        session.exit_reason = "TARGET_HIT"
+        session.exit_order_id = trade.order.orderId
+        session.exit_price = fill_price
+        session.realized_pnl = pnl
+
+        # Cancel stop loss order
+        if session.stop_order_id:
+            await self._cancel_sibling_orders([session.stop_order_id])
+
+        # Log to console
+        symbol = f"{session.underlying} {session.strike}{session.direction.value[0] if session.direction else '?'}"
+        print(f"🎯 TARGET HIT: {symbol} @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
+
+        # Create OrderResult for notification
+        result = OrderResult(
+            success=True,
+            order_id=trade.order.orderId,
+            status=OrderStatus.FILLED,
+            filled_price=fill_price,
+            message=f"Take profit hit at ${fill_price:.2f} | P&L: ${pnl:+,.2f}"
+        )
+
+        # Send Telegram notification (via orchestrator callback)
+        if hasattr(self, 'on_bracket_filled'):
+            from ..models import EventType
+            await self.on_bracket_filled(session, EventType.TP, result)
+
+    async def _cancel_sibling_orders(self, order_ids: list[int]):
+        """Cancel sibling bracket orders when one fills (OCO behavior)."""
+
+        if not order_ids:
+            return
+
+        for order_id in order_ids:
+            try:
+                # Find the trade by order ID
+                trades = self.ib.trades()
+                for trade in trades:
+                    if trade.order.orderId == order_id:
+                        if trade.isActive():
+                            self.ib.cancelOrder(trade.order)
+                            print(f"  ✓ Cancelled sibling order {order_id}")
+                        break
+            except Exception as e:
+                print(f"  ⚠️ Failed to cancel order {order_id}: {e}")
 
     async def execute_event(
         self,
@@ -219,6 +395,19 @@ class ExecutionEngine:
                 # Update session
                 session.state = "OPEN"
                 session.opened_at = datetime.now(timezone.utc)
+
+                # Store bracket order IDs for monitoring
+                session.entry_order_id = parent_trade.order.orderId
+
+                if len(trades) > 1:
+                    session.stop_order_id = trades[1].order.orderId
+
+                if len(trades) > 2:
+                    session.target_order_ids = [t.order.orderId for t in trades[2:]]
+
+                # Update position tracking
+                session.total_quantity = quantity
+                session.avg_entry_price = parent_trade.orderStatus.avgFillPrice
 
                 # Log the bracket structure
                 msg = f"Entry filled at ${parent_trade.orderStatus.avgFillPrice:.2f}"

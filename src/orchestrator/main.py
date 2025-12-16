@@ -9,10 +9,11 @@ from dotenv import load_dotenv
 from ..llm_parser import LLMParser
 from ..risk_gate import RiskGate, RiskDecision
 from ..execution import ExecutionEngine
+from ..execution.executor import OrderResult
 from ..discord_listener import DiscordListener
 from .session_manager import SessionManager
 from ..models import Event, EventType
-from ..logging import init_logger, get_logger
+from ..logging import init_logger, get_logger, DailySnapshotManager
 from ..notifications import init_notifier, get_notifier
 
 # Optional psutil for system monitoring
@@ -44,6 +45,7 @@ class TradingOrchestrator:
         # Initialize logger
         log_dir = config.get("log_dir", "logs")
         self.logger = init_logger(base_dir=log_dir)
+        self.snapshot_manager = DailySnapshotManager(base_dir=log_dir)
         print(f"Logger initialized (log_dir={log_dir})")
 
         # Initialize Telegram notifier
@@ -72,7 +74,11 @@ class TradingOrchestrator:
             host=config["ibkr"]["host"],
             port=config["ibkr"]["port"],
             client_id=config["ibkr"]["client_id"],
+            session_manager=self.session_manager,
         )
+
+        # Register bracket fill callback
+        self.executor.on_bracket_filled = self._on_bracket_filled
 
         self.discord_listener = DiscordListener(
             token=config["discord"]["user_token"],
@@ -118,10 +124,12 @@ class TradingOrchestrator:
         print("Starting Discord listener...")
         asyncio.create_task(self.discord_listener.start())
 
-        # Start daily summary task if Telegram enabled
+        # Start daily summary and snapshot tasks if Telegram enabled
         if self.notifier:
             print("Starting daily summary scheduler...")
             asyncio.create_task(self._daily_summary_task())
+            print("Starting daily snapshot scheduler...")
+            asyncio.create_task(self._daily_snapshot_task())
 
             # Register and start Telegram command polling
             print("Starting Telegram command handler...")
@@ -154,6 +162,72 @@ class TradingOrchestrator:
         self.logger.flush_all()
 
         print("Orchestrator stopped.")
+
+    async def _daily_snapshot_task(self):
+        """
+        Background task that takes snapshot at trading_hours_start.
+
+        Uses TRADING_HOURS_START from config (default: 13:30 UTC = 9:30 AM ET)
+        """
+        snapshot_time_str = self.config["risk"]["trading_hours_start"]
+        try:
+            hour, minute = map(int, snapshot_time_str.split(":"))
+            snapshot_time = time(hour=hour, minute=minute)
+        except:
+            # Default to 9:30 AM ET (13:30 UTC)
+            snapshot_time = time(hour=13, minute=30)
+
+        print(f"Daily snapshot will be taken at {snapshot_time_str} UTC (trading hours start)")
+
+        while self.running:
+            now = datetime.now(timezone.utc)
+            target_time = datetime.combine(now.date(), snapshot_time, tzinfo=timezone.utc)
+
+            # If target time already passed today, check if snapshot exists
+            if now > target_time:
+                # Try to take snapshot now (will skip if already exists)
+                try:
+                    snapshot = await self.snapshot_manager.take_snapshot(
+                        executor=self.executor,
+                        paper_mode=self.paper_mode,
+                        account_balance_config=self.config["risk"]["account_balance"],
+                        trading_hours_start=snapshot_time_str
+                    )
+                    if snapshot:
+                        print(f"✓ Daily snapshot taken: ${snapshot['account_balance']:,.2f}")
+                except Exception as e:
+                    print(f"✗ Failed to take snapshot: {e}")
+
+                # Schedule for tomorrow
+                from datetime import timedelta
+                target_time += timedelta(days=1)
+
+            # Calculate seconds until target time
+            seconds_until_snapshot = (target_time - now).total_seconds()
+
+            # Wait until snapshot time
+            await asyncio.sleep(seconds_until_snapshot)
+
+            # Take snapshot
+            if self.running:
+                try:
+                    print(f"\nTaking daily snapshot at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}...")
+
+                    snapshot = await self.snapshot_manager.take_snapshot(
+                        executor=self.executor,
+                        paper_mode=self.paper_mode,
+                        account_balance_config=self.config["risk"]["account_balance"],
+                        trading_hours_start=snapshot_time_str
+                    )
+
+                    if snapshot:
+                        print(f"✓ Snapshot saved: ${snapshot['account_balance']:,.2f}")
+
+                except Exception as e:
+                    print(f"✗ Failed to take snapshot: {e}")
+
+            # Wait a bit to avoid taking multiple snapshots
+            await asyncio.sleep(60)
 
     async def _daily_summary_task(self):
         """
@@ -191,15 +265,25 @@ class TradingOrchestrator:
                 try:
                     print(f"\nSending daily summary at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}...")
 
-                    # Get all sessions for today
-                    all_sessions = list(self.session_manager.sessions.values())
+                    # Get today's date
+                    today = datetime.now(timezone.utc).date().isoformat()
 
-                    # Get account balance if connected to IBKR
+                    # Get snapshot for today
+                    snapshot = self.snapshot_manager.get_snapshot_for_date(today)
+
+                    # Get current account balance if connected to IBKR
                     account_balance = None
-                    if not self.paper_mode and self.executor.connected:
+                    if self.executor.connected:
+                        # Get balance for both paper and live modes
                         account_balance = await self.executor.get_account_balance()
 
-                    await self.notifier.send_daily_summary(all_sessions, account_balance)
+                    # Send summary using snapshot + logs
+                    await self.notifier.send_daily_summary(
+                        date_str=today,
+                        snapshot=snapshot,
+                        account_balance=account_balance,
+                        log_dir=self.config.get("log_dir", "logs")
+                    )
 
                     print("✓ Daily summary sent")
                 except Exception as e:
@@ -716,6 +800,42 @@ class TradingOrchestrator:
 
             import traceback
             traceback.print_exc()
+
+    async def _on_bracket_filled(self, session, event_type: EventType, result: OrderResult):
+        """
+        Callback when bracket order fills (stop loss or take profit).
+
+        Args:
+            session: The TradeSession that closed
+            event_type: EventType.SL or EventType.TP
+            result: OrderResult with fill details
+        """
+        # Log to file
+        self.logger.log_order_result(session, event_type, result)
+
+        # Close the session in logs
+        self.logger.log_session_closed(
+            session,
+            reason=session.exit_reason,
+            final_pnl=session.realized_pnl
+        )
+
+        # Send Telegram notification
+        if self.notifier:
+            await self.notifier.notify_order_filled(
+                session=session,
+                event_type=event_type,
+                result=result
+            )
+
+        # Log to console
+        symbol = f"{session.underlying} {session.strike}{session.direction.value[0] if session.direction else '?'}"
+        exit_type = "STOP LOSS" if event_type == EventType.SL else "TAKE PROFIT"
+        print(f"\n{'='*60}")
+        print(f"{exit_type} FILLED: {symbol}")
+        print(f"Exit Price: ${result.filled_price:.2f}")
+        print(f"P&L: ${session.realized_pnl:+,.2f}")
+        print(f"{'='*60}\n")
 
 
 async def main():

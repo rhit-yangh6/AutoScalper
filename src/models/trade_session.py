@@ -63,6 +63,16 @@ class TradeSession(BaseModel):
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
 
+    # Order tracking (for bracket monitoring)
+    entry_order_id: Optional[int] = None
+    stop_order_id: Optional[int] = None
+    target_order_ids: list[int] = Field(default_factory=list)
+
+    # Exit tracking
+    exit_reason: Optional[str] = None  # "STOP_HIT", "TARGET_HIT", "MANUAL_EXIT"
+    exit_order_id: Optional[int] = None
+    exit_price: Optional[float] = None
+
     # Controls
     max_adds: int = 1  # From config, default from proposal
     num_adds: int = 0
