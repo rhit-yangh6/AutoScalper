@@ -1,45 +1,18 @@
 services:
-  ibgateway:
-    image: ghcr.io/gnzsnz/ib-gateway:stable
-    container_name: ibgateway
+  ib-gateway:
+    image: gnzsnz/ib-gateway:stable
+    container_name: ib-gateway
     restart: unless-stopped
     environment:
-      # IB Credentials
-      TWS_USERID: ${IB_USERNAME}
-      TWS_PASSWORD: ${IB_PASSWORD}
-
-      # Trading mode: "paper" or "live"
-      TRADING_MODE: paper
-
-      # Gateway settings
-      READ_ONLY_API: "no"
-      GATEWAY_OR_TWS: gateway
-
-      # IBC settings
-      TWOFA_TIMEOUT_ACTION: restart
-      TWS_ACCEPT_INCOMING: "accept"
-
-      # VNC password (for debugging/viewing Gateway UI)
-      VNC_PASSWORD: ${VNC_PASSWORD:-ibgateway}
-
+      - TWS_USERID=${IB_USERNAME}
+      - TWS_PASSWORD=${IB_PASSWORD}
+      - TRADING_MODE=paper
+      - JAVA_HEAP_SIZE=2048
+      - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-changeme}
     ports:
-      # Gateway API ports
-      - "4001:4001"  # Live trading
-      - "4002:4002"  # Paper trading
-
-      # VNC port (optional - for viewing Gateway UI remotely)
+      - "4001:4001"
+      - "4002:4002"
       - "5900:5900"
-
-    volumes:
-      # Persist Gateway settings
-      - ./docker/ibgateway/settings:/root/Jts
-
-    healthcheck:
-      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/4002' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
 
   bot:
     build: .
@@ -49,18 +22,9 @@ services:
     env_file:
       - .env
     environment:
-      # Use localhost since we're on host network
-      IBKR_HOST: 127.0.0.1
-      IBKR_PORT: 4002
+      - IBKR_HOST=127.0.0.1
+      - IBKR_PORT=4002
     volumes:
       - ./logs:/app/logs
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'python -m src.orchestrator.main' || exit 1"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
-networks:
-  default:
-    name: trading_network
+    depends_on:
+      - ib-gateway

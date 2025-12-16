@@ -186,6 +186,7 @@
   },
   "active": "b98d20507c559b6f",
   "lastOpenFiles": [
+    "DOCKER_SETUP.md",
     "DOCKER_SETUP_CLEAN.md",
     "test-gateway.sh",
     "docker-start.sh",
