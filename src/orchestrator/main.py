@@ -117,10 +117,25 @@ class TradingOrchestrator:
         # Connect to IBKR (only if not in paper mode)
         if not self.paper_mode:
             print("Connecting to IBKR...")
-            connected = await self.executor.connect()
-            if not connected:
-                print("ERROR: Failed to connect to IBKR. Exiting.")
-                return
+
+            # Retry connection up to 10 times with exponential backoff
+            max_retries = 10
+            retry_delay = 5  # Start with 5 seconds
+
+            for attempt in range(1, max_retries + 1):
+                print(f"Connection attempt {attempt}/{max_retries}...")
+                connected = await self.executor.connect()
+
+                if connected:
+                    break
+
+                if attempt < max_retries:
+                    print(f"Connection failed. Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)  # Max 60 seconds
+                else:
+                    print("ERROR: Failed to connect to IBKR after all retries. Exiting.")
+                    return
         else:
             print("Skipping IBKR connection (paper mode - no orders will be sent)")
 
