@@ -9,6 +9,7 @@ services:
       - TRADING_MODE=paper
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-changeme}
       - TIME_ZONE=America/New_York
+      - READ_ONLY_API=no
     ports:
       - "127.0.0.1:4001:4003"
       - "127.0.0.1:4002:4004"
