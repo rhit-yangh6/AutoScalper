@@ -33,11 +33,11 @@ services:
       - ./docker/ibgateway/settings:/root/Jts
 
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "4002"]
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/4002' || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 60s
+      retries: 5
+      start_period: 120s
 
   bot:
     build: .
