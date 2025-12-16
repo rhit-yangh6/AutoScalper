@@ -31,8 +31,8 @@ services:
       - "5900:5900"
 
     volumes:
-      # Persist Gateway settings
-      - ./docker/ibgateway/settings:/root/Jts
+      # Persist Gateway settings (Gateway uses /home/ibgateway/Jts)
+      - ./docker/ibgateway/settings:/home/ibgateway/Jts
 
     healthcheck:
       test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/4002' || exit 1"]
