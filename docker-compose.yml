@@ -31,8 +31,8 @@ services:
       - "5900:5900"
 
     volumes:
-      # Persist Gateway settings (Gateway uses /home/ibgateway/Jts)
-      - ./docker/ibgateway/settings:/home/ibgateway/Jts
+      # Persist Gateway settings
+      - ./docker/ibgateway/settings:/root/Jts
 
     healthcheck:
       test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/4002' || exit 1"]
@@ -45,14 +45,12 @@ services:
     build: .
     container_name: autoscalper
     restart: unless-stopped
-    depends_on:
-      ibgateway:
-        condition: service_healthy
+    network_mode: host
     env_file:
       - .env
     environment:
-      # Override IBKR connection to use container name
-      IBKR_HOST: ibgateway
+      # Use localhost since we're on host network
+      IBKR_HOST: 127.0.0.1
       IBKR_PORT: 4002
     volumes:
       - ./logs:/app/logs
