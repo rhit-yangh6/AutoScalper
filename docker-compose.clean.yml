@@ -1,0 +1,45 @@
+services:
+  ibgateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ibgateway
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${IB_USERNAME}
+      TWS_PASSWORD: ${IB_PASSWORD}
+      TRADING_MODE: paper
+      READ_ONLY_API: "no"
+      TWOFA_TIMEOUT_ACTION: restart
+      VNC_PASSWORD: ${VNC_PASSWORD:-ibgateway}
+    ports:
+      - "4002:4002"  # Paper trading port
+      - "5900:5900"  # VNC
+    volumes:
+      - gateway-settings:/root/Jts
+    healthcheck:
+      test: ["CMD-SHELL", "exit 0"]  # Always healthy (we'll check manually)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  bot:
+    build: .
+    container_name: autoscalper
+    restart: unless-stopped
+    depends_on:
+      - ibgateway
+    network_mode: host  # Use host network to avoid Docker networking issues
+    env_file:
+      - .env
+    environment:
+      IBKR_HOST: 127.0.0.1
+      IBKR_PORT: 4002
+    volumes:
+      - ./logs:/app/logs
+
+volumes:
+  gateway-settings:
+    driver: local
+
+networks:
+  default:
+    name: trading_network
