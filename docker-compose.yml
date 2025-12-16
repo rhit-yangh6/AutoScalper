@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  ibgateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ibgateway
+    restart: unless-stopped
+    environment:
+      # IB Credentials
+      TWS_USERID: ${IB_USERNAME}
+      TWS_PASSWORD: ${IB_PASSWORD}
+
+      # Trading mode: "paper" or "live"
+      TRADING_MODE: paper
+
+      # Gateway settings
+      READ_ONLY_API: "no"
+
+      # IBC settings
+      TWOFA_TIMEOUT_ACTION: restart
+
+      # VNC password (for debugging/viewing Gateway UI)
+      VNC_PASSWORD: ${VNC_PASSWORD:-ibgateway}
+
+    ports:
+      # Gateway API ports
+      - "4001:4001"  # Live trading
+      - "4002:4002"  # Paper trading
+
+      # VNC port (optional - for viewing Gateway UI remotely)
+      - "5900:5900"
+
+    volumes:
+      # Persist Gateway settings
+      - ./docker/ibgateway/settings:/root/Jts
+
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional: Your trading bot in the same network
+  # bot:
+  #   build: .
+  #   container_name: autoscalper
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - ibgateway
+  #   environment:
+  #     IBKR_HOST: ibgateway
+  #     IBKR_PORT: 4002
+  #   volumes:
+  #     - ./logs:/app/logs
+  #     - ./.env:/app/.env
+  #   network_mode: bridge
+
+networks:
+  default:
+    name: trading_network

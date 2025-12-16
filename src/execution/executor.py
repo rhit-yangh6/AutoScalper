@@ -56,6 +56,8 @@ class ExecutionEngine:
         self.connected = False
         self.kill_switch_active = False
         self.session_manager = session_manager
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 10
 
         # Track submitted orders for idempotency
         self.submitted_orders: dict[str, Trade] = {}
@@ -67,12 +69,17 @@ class ExecutionEngine:
                 host=self.host, port=self.port, clientId=self.client_id
             )
             self.connected = True
+            self.reconnect_attempts = 0
 
             # Register order monitoring callback
             self.ib.orderStatusEvent += self._on_order_status_change
 
+            # Register disconnection callback
+            self.ib.disconnectedEvent += self._on_disconnected
+
             print(f"Connected to IBKR at {self.host}:{self.port}")
             print("Order monitoring active (bracket fills will be detected)")
+            print("Auto-reconnection enabled")
 
             # Get and display account balance
             await self._display_account_balance()
@@ -82,6 +89,51 @@ class ExecutionEngine:
             print(f"Failed to connect to IBKR: {e}")
             self.connected = False
             return False
+
+    def _on_disconnected(self):
+        """Callback when IBKR connection is lost."""
+        self.connected = False
+        print("⚠️ IBKR connection lost! Auto-reconnection will attempt...")
+
+        # Notify via callback if available
+        if hasattr(self, 'on_disconnected'):
+            asyncio.create_task(self.on_disconnected())
+
+    async def reconnect(self) -> bool:
+        """Attempt to reconnect to IBKR."""
+        if self.reconnect_attempts >= self.max_reconnect_attempts:
+            print(f"❌ Max reconnection attempts ({self.max_reconnect_attempts}) reached. Manual intervention required.")
+            return False
+
+        self.reconnect_attempts += 1
+        print(f"🔄 Reconnection attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}...")
+
+        # Wait before attempting (exponential backoff)
+        wait_time = min(2 ** self.reconnect_attempts, 60)  # Max 60 seconds
+        await asyncio.sleep(wait_time)
+
+        try:
+            success = await self.connect()
+            if success:
+                print(f"✓ Reconnected to IBKR successfully!")
+
+                # Notify via callback if available
+                if hasattr(self, 'on_reconnected'):
+                    await self.on_reconnected()
+
+                return True
+            else:
+                return False
+        except Exception as e:
+            print(f"Reconnection attempt failed: {e}")
+            return False
+
+    async def ensure_connected(self) -> bool:
+        """Ensure connection is active, reconnect if necessary."""
+        if not self.connected:
+            print("⚠️ Not connected to IBKR. Attempting to reconnect...")
+            return await self.reconnect()
+        return True
 
     async def disconnect(self) -> None:
         """Disconnect from IBKR."""

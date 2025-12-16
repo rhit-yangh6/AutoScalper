@@ -49,3 +49,6 @@ config/secrets.yaml
 
 # Paper trading logs
 paper_trading_logs/
+
+# Docker volumes (IB Gateway settings)
+docker/ibgateway/settings/

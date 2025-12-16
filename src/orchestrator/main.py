@@ -80,6 +80,10 @@ class TradingOrchestrator:
         # Register bracket fill callback
         self.executor.on_bracket_filled = self._on_bracket_filled
 
+        # Register connection callbacks
+        self.executor.on_disconnected = self._on_ibkr_disconnected
+        self.executor.on_reconnected = self._on_ibkr_reconnected
+
         self.discord_listener = DiscordListener(
             token=config["discord"]["user_token"],
             channel_ids=config["discord"]["channel_ids"],
@@ -136,6 +140,11 @@ class TradingOrchestrator:
             self.notifier.register_command_handler("status", self._handle_status_command)
             self.notifier.register_command_handler("server", self._handle_server_command)
             asyncio.create_task(self._telegram_command_polling_task())
+
+        # Start connection monitoring (if not in paper mode)
+        if not self.paper_mode:
+            print("Starting IBKR connection monitor...")
+            asyncio.create_task(self._connection_monitor_task())
 
         # Keep running
         try:
@@ -836,6 +845,61 @@ class TradingOrchestrator:
         print(f"Exit Price: ${result.filled_price:.2f}")
         print(f"P&L: ${session.realized_pnl:+,.2f}")
         print(f"{'='*60}\n")
+
+    async def _connection_monitor_task(self):
+        """
+        Background task to monitor IBKR connection and auto-reconnect if needed.
+
+        Checks connection every 60 seconds and attempts reconnection if disconnected.
+        """
+        print("Connection monitor active (checks every 60 seconds)")
+
+        while self.running:
+            await asyncio.sleep(60)  # Check every minute
+
+            if not self.executor.connected:
+                print("⚠️ Connection monitor detected disconnection. Attempting reconnection...")
+
+                # Attempt to reconnect
+                success = await self.executor.reconnect()
+
+                if not success:
+                    print("❌ Reconnection failed. Will retry on next check...")
+
+                    # Send alert if reconnection keeps failing
+                    if self.executor.reconnect_attempts >= 5 and self.notifier:
+                        await self.notifier.send_message(
+                            "<b>⚠️ IBKR CONNECTION ISSUE</b>\n\n"
+                            f"Failed to reconnect after {self.executor.reconnect_attempts} attempts.\n"
+                            "Bot will continue attempting to reconnect.\n\n"
+                            "<i>Please check IBKR Gateway is running.</i>"
+                        )
+
+    async def _on_ibkr_disconnected(self):
+        """Callback when IBKR connection is lost."""
+        print("🔴 IBKR disconnected - auto-reconnection initiated")
+
+        # Send Telegram notification
+        if self.notifier:
+            await self.notifier.send_message(
+                "<b>🔴 IBKR DISCONNECTED</b>\n\n"
+                "Connection to IBKR Gateway lost.\n"
+                "Auto-reconnection will attempt shortly.\n\n"
+                "<i>Bracket orders are still active on IBKR side.</i>"
+            )
+
+    async def _on_ibkr_reconnected(self):
+        """Callback when IBKR connection is restored."""
+        print("🟢 IBKR reconnected successfully")
+
+        # Send Telegram notification
+        if self.notifier:
+            await self.notifier.send_message(
+                "<b>✅ IBKR RECONNECTED</b>\n\n"
+                "Connection to IBKR Gateway restored.\n"
+                "Bot is now fully operational.\n\n"
+                f"<i>Reconnected at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
+            )
 
 
 async def main():
