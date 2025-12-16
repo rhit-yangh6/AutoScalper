@@ -13,9 +13,11 @@ services:
 
       # Gateway settings
       READ_ONLY_API: "no"
+      GATEWAY_OR_TWS: gateway
 
       # IBC settings
       TWOFA_TIMEOUT_ACTION: restart
+      TWS_ACCEPT_INCOMING: "accept"
 
       # VNC password (for debugging/viewing Gateway UI)
       VNC_PASSWORD: ${VNC_PASSWORD:-ibgateway}
