@@ -66,7 +66,7 @@ class ExecutionEngine:
         """Connect to IBKR TWS/Gateway."""
         try:
             await self.ib.connectAsync(
-                host=self.host, port=self.port, clientId=self.client_id
+                host=self.host, port=self.port, clientId=self.client_id, timeout=30
             )
             self.connected = True
             self.reconnect_attempts = 0
