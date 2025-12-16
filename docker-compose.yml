@@ -1,18 +1,18 @@
 services:
   ib-gateway:
-    image: gnzsnz/ib-gateway:stable
+    image: ghcr.io/gnzsnz/ib-gateway:stable
     container_name: ib-gateway
     restart: unless-stopped
     environment:
       - TWS_USERID=${IB_USERNAME}
       - TWS_PASSWORD=${IB_PASSWORD}
       - TRADING_MODE=paper
-      - JAVA_HEAP_SIZE=2048
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-changeme}
+      - TIME_ZONE=America/New_York
     ports:
-      - "4001:4001"
-      - "4002:4002"
-      - "5900:5900"
+      - "127.0.0.1:4001:4003"
+      - "127.0.0.1:4002:4004"
+      - "127.0.0.1:5900:5900"
 
   bot:
     build: .
