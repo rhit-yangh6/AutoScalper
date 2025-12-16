@@ -27,7 +27,7 @@ class TradeSession(BaseModel):
     A session correlates related Discord messages (NEW, ADD, EXIT, etc.)
     for the same trade idea. Session correlation rules:
     - Same author
-    - Same underlying (SPY/SPX)
+    - Same underlying (SPY/QQQ/SPX)
     - Same direction (CALL/PUT)
     - Same trading day
     - Most recent open session wins
@@ -39,7 +39,7 @@ class TradeSession(BaseModel):
 
     # Trade definition
     author: str  # Discord username who initiated the trade
-    underlying: str  # "SPY" or "SPXW"
+    underlying: str  # "SPY", "QQQ", or "SPXW"
     direction: Direction
     strike: float
     expiry: str  # ISO date string

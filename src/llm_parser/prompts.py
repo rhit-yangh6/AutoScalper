@@ -24,7 +24,7 @@ EVENT TYPES:
 - IGNORE: Irrelevant chatter
 
 PARSING GUIDELINES:
-- Underlying: must be "SPY" or "SPXW" (SPX weekly)
+- Underlying: must be "SPY", "QQQ", or "SPXW" (SPX weekly)
 - Direction: CALL or PUT
 - Strike: numeric value
 - Entry price: premium paid per contract
@@ -33,7 +33,7 @@ PARSING GUIDELINES:
 
 EXPIRY DATE RULES (CRITICAL):
 - **DEFAULT**: If no expiry mentioned or unclear → use TODAY'S DATE (0DTE)
-- SPY/SPX options typically expire on FRIDAYS (weekly) or 3rd Friday (monthly)
+- SPY/QQQ/SPX options typically expire on FRIDAYS (weekly) or 3rd Friday (monthly)
 - If message mentions a date that's NOT a Friday → IGNORE IT, use TODAY instead
 - Only use a future date if it's clearly stated AND is a Friday
 - When in doubt → TODAY'S DATE (safer for 0DTE trading)
@@ -47,7 +47,7 @@ CRITICAL: Return ONLY a valid JSON object. Nothing else.
 
 Required fields for Event JSON:
 - event_type: One of NEW, PLAN, ADD, TARGETS, TRIM, MOVE_STOP, TP, SL, EXIT, CANCEL, RISK_NOTE, IGNORE
-- underlying: "SPY" or "SPXW" (null if not mentioned)
+- underlying: "SPY", "QQQ", or "SPXW" (null if not mentioned)
 - direction: "CALL" or "PUT" (null if not mentioned)
 - strike: Numeric strike price (null if not mentioned)
 - expiry: ISO date string "YYYY-MM-DD" (null if not mentioned)

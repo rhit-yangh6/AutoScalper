@@ -19,7 +19,7 @@ class Event(BaseModel):
     message_id: str  # Discord message ID for idempotency
 
     # Trade details (populated based on event type)
-    underlying: Optional[str] = None  # "SPY" or "SPXW"
+    underlying: Optional[str] = None  # "SPY", "QQQ", or "SPXW"
     direction: Optional[Direction] = None
     strike: Optional[float] = None
     expiry: Optional[str] = None  # ISO date string for the option expiry

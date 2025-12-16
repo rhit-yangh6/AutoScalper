@@ -656,8 +656,18 @@ class ExecutionEngine:
         # Convert expiry from ISO format (2025-12-12) to IBKR format (20251212)
         expiry_ibkr = event.expiry.replace('-', '') if event.expiry else ''
 
+        # Map underlying to IBKR symbol
+        if event.underlying == "SPY":
+            symbol = "SPY"
+        elif event.underlying == "QQQ":
+            symbol = "QQQ"
+        elif event.underlying == "SPXW":
+            symbol = "SPX"
+        else:
+            symbol = event.underlying  # Fallback to raw value
+
         return Option(
-            symbol="SPY" if event.underlying == "SPY" else "SPX",
+            symbol=symbol,
             lastTradeDateOrContractMonth=expiry_ibkr,
             strike=event.strike,
             right="C" if event.direction == Direction.CALL else "P",
@@ -669,8 +679,18 @@ class ExecutionEngine:
         # Convert expiry from ISO format (2025-12-12) to IBKR format (20251212)
         expiry_ibkr = session.expiry.replace('-', '') if session.expiry else ''
 
+        # Map underlying to IBKR symbol
+        if session.underlying == "SPY":
+            symbol = "SPY"
+        elif session.underlying == "QQQ":
+            symbol = "QQQ"
+        elif session.underlying == "SPXW":
+            symbol = "SPX"
+        else:
+            symbol = session.underlying  # Fallback to raw value
+
         return Option(
-            symbol="SPY" if session.underlying == "SPY" else "SPX",
+            symbol=symbol,
             lastTradeDateOrContractMonth=expiry_ibkr,
             strike=session.strike,
             right="C" if session.direction == Direction.CALL else "P",
