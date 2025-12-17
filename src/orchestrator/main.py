@@ -624,6 +624,18 @@ class TradingOrchestrator:
                 print(f"✓ Parsed as {event.event_type}")
                 if event.llm_reasoning:
                     print(f"  Reasoning: {event.llm_reasoning}")
+
+                # Validate NEW events have required fields and sufficient confidence
+                if event.event_type == EventType.NEW:
+                    if not all([event.underlying, event.direction, event.strike]):
+                        print(f"⚠️ NEW event missing required fields (underlying/direction/strike)")
+                        print(f"  Reclassifying as IGNORE (LLM was too aggressive)")
+                        event.event_type = EventType.IGNORE
+                    elif event.parsing_confidence and event.parsing_confidence < 0.7:
+                        print(f"⚠️ NEW event has low confidence ({event.parsing_confidence:.2f})")
+                        print(f"  Reclassifying as IGNORE (insufficient confidence)")
+                        event.event_type = EventType.IGNORE
+
             except Exception as e:
                 print(f"✗ Parsing failed: {e}")
                 print("  ACTION: NO TRADE (parsing failure)")

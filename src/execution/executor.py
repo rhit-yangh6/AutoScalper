@@ -81,6 +81,11 @@ class ExecutionEngine:
             print("Order monitoring active (bracket fills will be detected)")
             print("Auto-reconnection enabled")
 
+            # Request delayed market data (free, no subscription needed)
+            # This is 15-minute delayed but better than nothing for paper trading
+            self.ib.reqMarketDataType(3)  # 3 = delayed data, 1 = real-time, 4 = delayed-frozen
+            print("Using delayed market data (15-min delay, free)")
+
             # Get and display account balance
             await self._display_account_balance()
 
@@ -442,61 +447,12 @@ class ExecutionEngine:
                 else:
                     print(f"  ⚠️ Could not fetch underlying price, using original target: ${target_price:.2f}")
 
-            # Get current market data for comparison
-            print(f"  Fetching current market data...")
-            ticker = self.ib.reqMktData(contract)
-            await asyncio.sleep(1)  # Wait for market data
-
-            market_bid = ticker.bid if ticker.bid else 0
-            market_ask = ticker.ask if ticker.ask else 0
-            market_last = ticker.last if ticker.last else 0
-
-            if market_bid and market_ask:
-                print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last ${market_last:.2f}")
-            elif market_last:
-                print(f"  📊 Market: Last ${market_last:.2f}")
-
-            # Determine entry price with 5-cent flexibility
-            alert_price = event.entry_price
-            if not alert_price:
-                alert_price = await self._get_market_price(contract)
-
-            if not alert_price:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message="Could not determine entry price",
-                )
-
-            entry_price = alert_price
-
-            # Allow up to 5 cents deviation from alert price
-            max_entry_price = alert_price + 0.05
-
-            if market_ask and market_ask > entry_price:
-                if market_ask <= max_entry_price:
-                    # Market moved up but within tolerance, adjust to market ask
-                    old_price = entry_price
-                    entry_price = market_ask
-                    print(f"  ⓘ Adjusting entry: ${old_price:.2f} → ${entry_price:.2f} (market moved, within 5¢ tolerance)")
-                else:
-                    # Market moved too far above alert price
-                    deviation = market_ask - alert_price
-                    print(f"  ⚠️ WARNING: Market ask ${market_ask:.2f} is ${deviation:.2f} above alert price ${alert_price:.2f}")
-                    print(f"  ⚠️ Using max allowed: ${max_entry_price:.2f} (alert + 5¢)")
-                    entry_price = max_entry_price
-            elif market_ask and market_ask < entry_price:
-                # Market is below our alert price - great, use market ask for better entry
-                old_price = entry_price
-                entry_price = market_ask
-                print(f"  ✓ Better entry available: ${old_price:.2f} → ${entry_price:.2f} (below alert price)")
-
-            # Step 1: Submit ONLY parent order (no brackets yet)
-            parent_order = LimitOrder("BUY", quantity, entry_price)
-            parent_order.tif = "DAY"
+            # Step 1: Submit MARKET order for guaranteed fill
+            from ib_insync import MarketOrder
+            parent_order = MarketOrder("BUY", quantity)
             parent_trade = self.ib.placeOrder(contract, parent_order)
 
-            print(f"  ⓘ Entry order submitted @ ${entry_price:.2f}, waiting for fill...")
+            print(f"  ⓘ MARKET order submitted for {quantity} contracts, waiting for fill...")
 
             # Step 2: Wait for parent fill
             filled = await self._wait_for_fill(parent_trade, timeout=30)
@@ -678,21 +634,12 @@ class ExecutionEngine:
             contract = qualified[0]
             print(f"  ✓ Qualified contract: {contract.localSymbol}")
 
-            add_price = event.entry_price or await self._get_market_price(contract)
-
-            if not add_price:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message="Could not determine add price",
-                )
-
-            # Submit ADD order
-            order = LimitOrder("BUY", quantity, add_price)
-            order.tif = "DAY"
+            # Submit ADD order as MARKET order for guaranteed fill
+            from ib_insync import MarketOrder
+            order = MarketOrder("BUY", quantity)
             trade = self.ib.placeOrder(contract, order)
 
-            print(f"  ⓘ ADD order submitted: {quantity} contracts @ ${add_price:.2f}")
+            print(f"  ⓘ ADD MARKET order submitted: {quantity} contracts")
 
             # Wait for fill
             filled = await self._wait_for_fill(trade, timeout=30)
@@ -1067,22 +1014,36 @@ class ExecutionEngine:
         original_target: Optional[float],
     ) -> tuple[Optional[float], Optional[float]]:
         """
-        Calculate bracket prices to use with actual fill price.
+        Calculate bracket prices based on actual fill price.
 
-        Since we can't determine the original intended entry price from Discord,
-        we use the original stop/target prices as-is. The key improvement is that
-        brackets are created AFTER fill, so any slippage affects all prices equally.
+        Priority:
+        1. Use Discord alert stop/target if provided
+        2. Otherwise calculate from fill price using config percentages
 
         Args:
             actual_fill_price: Actual fill price from parent order
-            original_stop: Original stop price from Discord
-            original_target: Original target price from Discord
+            original_stop: Original stop price from Discord (or None)
+            original_target: Original target price from Discord (or None)
 
         Returns:
             (stop_price, target_price) tuple
         """
+        # Use Discord prices if provided
         stop_price = original_stop
         target_price = original_target
+
+        # Calculate from fill price if not provided
+        if not stop_price:
+            # Default: 25% stop loss from fill price
+            stop_percent = 25.0  # This should come from config
+            stop_price = actual_fill_price * (1 - stop_percent / 100)
+            print(f"  ⓘ Auto stop-loss: ${stop_price:.2f} ({stop_percent}% below fill)")
+
+        if not target_price:
+            # Default: 2:1 risk/reward ratio
+            risk = actual_fill_price - stop_price
+            target_price = actual_fill_price + (risk * 2.0)
+            print(f"  ⓘ Auto target: ${target_price:.2f} (2:1 R/R)")
 
         # Round to 2 decimals for option premiums
         if stop_price:
@@ -1348,19 +1309,26 @@ class ExecutionEngine:
     async def _get_market_price(self, contract: Option) -> Optional[float]:
         """Get current market price for contract."""
         try:
+            import math
+
             # Use async qualification (contract should already be qualified, but ensure)
             qualified = await self.ib.qualifyContractsAsync(contract)
             if qualified:
                 contract = qualified[0]
 
             ticker = self.ib.reqMktData(contract)
-            await asyncio.sleep(1)  # Wait for data
+            await asyncio.sleep(2)  # Wait for data (longer for delayed data)
+
+            # Clean NaN values
+            bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+            ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+            last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
 
             # Use midpoint of bid/ask
-            if ticker.bid and ticker.ask:
-                return (ticker.bid + ticker.ask) / 2
-            elif ticker.last:
-                return ticker.last
+            if bid and ask:
+                return (bid + ask) / 2
+            elif last:
+                return last
 
             return None
         except Exception as e:
@@ -1392,14 +1360,20 @@ class ExecutionEngine:
             stock = qualified[0]
 
             # Get market data
+            import math
             ticker = self.ib.reqMktData(stock)
-            await asyncio.sleep(1)  # Wait for data
+            await asyncio.sleep(2)  # Wait for data (longer for delayed data)
+
+            # Clean NaN values
+            last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+            bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+            ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
 
             # Use last price or midpoint
-            if ticker.last:
-                return ticker.last
-            elif ticker.bid and ticker.ask:
-                return (ticker.bid + ticker.ask) / 2
+            if last:
+                return last
+            elif bid and ask:
+                return (bid + ask) / 2
 
             return None
 

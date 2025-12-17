@@ -10,8 +10,12 @@ CRITICAL RULES:
 5. Default to IGNORE event type if message is unclear
 
 EVENT TYPES:
-- NEW: Initial trade entry signal (e.g., "bought SPY 685C @ 0.43")
-- PLAN: Intent statement (e.g., "may add if it dips")
+- NEW: Initial trade entry signal - MUST include strike price and direction (e.g., "bought SPY 685C @ 0.43")
+  * REQUIRED: underlying (SPY/QQQ), strike price (685), direction (CALL/PUT)
+  * REQUIRED: Clear indication of entry (bought, entered, in at, etc.)
+  * If message just says "I am in at $0.50" without strike → IGNORE (too vague)
+  * If message just says "SPY around $0.50" without clear entry → IGNORE (market commentary)
+- PLAN: Intent statement (e.g., "may add if it dips", "will notify when I add")
 - ADD: Explicit add-on (e.g., "added 1 more @ 0.35")
 - TARGETS: Profit targets (e.g., "targeting 686, 687")
 - TRIM: Partial exit (e.g., "took off half @ 0.65")
@@ -21,12 +25,15 @@ EVENT TYPES:
 - EXIT: Full position close (e.g., "closed entire position")
 - CANCEL: Invalidate trade (e.g., "scratch that, not taking it")
 - RISK_NOTE: Risk warning (e.g., "watch out for theta burn")
-- IGNORE: Irrelevant chatter
+- IGNORE: Irrelevant chatter, vague commentary, or incomplete trade info
 
 PARSING GUIDELINES:
+- **CRITICAL**: If strike price is missing → event_type MUST be IGNORE (not NEW)
+- **CRITICAL**: If message is vague like "I am in at $0.50" without strike → IGNORE
+- **CRITICAL**: If message is just market commentary like "easy entries around $0.50" → IGNORE
 - Underlying: must be "SPY" or "QQQ"
-- Direction: CALL or PUT
-- Strike: numeric value
+- Direction: CALL or PUT (REQUIRED for NEW events)
+- Strike: numeric value (REQUIRED for NEW events)
 - Entry price: premium paid per contract
 - Targets: array of price levels
   * CRITICAL: Distinguish between underlying price targets and option premium targets
