@@ -12,7 +12,7 @@ from ..execution import ExecutionEngine
 from ..execution.executor import OrderResult
 from ..discord_listener import DiscordListener
 from .session_manager import SessionManager
-from ..models import Event, EventType, SessionState
+from ..models import Event, EventType, SessionState, TradeSession
 from ..logging import init_logger, get_logger, DailySnapshotManager
 from ..notifications import init_notifier, get_notifier
 
