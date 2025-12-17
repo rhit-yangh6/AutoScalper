@@ -19,7 +19,7 @@ class Event(BaseModel):
     message_id: str  # Discord message ID for idempotency
 
     # Trade details (populated based on event type)
-    underlying: Optional[str] = None  # "SPY", "QQQ", or "SPXW"
+    underlying: Optional[str] = None  # "SPY" or "QQQ"
     direction: Optional[Direction] = None
     strike: Optional[float] = None
     expiry: Optional[str] = None  # ISO date string for the option expiry
@@ -27,6 +27,7 @@ class Event(BaseModel):
     # Pricing
     entry_price: Optional[float] = None
     targets: Optional[list[float]] = Field(default=None)  # Multiple target prices
+    target_type: Optional[str] = None  # "PREMIUM" or "UNDERLYING" - distinguishes option premium vs stock price targets
     stop_loss: Optional[float] = None
 
     # Position sizing

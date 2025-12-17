@@ -161,6 +161,12 @@ class TradingOrchestrator:
             print("Starting IBKR connection monitor...")
             asyncio.create_task(self._connection_monitor_task())
 
+            print("Starting position reconciliation...")
+            asyncio.create_task(self._position_reconciliation_task())
+
+            print("Starting EOD auto-close scheduler...")
+            asyncio.create_task(self._eod_auto_close_task())
+
         # Keep running
         try:
             while self.running:
@@ -917,6 +923,203 @@ class TradingOrchestrator:
                 "Bot is now fully operational.\n\n"
                 f"<i>Reconnected at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
             )
+
+    async def _position_reconciliation_task(self):
+        """
+        Background task to reconcile sessions with actual IBKR positions.
+
+        Runs every 60 seconds. For each OPEN session:
+        - Check if position still exists in IBKR
+        - If position is 0 (or doesn't exist), auto-close session
+
+        This handles cases where positions are manually closed outside the bot.
+        """
+        print("Position reconciliation active (checks every 60 seconds)")
+
+        while self.running:
+            await asyncio.sleep(60)
+
+            if self.paper_mode or not self.executor.connected:
+                continue  # Skip in paper mode or when disconnected
+
+            try:
+                # Get current IBKR positions
+                ibkr_positions = await self.executor.get_positions()
+
+                # Build position lookup: contract key -> quantity
+                position_map = {}
+                for pos in ibkr_positions:
+                    contract = pos.contract
+                    # Create key: "SPY 685 C 20251217"
+                    key = f"{contract.symbol} {contract.strike} {contract.right} {contract.lastTradeDateOrContractMonth}"
+                    position_map[key] = pos.position
+
+                # Check all OPEN sessions
+                open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
+
+                for session in open_sessions:
+                    # Build session key
+                    session_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
+
+                    # Check if position exists
+                    ibkr_quantity = position_map.get(session_key, 0)
+
+                    if ibkr_quantity == 0 and session.total_quantity > 0:
+                        # Position is gone but session thinks it's open → Auto-close
+                        print(f"⚠️ Position reconciliation: {session_key} position is 0, auto-closing session")
+
+                        session.state = SessionState.CLOSED
+                        session.closed_at = datetime.now(timezone.utc)
+                        session.exit_reason = "POSITION_RECONCILIATION"
+                        session.total_quantity = 0
+
+                        # Cancel any open bracket orders
+                        if session.stop_order_id or session.target_order_ids:
+                            await self._cancel_session_brackets(session)
+
+                        # Log closure
+                        self.logger.log_session_closed(
+                            session,
+                            reason="Position reconciliation (manually closed outside bot)",
+                            final_pnl=session.realized_pnl
+                        )
+
+                        # Send notification
+                        if self.notifier:
+                            await self.notifier.send_message(
+                                f"<b>🔄 Session Auto-Closed</b>\n\n"
+                                f"Position: {session_key}\n"
+                                f"Reason: Manually exited outside bot\n\n"
+                                f"<i>Session closed via position reconciliation</i>"
+                            )
+
+            except Exception as e:
+                print(f"⚠️ Error in position reconciliation: {e}")
+
+    async def _eod_auto_close_task(self):
+        """
+        Background task to auto-close all open positions at end of trading day.
+
+        At TRADING_HOURS_END (default: 20:00 UTC = 4:00 PM ET):
+        - Find all OPEN sessions
+        - Submit market orders to close positions
+        - Close sessions with reason "EOD_AUTO_CLOSE"
+        """
+        eod_time_str = self.config["risk"]["trading_hours_end"]
+        try:
+            hour, minute = map(int, eod_time_str.split(":"))
+            eod_time = time(hour=hour, minute=minute)
+        except (ValueError, TypeError, AttributeError):
+            eod_time = time(hour=20, minute=0)  # Default to 8 PM UTC
+
+        print(f"EOD auto-close will run at {eod_time_str} UTC")
+
+        while self.running:
+            now = datetime.now(timezone.utc)
+            target_time = datetime.combine(now.date(), eod_time, tzinfo=timezone.utc)
+
+            # If target time already passed today, schedule for tomorrow
+            if now > target_time:
+                from datetime import timedelta
+                target_time += timedelta(days=1)
+
+            # Wait until EOD time
+            seconds_until_eod = (target_time - now).total_seconds()
+            await asyncio.sleep(seconds_until_eod)
+
+            if not self.running:
+                break
+
+            # Execute EOD close
+            if self.paper_mode:
+                print("\n[EOD AUTO-CLOSE] Paper mode - would close all positions")
+            else:
+                print("\n[EOD AUTO-CLOSE] Closing all open positions...")
+                await self._execute_eod_close()
+
+            # Wait a bit to avoid running multiple times
+            await asyncio.sleep(60)
+
+    async def _execute_eod_close(self):
+        """
+        Execute end-of-day close for all open sessions.
+
+        Uses market orders for fast execution at market close.
+        """
+        from ib_insync import MarketOrder
+
+        open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
+
+        if not open_sessions:
+            print("  No open sessions to close")
+            return
+
+        print(f"  Closing {len(open_sessions)} open session(s)...")
+
+        for session in open_sessions:
+            try:
+                # Build contract
+                contract = self.executor._build_contract_from_session(session)
+                qualified = await self.executor.ib.qualifyContractsAsync(contract)
+
+                if not qualified:
+                    print(f"  ⚠️ Could not qualify contract for {session.underlying} {session.strike}")
+                    continue
+
+                contract = qualified[0]
+
+                # Cancel existing brackets
+                await self._cancel_session_brackets(session)
+
+                # Submit MARKET order for fast execution
+                market_order = MarketOrder("SELL", session.total_quantity)
+                trade = self.executor.ib.placeOrder(contract, market_order)
+
+                # Wait briefly for fill
+                filled = await self.executor._wait_for_fill(trade, timeout=10)
+
+                if filled:
+                    fill_price = trade.orderStatus.avgFillPrice
+                    pnl = self.executor._calculate_session_pnl(session, fill_price)
+
+                    # Update session
+                    session.state = SessionState.CLOSED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.exit_reason = "EOD_AUTO_CLOSE"
+                    session.exit_price = fill_price
+                    session.realized_pnl = pnl
+                    session.total_quantity = 0
+
+                    print(f"  ✓ Closed {session.underlying} {session.strike} @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
+
+                    # Log and notify
+                    self.logger.log_session_closed(session, reason="EOD Auto-Close", final_pnl=pnl)
+
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            f"<b>🌙 EOD Auto-Close</b>\n\n"
+                            f"Position: {session.underlying} {session.strike}\n"
+                            f"Exit Price: ${fill_price:.2f}\n"
+                            f"P&L: ${pnl:+,.2f}\n\n"
+                            f"<i>All positions closed at end of trading day</i>"
+                        )
+                else:
+                    print(f"  ⚠️ EOD close timeout for {session.underlying} {session.strike}")
+
+            except Exception as e:
+                print(f"  ⚠️ Error closing session {session.session_id}: {e}")
+
+    async def _cancel_session_brackets(self, session: TradeSession):
+        """Cancel all bracket orders for a session."""
+        order_ids_to_cancel = []
+
+        if session.stop_order_id:
+            order_ids_to_cancel.append(session.stop_order_id)
+        if session.target_order_ids:
+            order_ids_to_cancel.extend(session.target_order_ids)
+
+        if order_ids_to_cancel:
+            await self.executor._cancel_sibling_orders(order_ids_to_cancel)
 
 
 async def main():

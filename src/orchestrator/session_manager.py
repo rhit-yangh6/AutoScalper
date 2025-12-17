@@ -10,7 +10,7 @@ class SessionManager:
 
     Correlation rules (from proposal):
     - Same author
-    - Same underlying (SPY/QQQ/SPX)
+    - Same underlying (SPY/QQQ)
     - Same direction (CALL/PUT)
     - Same trading day
     - Most recent open session wins

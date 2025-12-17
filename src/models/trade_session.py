@@ -27,7 +27,7 @@ class TradeSession(BaseModel):
     A session correlates related Discord messages (NEW, ADD, EXIT, etc.)
     for the same trade idea. Session correlation rules:
     - Same author
-    - Same underlying (SPY/QQQ/SPX)
+    - Same underlying (SPY/QQQ)
     - Same direction (CALL/PUT)
     - Same trading day
     - Most recent open session wins
@@ -39,7 +39,7 @@ class TradeSession(BaseModel):
 
     # Trade definition
     author: str  # Discord username who initiated the trade
-    underlying: str  # "SPY", "QQQ", or "SPXW"
+    underlying: str  # "SPY" or "QQQ"
     direction: Direction
     strike: float
     expiry: str  # ISO date string
@@ -77,6 +77,10 @@ class TradeSession(BaseModel):
     max_adds: int = 1  # From config, default from proposal
     num_adds: int = 0
     stop_invalidated: bool = False  # True if stop was hit
+
+    # Bracket tracking (percentage-based for recalculation after ADD)
+    stop_loss_percent: Optional[float] = None  # e.g., -10.0 means 10% below entry
+    target_percent: Optional[float] = None  # e.g., +20.0 means 20% above entry
 
     class Config:
         json_encoders = {

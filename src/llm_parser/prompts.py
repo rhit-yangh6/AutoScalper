@@ -24,16 +24,23 @@ EVENT TYPES:
 - IGNORE: Irrelevant chatter
 
 PARSING GUIDELINES:
-- Underlying: must be "SPY", "QQQ", or "SPXW" (SPX weekly)
+- Underlying: must be "SPY" or "QQQ"
 - Direction: CALL or PUT
 - Strike: numeric value
 - Entry price: premium paid per contract
 - Targets: array of price levels
+  * CRITICAL: Distinguish between underlying price targets and option premium targets
+  * If target > 100 AND close to current underlying price → target_type = "UNDERLYING"
+  * If target < 100 OR explicitly stated as premium → target_type = "PREMIUM"
+  * Examples:
+    - "QQQ to 600" → targets: [600.0], target_type: "UNDERLYING"
+    - "target 6.00" → targets: [6.0], target_type: "PREMIUM"
+    - "SPY hits 685" → targets: [685.0], target_type: "UNDERLYING"
 - Risk level: LOW/MEDIUM/HIGH/EXTREME based on context clues
 
 EXPIRY DATE RULES (CRITICAL):
 - **DEFAULT**: If no expiry mentioned or unclear → use TODAY'S DATE (0DTE)
-- SPY/QQQ/SPX options typically expire on FRIDAYS (weekly) or 3rd Friday (monthly)
+- SPY/QQQ options typically expire on FRIDAYS (weekly) or 3rd Friday (monthly)
 - If message mentions a date that's NOT a Friday → IGNORE IT, use TODAY instead
 - Only use a future date if it's clearly stated AND is a Friday
 - When in doubt → TODAY'S DATE (safer for 0DTE trading)
@@ -47,12 +54,13 @@ CRITICAL: Return ONLY a valid JSON object. Nothing else.
 
 Required fields for Event JSON:
 - event_type: One of NEW, PLAN, ADD, TARGETS, TRIM, MOVE_STOP, TP, SL, EXIT, CANCEL, RISK_NOTE, IGNORE
-- underlying: "SPY", "QQQ", or "SPXW" (null if not mentioned)
+- underlying: "SPY" or "QQQ" (null if not mentioned)
 - direction: "CALL" or "PUT" (null if not mentioned)
 - strike: Numeric strike price (null if not mentioned)
 - expiry: ISO date string "YYYY-MM-DD" (null if not mentioned)
 - entry_price: Numeric premium per contract (null if not mentioned)
 - targets: Array of numeric target prices [686.0, 687.0] (null if not mentioned)
+- target_type: "PREMIUM" or "UNDERLYING" (null if targets not mentioned)
 - stop_loss: Numeric stop price (null if not mentioned)
 - quantity: Number of contracts (null if not mentioned)
 - risk_level: "LOW", "MEDIUM", "HIGH", or "EXTREME" (null if unclear)
