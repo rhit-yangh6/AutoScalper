@@ -442,14 +442,54 @@ class ExecutionEngine:
                 else:
                     print(f"  ⚠️ Could not fetch underlying price, using original target: ${target_price:.2f}")
 
-            # Determine entry price
-            entry_price = event.entry_price or await self._get_market_price(contract)
-            if not entry_price:
+            # Get current market data for comparison
+            print(f"  Fetching current market data...")
+            ticker = self.ib.reqMktData(contract)
+            await asyncio.sleep(1)  # Wait for market data
+
+            market_bid = ticker.bid if ticker.bid else 0
+            market_ask = ticker.ask if ticker.ask else 0
+            market_last = ticker.last if ticker.last else 0
+
+            if market_bid and market_ask:
+                print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last ${market_last:.2f}")
+            elif market_last:
+                print(f"  📊 Market: Last ${market_last:.2f}")
+
+            # Determine entry price with 5-cent flexibility
+            alert_price = event.entry_price
+            if not alert_price:
+                alert_price = await self._get_market_price(contract)
+
+            if not alert_price:
                 return OrderResult(
                     success=False,
                     status=OrderStatus.REJECTED,
                     message="Could not determine entry price",
                 )
+
+            entry_price = alert_price
+
+            # Allow up to 5 cents deviation from alert price
+            max_entry_price = alert_price + 0.05
+
+            if market_ask and market_ask > entry_price:
+                if market_ask <= max_entry_price:
+                    # Market moved up but within tolerance, adjust to market ask
+                    old_price = entry_price
+                    entry_price = market_ask
+                    print(f"  ⓘ Adjusting entry: ${old_price:.2f} → ${entry_price:.2f} (market moved, within 5¢ tolerance)")
+                else:
+                    # Market moved too far above alert price
+                    deviation = market_ask - alert_price
+                    print(f"  ⚠️ WARNING: Market ask ${market_ask:.2f} is ${deviation:.2f} above alert price ${alert_price:.2f}")
+                    print(f"  ⚠️ Using max allowed: ${max_entry_price:.2f} (alert + 5¢)")
+                    entry_price = max_entry_price
+            elif market_ask and market_ask < entry_price:
+                # Market is below our alert price - great, use market ask for better entry
+                old_price = entry_price
+                entry_price = market_ask
+                print(f"  ✓ Better entry available: ${old_price:.2f} → ${entry_price:.2f} (below alert price)")
 
             # Step 1: Submit ONLY parent order (no brackets yet)
             parent_order = LimitOrder("BUY", quantity, entry_price)
