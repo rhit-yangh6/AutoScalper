@@ -15,6 +15,8 @@ EVENT TYPES:
   * REQUIRED: Clear indication of entry (bought, entered, in at, etc.)
   * If message just says "I am in at $0.50" without strike → IGNORE (too vague)
   * If message just says "SPY around $0.50" without clear entry → IGNORE (market commentary)
+  * If message says "UP X%" or celebrates profit → NOT NEW, likely TRIM or TP
+  * If message just announces current price without entry verb → IGNORE
 - PLAN: Intent statement (e.g., "may add if it dips", "will notify when I add")
 - ADD: Explicit add-on (e.g., "added 1 more @ 0.35")
 - TARGETS: Profit targets (e.g., "targeting 686, 687")
@@ -31,17 +33,22 @@ PARSING GUIDELINES:
 - **CRITICAL**: If strike price is missing → event_type MUST be IGNORE (not NEW)
 - **CRITICAL**: If message is vague like "I am in at $0.50" without strike → IGNORE
 - **CRITICAL**: If message is just market commentary like "easy entries around $0.50" → IGNORE
+- **CRITICAL**: If message says "UP X%" or shows profit/gain → NOT NEW (it's an update on existing position)
+- **CRITICAL**: If message is celebration like "🔥" with price → likely TRIM or TP, NOT NEW
 - Underlying: must be "SPY" or "QQQ"
 - Direction: CALL or PUT (REQUIRED for NEW events)
 - Strike: numeric value (REQUIRED for NEW events)
 - Entry price: premium paid per contract
 - Targets: array of price levels
   * CRITICAL: Distinguish between underlying price targets and option premium targets
-  * If target > 100 AND close to current underlying price → target_type = "UNDERLYING"
-  * If target < 100 OR explicitly stated as premium → target_type = "PREMIUM"
+  * If target > 100 → ALWAYS target_type = "UNDERLYING" (stock price, not premium)
+  * If target < 100 → target_type = "PREMIUM" (option premium)
+  * Option premiums are almost never > $100, stock prices are usually > $100
   * Examples:
     - "QQQ to 600" → targets: [600.0], target_type: "UNDERLYING"
+    - "SPY $674" → targets: [674.0], target_type: "UNDERLYING"
     - "target 6.00" → targets: [6.0], target_type: "PREMIUM"
+    - "target $0.65" → targets: [0.65], target_type: "PREMIUM"
     - "SPY hits 685" → targets: [685.0], target_type: "UNDERLYING"
 - Risk level: LOW/MEDIUM/HIGH/EXTREME based on context clues
 

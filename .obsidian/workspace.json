@@ -11,14 +11,10 @@
             "id": "b98d20507c559b6f",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "DEPLOYMENT.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "DEPLOYMENT"
+              "title": "New tab"
             }
           }
         ]
@@ -95,7 +91,6 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "DEPLOYMENT.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -105,7 +100,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for DEPLOYMENT"
+              "title": "Backlinks"
             }
           },
           {
@@ -114,12 +109,11 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "DEPLOYMENT.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links from DEPLOYMENT"
+              "title": "Outgoing links"
             }
           },
           {
@@ -157,13 +151,12 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "DEPLOYMENT.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline of DEPLOYMENT"
+              "title": "Outline"
             }
           }
         ]
@@ -186,6 +179,11 @@
   },
   "active": "b98d20507c559b6f",
   "lastOpenFiles": [
+    "DEPLOYMENT.md",
+    "DOCKER_COMBINED.md",
+    "docker-compose.combined.yml",
+    "docker/start-combined.sh",
+    "Dockerfile.combined",
     "DOCKER_SETUP.md",
     "DOCKER_SETUP_CLEAN.md",
     "test-gateway.sh",
@@ -197,9 +195,6 @@
     "DOCKER_QUICKSTART.md",
     "start-docker.sh",
     "docker/README.md",
-    "docker",
-    "docker-compose.yml",
-    "logs/2025-12-16/session_064822_SPY_PUT.json",
     "SERVER_COMMAND_ADDED.md",
     "DATETIME_UTC_FIX.md",
     "TELEGRAM_COMMANDS.md",
@@ -214,7 +209,6 @@
     "TELEGRAM_SETUP.md",
     "FEATURE_LOGGING.md",
     "LOGGING.md",
-    "DEPLOYMENT.md",
     "SETUP_CHECKLIST.md",
     "get_token_helper.md"
   ]

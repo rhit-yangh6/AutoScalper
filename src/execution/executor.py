@@ -435,7 +435,7 @@ class ExecutionEngine:
             # Convert underlying targets to premium if needed (Issue 5)
             target_price = event.targets[0] if event.targets else None
             if event.target_type == "UNDERLYING" and target_price:
-                print(f"  ⓘ Converting underlying target to premium estimate...")
+                print(f"  ⓘ Converting underlying target ${target_price:.2f} to premium estimate...")
 
                 # Get current underlying price
                 current_underlying_price = await self._get_underlying_price(event.underlying)
@@ -450,9 +450,11 @@ class ExecutionEngine:
                         target_price = premium_target
                         print(f"  ✓ Using converted premium target: ${target_price:.2f}")
                     else:
-                        print(f"  ⚠️ Conversion failed, using original target: ${target_price:.2f}")
+                        print(f"  ⚠️ Conversion failed, falling back to auto-calculated target")
+                        target_price = None  # Let bracket calculation use R/R ratio
                 else:
-                    print(f"  ⚠️ Could not fetch underlying price, using original target: ${target_price:.2f}")
+                    print(f"  ⚠️ Could not fetch underlying price, falling back to auto-calculated target")
+                    target_price = None  # Let bracket calculation use R/R ratio
 
             # Step 1: Submit entry order (Market or Limit based on data availability)
             from ib_insync import MarketOrder, LimitOrder
@@ -1110,9 +1112,16 @@ class ExecutionEngine:
         Returns:
             (stop_price, target_price) tuple
         """
-        # Use Discord prices if provided
+        # Use Discord prices if provided (with sanity checks)
         stop_price = original_stop
         target_price = original_target
+
+        # Sanity check: Detect if stock price was mistakenly used as premium target
+        # For 0DTE options, premiums rarely exceed $50, typically < $10
+        if target_price and target_price > 50:
+            print(f"  ⚠️ WARNING: Target ${target_price:.2f} seems too high for option premium")
+            print(f"  ⚠️ This might be a stock price, not premium. Using auto-calculated target instead.")
+            target_price = None  # Force auto-calculation
 
         # Calculate from fill price if not provided
         if not stop_price:
