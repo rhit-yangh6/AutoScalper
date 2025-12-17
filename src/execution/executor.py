@@ -539,9 +539,18 @@ class ExecutionEngine:
             session.total_quantity = quantity
             session.avg_entry_price = actual_fill_price
 
-            # Step 5: Calculate bracket prices based on actual fill
+            # Step 5: Calculate bracket prices
+            # CRITICAL: For LIMIT orders, use limit price for brackets
+            #           For MARKET orders, use actual fill price
+            bracket_base_price = actual_fill_price  # Default to fill price
+            if isinstance(parent_order, LimitOrder):
+                # For limit orders, brackets based on intended entry (limit price)
+                bracket_base_price = parent_order.lmtPrice
+                if bracket_base_price != actual_fill_price:
+                    print(f"  ⓘ Using limit price ${bracket_base_price:.2f} for brackets (filled at ${actual_fill_price:.2f})")
+
             stop_price, final_target_price = self._calculate_bracket_prices(
-                actual_fill_price,
+                bracket_base_price,
                 event.stop_loss,
                 target_price,
             )
@@ -625,22 +634,23 @@ class ExecutionEngine:
                     )
 
             # Step 8: Store bracket percentages for future ADD operations (Issue 4)
-            # Validate fill price before calculating percentages
-            if actual_fill_price <= 0:
-                print(f"  ⚠️ WARNING: Invalid fill price {actual_fill_price}, cannot calculate bracket percentages")
+            # CRITICAL: Use bracket_base_price for percentage calculations
+            # (same price used to calculate the brackets)
+            if bracket_base_price <= 0:
+                print(f"  ⚠️ WARNING: Invalid bracket base price {bracket_base_price}, cannot calculate bracket percentages")
                 print(f"  ⚠️ ADD operations will not be able to update brackets")
                 session.stop_loss_percent = None
                 session.target_percent = None
             else:
-                # Safe to calculate percentages
+                # Safe to calculate percentages based on bracket base price
                 if stop_price:
-                    session.stop_loss_percent = ((stop_price - actual_fill_price) / actual_fill_price) * 100
+                    session.stop_loss_percent = ((stop_price - bracket_base_price) / bracket_base_price) * 100
                     # Validate extreme percentages (sanity check)
                     if session.stop_loss_percent < -99 or session.stop_loss_percent > 1000:
                         print(f"  ⚠️ WARNING: Extreme stop_loss_percent: {session.stop_loss_percent:.2f}%")
 
                 if final_target_price:
-                    session.target_percent = ((final_target_price - actual_fill_price) / actual_fill_price) * 100
+                    session.target_percent = ((final_target_price - bracket_base_price) / bracket_base_price) * 100
                     # Validate extreme percentages (sanity check)
                     if session.target_percent < -99 or session.target_percent > 1000:
                         print(f"  ⚠️ WARNING: Extreme target_percent: {session.target_percent:.2f}%")
@@ -1116,12 +1126,25 @@ class ExecutionEngine:
         stop_price = original_stop
         target_price = original_target
 
-        # Sanity check: Detect if stock price was mistakenly used as premium target
-        # For 0DTE options, premiums rarely exceed $50, typically < $10
-        if target_price and target_price > 50:
-            print(f"  ⚠️ WARNING: Target ${target_price:.2f} seems too high for option premium")
-            print(f"  ⚠️ This might be a stock price, not premium. Using auto-calculated target instead.")
-            target_price = None  # Force auto-calculation
+        # CRITICAL: Validate stop direction for LONG positions
+        # For buying options (LONG), stop must be BELOW entry to limit losses
+        if stop_price and stop_price >= actual_fill_price:
+            print(f"  ⚠️ WARNING: Stop ${stop_price:.2f} is above/equal to entry ${actual_fill_price:.2f}")
+            print(f"  ⚠️ For LONG positions, stop must be BELOW entry. Using auto-calculated stop.")
+            stop_price = None  # Force auto-calculation
+
+        # Sanity check: Validate target price
+        if target_price:
+            # Check if target is too high (likely stock price, not premium)
+            if target_price > 50:
+                print(f"  ⚠️ WARNING: Target ${target_price:.2f} seems too high for option premium")
+                print(f"  ⚠️ This might be a stock price, not premium. Using auto-calculated target instead.")
+                target_price = None  # Force auto-calculation
+            # Check if target is below/equal to entry (wrong direction)
+            elif target_price <= actual_fill_price:
+                print(f"  ⚠️ WARNING: Target ${target_price:.2f} is below/equal to entry ${actual_fill_price:.2f}")
+                print(f"  ⚠️ For LONG positions, target must be ABOVE entry. Using auto-calculated target.")
+                target_price = None  # Force auto-calculation
 
         # Calculate from fill price if not provided
         if not stop_price:
@@ -1133,6 +1156,17 @@ class ExecutionEngine:
         if not target_price:
             # Default: 2:1 risk/reward ratio
             risk = actual_fill_price - stop_price
+
+            # Validate risk is positive (stop is below entry)
+            if risk <= 0:
+                print(f"  ⚠️ WARNING: Negative/zero risk detected (entry: ${actual_fill_price:.2f}, stop: ${stop_price:.2f})")
+                print(f"  ⚠️ Recalculating both stop and target with defaults")
+                # Recalculate stop with default percentage
+                stop_percent = 25.0
+                stop_price = actual_fill_price * (1 - stop_percent / 100)
+                risk = actual_fill_price - stop_price
+                print(f"  ⓘ Auto stop-loss: ${stop_price:.2f} ({stop_percent}% below fill)")
+
             target_price = actual_fill_price + (risk * 2.0)
             print(f"  ⓘ Auto target: ${target_price:.2f} (2:1 R/R)")
 

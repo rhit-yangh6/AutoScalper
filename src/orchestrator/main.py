@@ -409,19 +409,78 @@ class TradingOrchestrator:
 
             text += "\n"
 
-            # Open orders
+            # Open orders - separate brackets from entry orders
             text += f"<b>📋 Open Orders ({len(open_orders)}):</b>\n"
             if open_orders:
-                for trade in open_orders:
-                    contract = trade.contract
-                    order = trade.order
-                    symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
-                    action = order.action
-                    qty = order.totalQuantity
-                    price = order.lmtPrice
-                    status = trade.orderStatus.status
+                # Collect bracket order IDs from sessions
+                bracket_order_ids = set()
+                for session in open_sessions:
+                    if session.stop_order_id:
+                        bracket_order_ids.add(session.stop_order_id)
+                    if session.target_order_ids:
+                        bracket_order_ids.update(session.target_order_ids)
 
-                    text += f"• {action} {qty} {symbol} @ ${price:.2f} - {status}\n"
+                # Separate bracket orders from other orders
+                entry_orders = []
+                stop_orders = []
+                target_orders = []
+
+                for trade in open_orders:
+                    order_id = trade.order.orderId
+                    if order_id in bracket_order_ids:
+                        # Find which session owns this bracket
+                        order_type = "UNKNOWN"
+                        for session in open_sessions:
+                            if session.stop_order_id == order_id:
+                                order_type = "STOP"
+                                break
+                            elif session.target_order_ids and order_id in session.target_order_ids:
+                                order_type = "TARGET"
+                                break
+
+                        if order_type == "STOP":
+                            stop_orders.append(trade)
+                        elif order_type == "TARGET":
+                            target_orders.append(trade)
+                    else:
+                        entry_orders.append(trade)
+
+                # Display entry orders
+                if entry_orders:
+                    text += "  <i>Entry Orders:</i>\n"
+                    for trade in entry_orders:
+                        contract = trade.contract
+                        order = trade.order
+                        symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
+                        action = order.action
+                        qty = order.totalQuantity
+                        price = order.lmtPrice if order.lmtPrice else order.auxPrice
+                        status = trade.orderStatus.status
+                        text += f"    • {action} {qty} {symbol} @ ${price:.2f} - {status}\n"
+
+                # Display bracket orders
+                if stop_orders or target_orders:
+                    text += "  <i>Bracket Orders:</i>\n"
+                    for trade in stop_orders:
+                        contract = trade.contract
+                        order = trade.order
+                        symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
+                        qty = order.totalQuantity
+                        price = order.lmtPrice if order.lmtPrice else order.auxPrice
+                        status = trade.orderStatus.status
+                        text += f"    • 🛑 STOP: {qty} {symbol} @ ${price:.2f} - {status}\n"
+
+                    for trade in target_orders:
+                        contract = trade.contract
+                        order = trade.order
+                        symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
+                        qty = order.totalQuantity
+                        price = order.lmtPrice if order.lmtPrice else order.auxPrice
+                        status = trade.orderStatus.status
+                        text += f"    • 🎯 TARGET: {qty} {symbol} @ ${price:.2f} - {status}\n"
+
+                if not entry_orders and not stop_orders and not target_orders:
+                    text += "  No open orders\n"
             else:
                 text += "  No open orders\n"
 
