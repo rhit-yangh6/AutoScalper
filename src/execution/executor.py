@@ -48,10 +48,12 @@ class ExecutionEngine:
         port: int = 7497,  # 7497 = paper, 7496 = live
         client_id: int = 1,
         session_manager=None,  # For bracket order monitoring
+        use_market_orders: bool = True,  # True = market orders, False = limit orders with 5¢ flexibility
     ):
         self.host = host
         self.port = port
         self.client_id = client_id
+        self.use_market_orders = use_market_orders
         self.ib = IB()
         self.connected = False
         self.kill_switch_active = False
@@ -81,10 +83,15 @@ class ExecutionEngine:
             print("Order monitoring active (bracket fills will be detected)")
             print("Auto-reconnection enabled")
 
-            # Request delayed market data (free, no subscription needed)
-            # This is 15-minute delayed but better than nothing for paper trading
-            self.ib.reqMarketDataType(3)  # 3 = delayed data, 1 = real-time, 4 = delayed-frozen
-            print("Using delayed market data (15-min delay, free)")
+            # Configure market data and order strategy
+            if self.use_market_orders:
+                # IBKR Paper account or no real-time data: Use delayed data + market orders
+                self.ib.reqMarketDataType(3)  # 3 = delayed data (free)
+                print("📊 Order Strategy: MARKET orders (delayed data)")
+            else:
+                # IBKR Live account with real-time data: Use real-time data + limit orders
+                self.ib.reqMarketDataType(1)  # 1 = real-time (subscription required)
+                print("📊 Order Strategy: LIMIT orders with 5¢ flexibility (real-time data)")
 
             # Get and display account balance
             await self._display_account_balance()
@@ -447,12 +454,66 @@ class ExecutionEngine:
                 else:
                     print(f"  ⚠️ Could not fetch underlying price, using original target: ${target_price:.2f}")
 
-            # Step 1: Submit MARKET order for guaranteed fill
-            from ib_insync import MarketOrder
-            parent_order = MarketOrder("BUY", quantity)
-            parent_trade = self.ib.placeOrder(contract, parent_order)
+            # Step 1: Submit entry order (Market or Limit based on data availability)
+            from ib_insync import MarketOrder, LimitOrder
 
-            print(f"  ⓘ MARKET order submitted for {quantity} contracts, waiting for fill...")
+            if self.use_market_orders:
+                # Use MARKET order (IBKR paper or no real-time data)
+                parent_order = MarketOrder("BUY", quantity)
+                parent_trade = self.ib.placeOrder(contract, parent_order)
+                print(f"  ⓘ MARKET order submitted for {quantity} contracts")
+            else:
+                # Use LIMIT order with 5¢ flexibility (real-time data available)
+                # Get current market data
+                print(f"  Fetching current market data...")
+                ticker = self.ib.reqMktData(contract)
+                await asyncio.sleep(1)  # Wait for real-time data
+
+                # Handle NaN and None values
+                import math
+                market_bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+                market_ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+                market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+
+                if market_bid and market_ask:
+                    print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last ${market_last:.2f if market_last else 0:.2f}")
+                elif market_last:
+                    print(f"  📊 Market: Last ${market_last:.2f}")
+
+                # Determine entry price with 5-cent flexibility
+                alert_price = event.entry_price or (market_ask if market_ask else market_last)
+
+                if not alert_price:
+                    print(f"  ⚠️ No market data available, falling back to MARKET order")
+                    parent_order = MarketOrder("BUY", quantity)
+                    parent_trade = self.ib.placeOrder(contract, parent_order)
+                    print(f"  ⓘ MARKET order submitted (no market data)")
+                else:
+                    entry_price = alert_price
+                    max_entry_price = alert_price + 0.05  # 5¢ flexibility
+
+                    if market_ask:
+                        if market_ask > entry_price and market_ask <= max_entry_price:
+                            # Market moved up but within tolerance
+                            old_price = entry_price
+                            entry_price = market_ask
+                            print(f"  ⓘ Adjusting entry: ${old_price:.2f} → ${entry_price:.2f} (market moved, within 5¢)")
+                        elif market_ask > max_entry_price:
+                            # Market moved too far, use max allowed
+                            deviation = market_ask - alert_price
+                            print(f"  ⚠️ Market ask ${market_ask:.2f} is ${deviation:.2f} above alert ${alert_price:.2f}")
+                            print(f"  ⚠️ Using max allowed: ${max_entry_price:.2f} (alert + 5¢)")
+                            entry_price = max_entry_price
+                        elif market_ask < entry_price:
+                            # Better entry available
+                            old_price = entry_price
+                            entry_price = market_ask
+                            print(f"  ✓ Better entry: ${old_price:.2f} → ${entry_price:.2f} (below alert)")
+
+                    parent_order = LimitOrder("BUY", quantity, entry_price)
+                    parent_order.tif = "DAY"
+                    parent_trade = self.ib.placeOrder(contract, parent_order)
+                    print(f"  ⓘ LIMIT order submitted @ ${entry_price:.2f}")
 
             # Step 2: Wait for parent fill
             filled = await self._wait_for_fill(parent_trade, timeout=30)
@@ -634,12 +695,48 @@ class ExecutionEngine:
             contract = qualified[0]
             print(f"  ✓ Qualified contract: {contract.localSymbol}")
 
-            # Submit ADD order as MARKET order for guaranteed fill
-            from ib_insync import MarketOrder
-            order = MarketOrder("BUY", quantity)
-            trade = self.ib.placeOrder(contract, order)
+            # Submit ADD order (Market or Limit based on data availability)
+            from ib_insync import MarketOrder, LimitOrder
 
-            print(f"  ⓘ ADD MARKET order submitted: {quantity} contracts")
+            if self.use_market_orders:
+                # Use MARKET order (IBKR paper or no real-time data)
+                order = MarketOrder("BUY", quantity)
+                trade = self.ib.placeOrder(contract, order)
+                print(f"  ⓘ ADD MARKET order submitted: {quantity} contracts")
+            else:
+                # Use LIMIT order with 5¢ flexibility (real-time data available)
+                print(f"  Fetching current market data...")
+                ticker = self.ib.reqMktData(contract)
+                await asyncio.sleep(1)
+
+                import math
+                market_ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+                market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+
+                add_price = event.entry_price or market_ask or market_last
+
+                if not add_price:
+                    print(f"  ⚠️ No market data, falling back to MARKET order")
+                    order = MarketOrder("BUY", quantity)
+                    trade = self.ib.placeOrder(contract, order)
+                    print(f"  ⓘ ADD MARKET order submitted (no data)")
+                else:
+                    # Allow 5¢ flexibility
+                    if market_ask and market_ask > add_price:
+                        if market_ask <= add_price + 0.05:
+                            print(f"  ⓘ Adjusting ADD: ${add_price:.2f} → ${market_ask:.2f} (within 5¢)")
+                            add_price = market_ask
+                        else:
+                            print(f"  ⚠️ Using max allowed: ${add_price + 0.05:.2f}")
+                            add_price = add_price + 0.05
+                    elif market_ask and market_ask < add_price:
+                        print(f"  ✓ Better ADD entry: ${add_price:.2f} → ${market_ask:.2f}")
+                        add_price = market_ask
+
+                    order = LimitOrder("BUY", quantity, add_price)
+                    order.tif = "DAY"
+                    trade = self.ib.placeOrder(contract, order)
+                    print(f"  ⓘ ADD LIMIT order submitted @ ${add_price:.2f}")
 
             # Wait for fill
             filled = await self._wait_for_fill(trade, timeout=30)
@@ -733,18 +830,12 @@ class ExecutionEngine:
             if cancelled_orders > 0:
                 print(f"  ✓ Cancelled {cancelled_orders} existing order(s) (bracket stop/target)")
 
-            exit_price = await self._get_market_price(contract)
-
-            if not exit_price:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message="Could not determine exit price",
-                )
-
-            order = LimitOrder("SELL", total_quantity, exit_price)
-            order.tif = "DAY"  # Explicit Time In Force
+            # Use MARKET order for fast exit (speed more important than price)
+            from ib_insync import MarketOrder
+            order = MarketOrder("SELL", total_quantity)
             trade = self.ib.placeOrder(contract, order)
+
+            print(f"  ⓘ EXIT MARKET order submitted for {total_quantity} contracts")
 
             filled = await self._wait_for_fill(trade, timeout=30)
 
@@ -820,21 +911,12 @@ class ExecutionEngine:
             contract = qualified[0]
             print(f"  ✓ Qualified contract: {contract.localSymbol}")
 
-            # Get exit price
-            exit_price = await self._get_market_price(contract)
-            if not exit_price:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message="Could not determine trim price",
-                )
-
-            # Submit SELL order for trim quantity
-            order = LimitOrder("SELL", trim_qty, exit_price)
-            order.tif = "DAY"
+            # Use MARKET order for fast exit (speed more important than price)
+            from ib_insync import MarketOrder
+            order = MarketOrder("SELL", trim_qty)
             trade = self.ib.placeOrder(contract, order)
 
-            print(f"  ⓘ TRIM order submitted: {trim_qty} contracts @ ${exit_price:.2f}")
+            print(f"  ⓘ TRIM MARKET order submitted: {trim_qty} contracts")
 
             # Wait for fill
             filled = await self._wait_for_fill(trade, timeout=30)

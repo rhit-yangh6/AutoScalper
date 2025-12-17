@@ -70,11 +70,18 @@ class TradingOrchestrator:
 
         self.risk_gate = RiskGate(config["risk"])
 
+        # Determine order strategy based on IBKR port
+        # Port 4001 (live) = use limit orders with real-time data
+        # Port 4002 (paper) = use market orders with delayed data
+        ibkr_port = config["ibkr"]["port"]
+        use_market_orders = (ibkr_port == 4002)  # Paper IBKR account uses market orders
+
         self.executor = ExecutionEngine(
             host=config["ibkr"]["host"],
-            port=config["ibkr"]["port"],
+            port=ibkr_port,
             client_id=config["ibkr"]["client_id"],
             session_manager=self.session_manager,
+            use_market_orders=use_market_orders,
         )
 
         # Register bracket fill callback
