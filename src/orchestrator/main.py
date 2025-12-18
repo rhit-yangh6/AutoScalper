@@ -70,11 +70,17 @@ class TradingOrchestrator:
 
         self.risk_gate = RiskGate(config["risk"])
 
-        # Determine order strategy based on IBKR port
-        # Port 4001 (live) = use limit orders with real-time data
-        # Port 4002 (paper) = use market orders with delayed data
+        # Determine order strategy based on IBKR port and config
+        # Gateway ports: 4001 (live), 4002 (paper)
+        # TWS ports: 7497 (live), 7496 (paper)
+        # Paper accounts always use market orders (delayed data)
+        # Live accounts can use market OR limit orders (configurable)
         ibkr_port = config["ibkr"]["port"]
-        use_market_orders = (ibkr_port == 4002)  # Paper IBKR account uses market orders
+        paper_ports = [4002, 7496]  # Gateway paper, TWS paper
+        force_market = config["ibkr"].get("force_market_orders", False)
+
+        # Use market orders if: paper account OR force_market_orders=true
+        use_market_orders = (ibkr_port in paper_ports) or force_market
 
         self.executor = ExecutionEngine(
             host=config["ibkr"]["host"],
@@ -747,27 +753,33 @@ class TradingOrchestrator:
                 )
                 print(f"✓ Position size: {quantity} contracts")
 
-                # Calculate stop loss and target if not provided
+                # Calculate stop loss and target based on CONFIG (ignore Discord targets)
                 if event.event_type == EventType.NEW:
+                    # CRITICAL: Always clear Discord-parsed targets to prevent using stock prices as premiums
+                    # Brackets are ALWAYS calculated from config (AUTO_STOP_LOSS_PERCENT, RISK_REWARD_RATIO)
+                    event.stop_loss = None  # Will be recalculated from config
+                    event.targets = None    # Will be recalculated from config
+
                     stop_loss, target = self.risk_gate.calculate_stop_and_target(
                         event=event, session=session
                     )
 
-                    # Update event with calculated values
-                    if stop_loss and not event.stop_loss:
+                    # Update event with config-based calculated values
+                    if stop_loss:
                         event.stop_loss = stop_loss
-                        print(f"  Auto-calculated Stop Loss: ${stop_loss:.2f}")
+                        print(f"  Auto-calculated Stop Loss: ${stop_loss:.2f} ({self.config['risk']['auto_stop_loss_percent']}% below entry)")
 
-                    if target and not event.targets:
+                    if target:
                         event.targets = [target]
-                        print(f"  Auto-calculated Target: ${target:.2f}")
+                        rr_ratio = self.config['risk']['risk_reward_ratio']
+                        print(f"  Auto-calculated Target: ${target:.2f} (R:R = 1:{rr_ratio:.1f})")
 
-                    # Show risk/reward
+                    # Show risk/reward summary
                     if event.entry_price and event.stop_loss and event.targets:
                         risk_per_contract = event.entry_price - event.stop_loss
                         reward_per_contract = event.targets[0] - event.entry_price
-                        rr_ratio = reward_per_contract / risk_per_contract if risk_per_contract > 0 else 0
-                        print(f"  Risk/Reward: 1:{rr_ratio:.2f}")
+                        actual_rr = reward_per_contract / risk_per_contract if risk_per_contract > 0 else 0
+                        print(f"  Risk: ${risk_per_contract:.2f} | Reward: ${reward_per_contract:.2f} | R:R: 1:{actual_rr:.2f}")
             else:
                 print("✓ Non-actionable event (informational only)")
                 return
@@ -1214,8 +1226,9 @@ async def main():
         },
         "ibkr": {
             "host": os.getenv("IBKR_HOST", "127.0.0.1"),
-            "port": int(os.getenv("IBKR_PORT", "7497")),  # 7497 = paper
+            "port": int(os.getenv("IBKR_PORT", "7497")),  # 7497 = TWS live, 7496 = TWS paper, 4001 = Gateway live, 4002 = Gateway paper
             "client_id": int(os.getenv("IBKR_CLIENT_ID", "1")),
+            "force_market_orders": os.getenv("FORCE_MARKET_ORDERS", "false").lower() == "true",
         },
         "risk": {
             "account_balance": float(
