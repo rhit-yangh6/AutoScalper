@@ -199,12 +199,25 @@ class TelegramNotifier:
         if result.filled_price:
             text += f"<b>Fill Price:</b> ${result.filled_price:.2f}\n"
 
-        # Add P&L for exits
-        if event_type in [EventType.SL, EventType.TP, EventType.EXIT]:
+        # Add position details for entries and scale-ins
+        if event_type == EventType.NEW:
+            text += f"<b>Position:</b> {session.total_quantity} contracts @ ${session.avg_entry_price:.2f}\n"
+        elif event_type == EventType.ADD:
+            text += f"<b>New Position:</b> {session.total_quantity} contracts @ ${session.avg_entry_price:.2f} avg\n"
+
+        # Add P&L and position info for exits and trims
+        if event_type in [EventType.SL, EventType.TP, EventType.EXIT, EventType.TRIM]:
             if hasattr(session, 'realized_pnl') and session.realized_pnl is not None:
                 pnl = session.realized_pnl
                 pnl_emoji = "💰" if pnl > 0 else "📉" if pnl < 0 else "⚪"
                 text += f"<b>P&L:</b> {pnl_emoji} ${pnl:+,.2f}\n"
+
+            # Show remaining position for TRIM
+            if event_type == EventType.TRIM:
+                if session.total_quantity > 0:
+                    text += f"<b>Remaining:</b> {session.total_quantity} contracts\n"
+                else:
+                    text += f"<b>Position:</b> CLOSED (trimmed to zero)\n"
 
         if result.message:
             text += f"\n<i>{result.message}</i>\n"

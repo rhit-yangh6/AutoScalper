@@ -1015,7 +1015,7 @@ class TradingOrchestrator:
 
         This handles cases where positions are manually closed outside the bot.
         """
-        print("Position reconciliation active (checks every 60 seconds)")
+        print("Position reconciliation active (checks every 60 seconds, 3-minute grace period)")
 
         while self.running:
             await asyncio.sleep(60)
@@ -1039,6 +1039,12 @@ class TradingOrchestrator:
                 open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
 
                 for session in open_sessions:
+                    # Skip recently updated sessions (grace period for settlement)
+                    # IBKR positions take time to settle after fills
+                    time_since_update = (datetime.now(timezone.utc) - session.updated_at).total_seconds()
+                    if time_since_update < 180:  # 3 minutes grace period
+                        continue  # Don't reconcile yet, position may still be settling
+
                     # Build session key
                     session_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
 
@@ -1065,12 +1071,18 @@ class TradingOrchestrator:
                             final_pnl=session.realized_pnl
                         )
 
-                        # Send notification
+                        # Send notification with P&L if available
                         if self.notifier:
+                            pnl_text = ""
+                            if session.realized_pnl != 0:
+                                pnl_emoji = "💰" if session.realized_pnl > 0 else "📉"
+                                pnl_text = f"P&L: {pnl_emoji} ${session.realized_pnl:+,.2f}\n"
+
                             await self.notifier.send_message(
                                 f"<b>🔄 Session Auto-Closed</b>\n\n"
-                                f"Position: {session_key}\n"
-                                f"Reason: Manually exited outside bot\n\n"
+                                f"<b>Position:</b> {session_key}\n"
+                                f"<b>Reason:</b> Manually exited outside bot\n"
+                                f"{pnl_text}\n"
                                 f"<i>Session closed via position reconciliation</i>"
                             )
 
