@@ -852,31 +852,15 @@ class TradingOrchestrator:
 
                 # Calculate stop loss and target based on CONFIG (ignore Discord targets)
                 if event.event_type == EventType.NEW:
-                    # CRITICAL: Always clear Discord-parsed targets to prevent using stock prices as premiums
-                    # Brackets are ALWAYS calculated from config (AUTO_STOP_LOSS_PERCENT, RISK_REWARD_RATIO)
-                    event.stop_loss = None  # Will be recalculated from config
-                    event.targets = None    # Will be recalculated from config
+                    # CRITICAL: Clear Discord-parsed targets for NEW orders
+                    # Brackets will be calculated by EXECUTOR from ACTUAL FILL PRICE
+                    # This ensures brackets use real execution price, not Discord alert price
+                    event.stop_loss = None  # Executor will calculate from actual fill
+                    event.targets = None    # Executor will calculate from actual fill
 
-                    stop_loss, target = self.risk_gate.calculate_stop_and_target(
-                        event=event, session=session
-                    )
-
-                    # Update event with config-based calculated values
-                    if stop_loss:
-                        event.stop_loss = stop_loss
-                        print(f"  Auto-calculated Stop Loss: ${stop_loss:.2f} ({self.config['risk']['auto_stop_loss_percent']}% below entry)")
-
-                    if target:
-                        event.targets = [target]
-                        rr_ratio = self.config['risk']['risk_reward_ratio']
-                        print(f"  Auto-calculated Target: ${target:.2f} (R:R = 1:{rr_ratio:.1f})")
-
-                    # Show risk/reward summary
-                    if event.entry_price and event.stop_loss and event.targets:
-                        risk_per_contract = event.entry_price - event.stop_loss
-                        reward_per_contract = event.targets[0] - event.entry_price
-                        actual_rr = reward_per_contract / risk_per_contract if risk_per_contract > 0 else 0
-                        print(f"  Risk: ${risk_per_contract:.2f} | Reward: ${reward_per_contract:.2f} | R:R: 1:{actual_rr:.2f}")
+                    print(f"  ℹ️  Brackets will be calculated from actual fill price using config:")
+                    print(f"     - Stop: {self.config['risk']['auto_stop_loss_percent']}% below fill")
+                    print(f"     - Target: {self.config['risk']['risk_reward_ratio']}x risk above fill")
             else:
                 print("✓ Non-actionable event (informational only)")
                 return
@@ -1136,23 +1120,26 @@ class TradingOrchestrator:
                 open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
 
                 # Track which positions we've matched to sessions
+                # IMPORTANT: Mark ALL open sessions as matched (even within grace period)
+                # to prevent false "orphaned" warnings for new positions
                 matched_positions = set()
 
                 for session in open_sessions:
-                    # Skip recently updated sessions (grace period for settlement)
-                    # IBKR positions take time to settle after fills
-                    time_since_update = (datetime.now(timezone.utc) - session.updated_at).total_seconds()
-                    if time_since_update < 180:  # 3 minutes grace period
-                        continue  # Don't reconcile yet, position may still be settling
-
                     # Build session key
                     session_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
 
                     # Mark this position as matched (tracked by a session)
+                    # This prevents false "orphaned" warnings
                     if session_key in position_map:
                         matched_positions.add(session_key)
 
-                    # Check if position exists
+                    # Skip recently updated sessions for reconciliation checks (grace period for settlement)
+                    # IBKR positions take time to settle after fills
+                    time_since_update = (datetime.now(timezone.utc) - session.updated_at).total_seconds()
+                    if time_since_update < 180:  # 3 minutes grace period
+                        continue  # Don't check for position-gone yet, still settling
+
+                    # Check if position exists (only for sessions past grace period)
                     ibkr_quantity = position_map.get(session_key, 0)
 
                     if ibkr_quantity == 0 and session.total_quantity > 0:
