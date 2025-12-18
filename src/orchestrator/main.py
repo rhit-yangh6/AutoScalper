@@ -441,6 +441,9 @@ class TradingOrchestrator:
                     current_price = None
                     pnl_text = ""
                     try:
+                        # Set exchange for market data request (required by IBKR)
+                        contract.exchange = "SMART"
+
                         # Request market data snapshot
                         ticker = self.executor.ib.reqMktData(contract, snapshot=True)
                         await asyncio.sleep(0.5)  # Wait for market data
