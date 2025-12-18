@@ -950,6 +950,20 @@ class ExecutionEngine:
             contract = qualified[0]
             print(f"  ✓ Qualified contract: {contract.localSymbol}")
 
+            # CRITICAL: Cancel brackets FIRST to prevent SHORT positions
+            # If trimming to 0, brackets must be cancelled before submitting TRIM
+            # If partial trim, old brackets will be replaced with new ones after fill
+            if session.stop_order_id or session.target_order_ids:
+                order_ids = []
+                if session.stop_order_id:
+                    order_ids.append(session.stop_order_id)
+                if session.target_order_ids:
+                    order_ids.extend(session.target_order_ids)
+
+                print(f"  ⓘ Cancelling {len(order_ids)} bracket order(s) before TRIM...")
+                await self._cancel_sibling_orders(order_ids)
+                print(f"  ✓ Brackets cancelled")
+
             # Use MARKET order for fast exit (speed more important than price)
             from ib_insync import MarketOrder
             order = MarketOrder("SELL", trim_qty)
@@ -989,14 +1003,7 @@ class ExecutionEngine:
                 session.exit_reason = "TRIM_TO_ZERO"
                 session.exit_price = fill_price
 
-                # Cancel remaining brackets
-                if session.stop_order_id or session.target_order_ids:
-                    order_ids = []
-                    if session.stop_order_id:
-                        order_ids.append(session.stop_order_id)
-                    if session.target_order_ids:
-                        order_ids.extend(session.target_order_ids)
-                    await self._cancel_sibling_orders(order_ids)
+                # Note: Brackets already cancelled before TRIM order (see above)
 
                 return OrderResult(
                     success=True,
@@ -1339,8 +1346,8 @@ class ExecutionEngine:
         Update bracket orders after TRIM to reflect new position size.
 
         Strategy:
-        - Cancel old brackets (old quantity)
         - Create new brackets (new quantity, same prices)
+        - Note: Old brackets already cancelled before TRIM order (in _execute_trim)
         """
         try:
             # Check session state to prevent race condition with position reconciliation
@@ -1348,18 +1355,11 @@ class ExecutionEngine:
                 print(f"    ⚠️ Skipping bracket update - session is {session.state.value}, not OPEN")
                 return
 
-            # Cancel existing brackets
-            print(f"    Updating brackets after TRIM...")
+            # Create new brackets after TRIM
+            print(f"    Creating new brackets after TRIM...")
 
-            order_ids_to_cancel = []
-            if session.stop_order_id:
-                order_ids_to_cancel.append(session.stop_order_id)
-            if session.target_order_ids:
-                order_ids_to_cancel.extend(session.target_order_ids)
-
-            if order_ids_to_cancel:
-                await self._cancel_sibling_orders(order_ids_to_cancel)
-                print(f"    ✓ Cancelled {len(order_ids_to_cancel)} old bracket order(s)")
+            # Note: Old brackets already cancelled before TRIM order
+            # No need to cancel again - just create new ones
 
             # Calculate bracket prices using stored percentages
             new_stop = None

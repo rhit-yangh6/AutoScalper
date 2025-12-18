@@ -462,8 +462,11 @@ class TradingOrchestrator:
 
                         # Calculate P&L if we have current price
                         if current_price and avg_cost > 0 and abs(qty) > 0:
-                            unrealized_pnl = (current_price - avg_cost) * qty * 100  # Options multiplier
-                            pnl_pct = ((current_price - avg_cost) / avg_cost) * 100
+                            # For options: current_price is premium, avg_cost is already in dollars
+                            # Convert premium to dollar value first
+                            current_value = current_price * 100  # Premium to dollar value
+                            unrealized_pnl = (current_value - avg_cost) * qty
+                            pnl_pct = ((current_value - avg_cost) / avg_cost) * 100
                             pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
                             pnl_text = f" → ${current_price:.2f} | {pnl_emoji} ${unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
 
@@ -729,6 +732,24 @@ class TradingOrchestrator:
                 text += f"\n• {symbol}: {quantity} ({position_type})\n"
 
                 try:
+                    # CRITICAL: Cancel bracket orders FIRST to prevent SHORT positions
+                    # Find and cancel brackets before closing position
+                    session_to_close = None
+                    if hasattr(contract, 'strike'):
+                        session_key = f"{contract.symbol} {contract.strike} {contract.right} {contract.lastTradeDateOrContractMonth}"
+                        for session in self.session_manager.sessions.values():
+                            if session.state == SessionState.OPEN:
+                                sess_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
+                                if sess_key == session_key:
+                                    session_to_close = session
+
+                                    # Cancel brackets FIRST
+                                    if session.stop_order_id or session.target_order_ids:
+                                        print(f"    Cancelling brackets for {symbol}...")
+                                        await self._cancel_session_brackets(session)
+                                        text += f"  🛑 Cancelled {1 if session.stop_order_id else 0 + len(session.target_order_ids or [])} bracket order(s)\n"
+                                    break
+
                     # Determine order action (BUY to close SHORT, SELL to close LONG)
                     action = "BUY" if quantity < 0 else "SELL"
                     close_quantity = abs(quantity)
@@ -746,7 +767,17 @@ class TradingOrchestrator:
 
                     if filled:
                         fill_price = trade.orderStatus.avgFillPrice
-                        pnl = (fill_price - avg_cost) * quantity * 100 if hasattr(contract, 'strike') else 0
+
+                        # Calculate P&L correctly for options
+                        # fill_price is premium (e.g., $0.10)
+                        # avg_cost is already in dollars per contract (e.g., $12.00)
+                        # For options: convert fill_price to dollars first
+                        if hasattr(contract, 'strike'):
+                            fill_value = fill_price * 100  # Convert premium to dollar value
+                            pnl = (fill_value - avg_cost) * quantity
+                        else:
+                            # For stocks/other securities
+                            pnl = (fill_price - avg_cost) * quantity
 
                         text += f"  ✅ Closed @ ${fill_price:.2f}"
                         if pnl != 0:
@@ -756,18 +787,16 @@ class TradingOrchestrator:
 
                         closed_count += 1
 
-                        # Close any associated sessions
-                        if hasattr(contract, 'strike'):
-                            session_key = f"{contract.symbol} {contract.strike} {contract.right} {contract.lastTradeDateOrContractMonth}"
-                            for session in self.session_manager.sessions.values():
-                                if session.state == SessionState.OPEN:
-                                    sess_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
-                                    if sess_key == session_key:
-                                        session.state = SessionState.CLOSED
-                                        session.closed_at = datetime.now(timezone.utc)
-                                        session.exit_reason = "EMERGENCY_CLOSEALL"
-                                        session.total_quantity = 0
-                                        break
+                        # Close any associated sessions (already found earlier)
+                        if session_to_close:
+                            now = datetime.now(timezone.utc)
+                            session_to_close.state = SessionState.CLOSED
+                            session_to_close.closed_at = now
+                            session_to_close.updated_at = now
+                            session_to_close.exit_reason = "EMERGENCY_CLOSEALL"
+                            session_to_close.total_quantity = 0
+                            session_to_close.exit_price = fill_price
+                            session_to_close.realized_pnl = pnl if hasattr(contract, 'strike') else 0
                     else:
                         text += f"  ⚠️ Close order timed out\n"
                         failed_count += 1
