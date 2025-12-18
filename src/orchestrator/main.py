@@ -100,19 +100,55 @@ class TradingOrchestrator:
 
         # State
         self.running = False
-        self.paper_mode = config.get("paper_mode", True)
+        self.dry_run = config.get("dry_run", True)
         self.start_time = None  # Will be set when bot starts
 
         print(
-            f"Orchestrator initialized (paper_mode={self.paper_mode})"
+            f"Orchestrator initialized (dry_run={self.dry_run})"
         )
+
+    def _categorize_orders(self, open_orders, open_sessions):
+        """Categorize orders into entry, stop, and target."""
+        bracket_order_ids = set()
+        for session in open_sessions:
+            if session.stop_order_id:
+                bracket_order_ids.add(session.stop_order_id)
+            if session.target_order_ids:
+                bracket_order_ids.update(session.target_order_ids)
+
+        entry_orders, stop_orders, target_orders = [], [], []
+
+        for trade in open_orders:
+            order_id = trade.order.orderId
+            if order_id not in bracket_order_ids:
+                entry_orders.append(trade)
+                continue
+
+            # Find bracket type
+            for session in open_sessions:
+                if session.stop_order_id == order_id:
+                    stop_orders.append(trade)
+                    break
+                elif session.target_order_ids and order_id in session.target_order_ids:
+                    target_orders.append(trade)
+                    break
+
+        return entry_orders, stop_orders, target_orders
+
+    def _get_resource_emoji(self, percent: float, warn_threshold: float, critical_threshold: float) -> str:
+        """Get emoji based on resource usage percentage."""
+        if percent < warn_threshold:
+            return "✅"
+        elif percent < critical_threshold:
+            return "⚠️"
+        return "🔴"
 
     async def start(self):
         """Start the orchestrator."""
         print("\n" + "=" * 60)
         print("STARTING AUTOSCALPER")
         print("=" * 60)
-        print(f"Mode: {'PAPER TRADING' if self.paper_mode else 'LIVE TRADING'}")
+        print(f"Mode: {'DRY-RUN (No IBKR)' if self.dry_run else 'LIVE TRADING'}")
         print(f"Risk per trade: {self.config['risk']['risk_per_trade_percent']}%")
         print(f"Daily max loss: {self.config['risk']['daily_max_loss_percent']}%")
         print(f"Max contracts: {self.config['risk']['max_contracts']}")
@@ -122,7 +158,7 @@ class TradingOrchestrator:
         self.start_time = datetime.now(timezone.utc)
 
         # Connect to IBKR (only if not in paper mode)
-        if not self.paper_mode:
+        if not self.dry_run:
             print("Connecting to IBKR...")
 
             # Retry connection up to 10 times with exponential backoff
@@ -163,8 +199,8 @@ class TradingOrchestrator:
             self.notifier.register_command_handler("server", self._handle_server_command)
             asyncio.create_task(self._telegram_command_polling_task())
 
-        # Start connection monitoring (if not in paper mode)
-        if not self.paper_mode:
+        # Start connection monitoring (if not in dry-run mode)
+        if not self.dry_run:
             print("Starting IBKR connection monitor...")
             asyncio.create_task(self._connection_monitor_task())
 
@@ -191,7 +227,7 @@ class TradingOrchestrator:
         await self.discord_listener.stop()
 
         # Only disconnect from IBKR if we connected
-        if not self.paper_mode:
+        if not self.dry_run:
             await self.executor.disconnect()
 
         # Flush all logs
@@ -227,7 +263,7 @@ class TradingOrchestrator:
                 try:
                     snapshot = await self.snapshot_manager.take_snapshot(
                         executor=self.executor,
-                        paper_mode=self.paper_mode,
+                        dry_run=self.dry_run,
                         account_balance_config=self.config["risk"]["account_balance"],
                         trading_hours_start=snapshot_time_str
                     )
@@ -253,7 +289,7 @@ class TradingOrchestrator:
 
                     snapshot = await self.snapshot_manager.take_snapshot(
                         executor=self.executor,
-                        paper_mode=self.paper_mode,
+                        dry_run=self.dry_run,
                         account_balance_config=self.config["risk"]["account_balance"],
                         trading_hours_start=snapshot_time_str
                     )
@@ -354,21 +390,21 @@ class TradingOrchestrator:
         Returns formatted status message with positions and account info.
         """
         try:
-            mode = "📝 PAPER" if self.paper_mode else "🔴 LIVE"
+            mode = "📝 DRY-RUN" if self.dry_run else "🔴 LIVE"
 
             # Get account balance
             account_balance = None
-            if not self.paper_mode and self.executor.connected:
+            if not self.dry_run and self.executor.connected:
                 account_balance = await self.executor.get_account_balance()
 
             # Get positions
             positions = []
-            if not self.paper_mode and self.executor.connected:
+            if not self.dry_run and self.executor.connected:
                 positions = await self.executor.get_positions()
 
             # Get open orders
             open_orders = []
-            if not self.paper_mode and self.executor.connected:
+            if not self.dry_run and self.executor.connected:
                 open_orders = await self.executor.get_open_orders()
 
             # Get active sessions
@@ -412,38 +448,7 @@ class TradingOrchestrator:
             # Open orders - separate brackets from entry orders
             text += f"<b>📋 Open Orders ({len(open_orders)}):</b>\n"
             if open_orders:
-                # Collect bracket order IDs from sessions
-                bracket_order_ids = set()
-                for session in open_sessions:
-                    if session.stop_order_id:
-                        bracket_order_ids.add(session.stop_order_id)
-                    if session.target_order_ids:
-                        bracket_order_ids.update(session.target_order_ids)
-
-                # Separate bracket orders from other orders
-                entry_orders = []
-                stop_orders = []
-                target_orders = []
-
-                for trade in open_orders:
-                    order_id = trade.order.orderId
-                    if order_id in bracket_order_ids:
-                        # Find which session owns this bracket
-                        order_type = "UNKNOWN"
-                        for session in open_sessions:
-                            if session.stop_order_id == order_id:
-                                order_type = "STOP"
-                                break
-                            elif session.target_order_ids and order_id in session.target_order_ids:
-                                order_type = "TARGET"
-                                break
-
-                        if order_type == "STOP":
-                            stop_orders.append(trade)
-                        elif order_type == "TARGET":
-                            target_orders.append(trade)
-                    else:
-                        entry_orders.append(trade)
+                entry_orders, stop_orders, target_orders = self._categorize_orders(open_orders, open_sessions)
 
                 # Display entry orders
                 if entry_orders:
@@ -515,7 +520,7 @@ class TradingOrchestrator:
         try:
             import platform
 
-            mode = "📝 PAPER" if self.paper_mode else "🔴 LIVE"
+            mode = "📝 DRY-RUN" if self.dry_run else "🔴 LIVE"
 
             # Calculate uptime
             uptime_str = "Unknown"
@@ -540,7 +545,7 @@ class TradingOrchestrator:
 
             # IBKR Connection
             text += f"<b>🏦 IBKR Connection</b>\n"
-            if self.paper_mode:
+            if self.dry_run:
                 text += f"• Status: ⏸️ Disconnected (Paper Mode)\n"
                 text += f"• Port: {self.config['ibkr']['port']}\n"
             else:
@@ -591,33 +596,18 @@ class TradingOrchestrator:
 
                     text += f"<b>💻 System Resources</b>\n"
 
-                    # CPU
-                    if cpu_percent < 50:
-                        cpu_emoji = "✅"
-                    elif cpu_percent < 80:
-                        cpu_emoji = "⚠️"
-                    else:
-                        cpu_emoji = "🔴"
+                    # Resource usage emojis
+                    cpu_emoji = self._get_resource_emoji(cpu_percent, 50, 80)
                     text += f"• CPU: {cpu_emoji} {cpu_percent:.1f}%\n"
 
                     # Memory
                     mem_percent = memory.percent
-                    if mem_percent < 70:
-                        mem_emoji = "✅"
-                    elif mem_percent < 90:
-                        mem_emoji = "⚠️"
-                    else:
-                        mem_emoji = "🔴"
+                    mem_emoji = self._get_resource_emoji(mem_percent, 70, 90)
                     text += f"• Memory: {mem_emoji} {mem_percent:.1f}% ({memory.used / (1024**3):.1f}GB / {memory.total / (1024**3):.1f}GB)\n"
 
                     # Disk
                     disk_percent = disk.percent
-                    if disk_percent < 70:
-                        disk_emoji = "✅"
-                    elif disk_percent < 90:
-                        disk_emoji = "⚠️"
-                    else:
-                        disk_emoji = "🔴"
+                    disk_emoji = self._get_resource_emoji(disk_percent, 70, 90)
                     text += f"• Disk: {disk_emoji} {disk_percent:.1f}% ({disk.used / (1024**3):.1f}GB / {disk.total / (1024**3):.1f}GB)\n"
                     text += f"\n"
 
@@ -785,7 +775,7 @@ class TradingOrchestrator:
             # Step 5: Execute
             print("\n[5/5] Executing order...")
 
-            if self.paper_mode:
+            if self.dry_run:
                 print("  [PAPER MODE] Would execute:")
                 print(f"    Event: {event.event_type}")
                 print(f"    Quantity: {quantity}")
@@ -816,7 +806,7 @@ class TradingOrchestrator:
                         session=session,
                         event_type=event.event_type,
                         order_details=order_details,
-                        paper_mode=True,
+                        dry_run=True,
                     )
 
                 # Log simulated result
@@ -825,7 +815,7 @@ class TradingOrchestrator:
                     success=True,
                     status=OrderStatus.FILLED,
                     filled_price=event.entry_price,
-                    message="Simulated fill (paper mode)"
+                    message="Simulated fill (dry-run mode)"
                 )
                 self.logger.log_order_result(
                     session=session,
@@ -839,7 +829,7 @@ class TradingOrchestrator:
                         session=session,
                         event_type=event.event_type,
                         result=simulated_result,
-                        paper_mode=True,
+                        dry_run=True,
                     )
             else:
                 # Log order submission
@@ -865,7 +855,7 @@ class TradingOrchestrator:
                         session=session,
                         event_type=event.event_type,
                         order_details=order_details,
-                        paper_mode=False,
+                        dry_run=False,
                     )
 
                 # Execute the order
@@ -888,7 +878,7 @@ class TradingOrchestrator:
                         session=session,
                         event_type=event.event_type,
                         result=result,
-                        paper_mode=False,
+                        dry_run=False,
                     )
 
                 if result.success:
@@ -935,7 +925,8 @@ class TradingOrchestrator:
             await self.notifier.notify_order_filled(
                 session=session,
                 event_type=event_type,
-                result=result
+                result=result,
+                dry_run=self.dry_run
             )
 
         # Log to console
@@ -1017,8 +1008,8 @@ class TradingOrchestrator:
         while self.running:
             await asyncio.sleep(60)
 
-            if self.paper_mode or not self.executor.connected:
-                continue  # Skip in paper mode or when disconnected
+            if self.dry_run or not self.executor.connected:
+                continue  # Skip in dry-run mode or when disconnected
 
             try:
                 # Get current IBKR positions
@@ -1109,7 +1100,7 @@ class TradingOrchestrator:
                 break
 
             # Execute EOD close
-            if self.paper_mode:
+            if self.dry_run:
                 print("\n[EOD AUTO-CLOSE] Paper mode - would close all positions")
             else:
                 print("\n[EOD AUTO-CLOSE] Closing all open positions...")
@@ -1237,7 +1228,8 @@ async def main():
                 os.getenv("DAILY_MAX_LOSS_PERCENT", "2.0")
             ),
             "max_loss_streak": int(os.getenv("MAX_LOSS_STREAK", "3")),
-            "max_contracts": int(os.getenv("MAX_CONTRACTS", "1")),
+            "initial_contracts": int(os.getenv("INITIAL_CONTRACTS", "1")),
+            "max_contracts": int(os.getenv("MAX_CONTRACTS", "2")),
             "max_adds_per_trade": int(os.getenv("MAX_ADDS_PER_TRADE", "1")),
             "trading_hours_start": os.getenv(
                 "TRADING_HOURS_START", "13:30"
@@ -1267,7 +1259,7 @@ async def main():
             "bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
             "chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
         },
-        "paper_mode": os.getenv("PAPER_MODE", "true").lower() == "true",
+        "dry_run": os.getenv("DRY_RUN", "true").lower() == "true",
     }
 
     # Create and start orchestrator

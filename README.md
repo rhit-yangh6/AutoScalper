@@ -44,7 +44,7 @@ The bot supports three modes for testing and trading:
 ### Configuration
 Edit `.env`:
 ```bash
-PAPER_MODE=true
+DRY_RUN=true
 # IBKR_PORT is ignored in this mode
 ```
 
@@ -100,7 +100,7 @@ http://localhost:5900
 ### Configuration
 Edit `.env`:
 ```bash
-PAPER_MODE=false
+DRY_RUN=false
 IBKR_HOST=127.0.0.1
 IBKR_PORT=4002          # Paper trading port
 IBKR_CLIENT_ID=1
@@ -167,7 +167,7 @@ docker-compose up -d
 ### Configuration
 Edit `.env`:
 ```bash
-PAPER_MODE=false
+DRY_RUN=false
 IBKR_HOST=127.0.0.1
 IBKR_PORT=4001          # Live trading port
 IBKR_CLIENT_ID=1
@@ -213,7 +213,7 @@ Fetching current market data...
 ### Dry-Run → IBKR Paper
 1. Edit `.env`:
    ```bash
-   PAPER_MODE=false  # Changed from true
+   DRY_RUN=false  # Changed from true
    IBKR_PORT=4002
    ```
 2. Start IB Gateway: `docker-compose up -d`
@@ -266,7 +266,7 @@ Fetching current market data...
 
 ```bash
 # Mode Selection
-PAPER_MODE=false           # true = dry-run, false = IBKR trading
+DRY_RUN=false           # true = dry-run (no IBKR), false = IBKR trading
 
 # IBKR Connection
 IBKR_HOST=127.0.0.1

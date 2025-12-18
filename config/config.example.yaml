@@ -3,7 +3,7 @@
 system:
   name: "LLM-Assisted 0DTE Options Auto-Trading"
   version: "1.0"
-  paper_mode: true  # ALWAYS start with paper trading
+  dry_run: true  # true = no IBKR connection (simulated), false = connect to IBKR
 
 llm:
   provider: "anthropic"

@@ -63,7 +63,7 @@ class DailySnapshotManager:
     async def take_snapshot(
         self,
         executor,
-        paper_mode: bool,
+        dry_run: bool,
         account_balance_config: float,
         trading_hours_start: str
     ) -> Optional[dict]:
@@ -72,7 +72,7 @@ class DailySnapshotManager:
 
         Args:
             executor: ExecutionEngine instance
-            paper_mode: Whether running in paper trading mode
+            dry_run: Whether running in dry-run mode (no IBKR connection)
             account_balance_config: Configured account balance (fallback)
             trading_hours_start: Trading hours start time (HH:MM format)
 
@@ -104,7 +104,7 @@ class DailySnapshotManager:
                 account_balance = await executor.get_account_balance()
 
                 if account_balance is not None:
-                    if paper_mode:
+                    if dry_run:
                         balance_source = "IBKR_PAPER"
                     else:
                         balance_source = "IBKR_LIVE"
@@ -129,7 +129,7 @@ class DailySnapshotManager:
             "timestamp": now.isoformat(),
             "trading_hours_start": trading_hours_start,
             "account_balance": account_balance,
-            "mode": "PAPER" if paper_mode else "LIVE",
+            "mode": "DRY-RUN" if dry_run else "LIVE",
             "ibkr_connected": ibkr_connected,
             "balance_source": balance_source,
             "notes": "Daily snapshot at trading hours start"

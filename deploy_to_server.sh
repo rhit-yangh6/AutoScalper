@@ -86,8 +86,8 @@ RISK_REWARD_RATIO=2.0
 TRADING_HOURS_START=13:30
 TRADING_HOURS_END=20:00
 
-# Mode
-PAPER_MODE=true
+# Mode (DRY_RUN=true means no IBKR connection, just simulated trades)
+DRY_RUN=true
 EOF
     chmod 600 .env
     echo "✓ Created .env file - YOU MUST EDIT THIS FILE WITH YOUR API KEYS!"

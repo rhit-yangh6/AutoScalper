@@ -175,28 +175,27 @@ class ExecutionEngine:
         """
         Callback when ANY order status changes.
 
-        Detects bracket child order fills (stop loss / take profit) and
+        Detects bracket order fills (stop loss / take profit) and
         updates session state, calculates P&L, and sends notifications.
+
+        Note: Brackets are standalone orders (not parent-child), so we check
+        order IDs against session.stop_order_id and session.target_order_ids.
         """
         order_id = trade.order.orderId
         status = trade.orderStatus.status
-        parent_id = trade.orderStatus.parentId
 
         # Only care about filled orders
         if status != "Filled":
             return
 
-        # Only care about child orders (parent_id > 0)
-        if parent_id == 0:
-            return
-
-        # Find session by order ID
+        # Find session by order ID (checks if this order is a bracket)
         if not self.session_manager:
             return
 
         session = self._find_session_by_order_id(order_id)
 
         if not session:
+            # Not a bracket order we're tracking
             return
 
         # Ensure session is still open
@@ -207,9 +206,11 @@ class ExecutionEngine:
         # Determine if this is stop or target
         if order_id == session.stop_order_id:
             # Stop loss filled
+            print(f"🔔 Bracket order filled: STOP LOSS (Order #{order_id})")
             asyncio.create_task(self._handle_stop_filled(session, trade))
         elif order_id in session.target_order_ids:
             # Take profit filled
+            print(f"🔔 Bracket order filled: TAKE PROFIT (Order #{order_id})")
             asyncio.create_task(self._handle_target_filled(session, trade))
 
     def _find_session_by_order_id(self, order_id: int):
@@ -478,7 +479,8 @@ class ExecutionEngine:
                 market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
 
                 if market_bid and market_ask:
-                    print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last ${market_last:.2f if market_last else 0:.2f}")
+                    last_str = f"${market_last:.2f}" if market_last else "N/A"
+                    print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last {last_str}")
                 elif market_last:
                     print(f"  📊 Market: Last ${market_last:.2f}")
 
@@ -643,17 +645,8 @@ class ExecutionEngine:
                 session.target_percent = None
             else:
                 # Safe to calculate percentages based on bracket base price
-                if stop_price:
-                    session.stop_loss_percent = ((stop_price - bracket_base_price) / bracket_base_price) * 100
-                    # Validate extreme percentages (sanity check)
-                    if session.stop_loss_percent < -99 or session.stop_loss_percent > 1000:
-                        print(f"  ⚠️ WARNING: Extreme stop_loss_percent: {session.stop_loss_percent:.2f}%")
-
-                if final_target_price:
-                    session.target_percent = ((final_target_price - bracket_base_price) / bracket_base_price) * 100
-                    # Validate extreme percentages (sanity check)
-                    if session.target_percent < -99 or session.target_percent > 1000:
-                        print(f"  ⚠️ WARNING: Extreme target_percent: {session.target_percent:.2f}%")
+                session.stop_loss_percent = self._calculate_bracket_percent(stop_price, bracket_base_price, "stop_loss_percent") if stop_price else None
+                session.target_percent = self._calculate_bracket_percent(final_target_price, bracket_base_price, "target_percent") if final_target_price else None
 
             # Build success message
             msg = f"Entry filled at ${actual_fill_price:.2f}"
@@ -1101,6 +1094,47 @@ class ExecutionEngine:
 
         return orders
 
+    def _calculate_bracket_percent(self, price: float, base_price: float, label: str) -> Optional[float]:
+        """Calculate bracket percentage and validate. Returns None if invalid."""
+        if base_price <= 0:
+            return None
+
+        percent = ((price - base_price) / base_price) * 100
+
+        if percent < -99 or percent > 1000:
+            print(f"  ⚠️ WARNING: Extreme {label}: {percent:.2f}%")
+
+        return percent
+
+    def _validate_stop_price(self, stop_price: Optional[float], entry_price: float) -> Optional[float]:
+        """Validate stop price for LONG positions. Returns None if invalid."""
+        if not stop_price:
+            return stop_price
+
+        if stop_price >= entry_price:
+            print(f"  ⚠️ WARNING: Stop ${stop_price:.2f} is above/equal to entry ${entry_price:.2f}")
+            print(f"  ⚠️ For LONG positions, stop must be BELOW entry. Using auto-calculated stop.")
+            return None
+
+        return stop_price
+
+    def _validate_target_price(self, target_price: Optional[float], entry_price: float) -> Optional[float]:
+        """Validate target price for LONG positions. Returns None if invalid."""
+        if not target_price:
+            return target_price
+
+        if target_price > 50:
+            print(f"  ⚠️ WARNING: Target ${target_price:.2f} seems too high for option premium")
+            print(f"  ⚠️ This might be a stock price, not premium. Using auto-calculated target instead.")
+            return None
+
+        if target_price <= entry_price:
+            print(f"  ⚠️ WARNING: Target ${target_price:.2f} is below/equal to entry ${entry_price:.2f}")
+            print(f"  ⚠️ For LONG positions, target must be ABOVE entry. Using auto-calculated target.")
+            return None
+
+        return target_price
+
     def _calculate_bracket_prices(
         self,
         actual_fill_price: float,
@@ -1122,29 +1156,9 @@ class ExecutionEngine:
         Returns:
             (stop_price, target_price) tuple
         """
-        # Use Discord prices if provided (with sanity checks)
-        stop_price = original_stop
-        target_price = original_target
-
-        # CRITICAL: Validate stop direction for LONG positions
-        # For buying options (LONG), stop must be BELOW entry to limit losses
-        if stop_price and stop_price >= actual_fill_price:
-            print(f"  ⚠️ WARNING: Stop ${stop_price:.2f} is above/equal to entry ${actual_fill_price:.2f}")
-            print(f"  ⚠️ For LONG positions, stop must be BELOW entry. Using auto-calculated stop.")
-            stop_price = None  # Force auto-calculation
-
-        # Sanity check: Validate target price
-        if target_price:
-            # Check if target is too high (likely stock price, not premium)
-            if target_price > 50:
-                print(f"  ⚠️ WARNING: Target ${target_price:.2f} seems too high for option premium")
-                print(f"  ⚠️ This might be a stock price, not premium. Using auto-calculated target instead.")
-                target_price = None  # Force auto-calculation
-            # Check if target is below/equal to entry (wrong direction)
-            elif target_price <= actual_fill_price:
-                print(f"  ⚠️ WARNING: Target ${target_price:.2f} is below/equal to entry ${actual_fill_price:.2f}")
-                print(f"  ⚠️ For LONG positions, target must be ABOVE entry. Using auto-calculated target.")
-                target_price = None  # Force auto-calculation
+        # Validate Discord prices
+        stop_price = self._validate_stop_price(original_stop, actual_fill_price)
+        target_price = self._validate_target_price(original_target, actual_fill_price)
 
         # Calculate from fill price if not provided
         if not stop_price:

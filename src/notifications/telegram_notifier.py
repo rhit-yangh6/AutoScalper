@@ -109,7 +109,7 @@ class TelegramNotifier:
         session: TradeSession,
         event_type: EventType,
         order_details: dict,
-        paper_mode: bool = True,
+        dry_run: bool = True,
     ):
         """
         Notify when an order is submitted to IBKR.
@@ -118,7 +118,7 @@ class TelegramNotifier:
             session: Trading session
             event_type: Type of event (NEW, ADD, EXIT, etc.)
             order_details: Order details dict
-            paper_mode: Whether in paper trading mode
+            dry_run: Whether in dry-run mode (no IBKR connection)
         """
         # Track for daily summary
         self.daily_orders.append({
@@ -129,7 +129,7 @@ class TelegramNotifier:
         })
 
         # Format message
-        mode = "📝 PAPER" if paper_mode else "🔴 LIVE"
+        mode = "📝 DRY-RUN" if dry_run else "🔴 LIVE"
         symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "UNKNOWN"
 
         text = f"<b>{mode} ORDER SUBMITTED</b>\n\n"
@@ -160,7 +160,7 @@ class TelegramNotifier:
         session: TradeSession,
         event_type: EventType,
         result: OrderResult,
-        paper_mode: bool = True,
+        dry_run: bool = True,
     ):
         """
         Notify when an order is filled (or rejected/cancelled).
@@ -169,7 +169,7 @@ class TelegramNotifier:
             session: Trading session
             event_type: Type of event
             result: Order result
-            paper_mode: Whether in paper trading mode
+            dry_run: Whether in dry-run mode (no IBKR connection)
         """
         # result.status is already a string value (Pydantic's use_enum_values = True)
         # Determine emoji and color based on status string
@@ -186,7 +186,7 @@ class TelegramNotifier:
             emoji = "ℹ️"
             status_text = result.status
 
-        mode = "📝 PAPER" if paper_mode else "🔴 LIVE"
+        mode = "📝 DRY-RUN" if dry_run else "🔴 LIVE"
         symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "UNKNOWN"
 
         text = f"<b>{emoji} {mode} ORDER {status_text}</b>\n\n"
@@ -347,26 +347,28 @@ class TelegramNotifier:
         if closed_sessions:
             text += f"<b>🔒 Closed Positions</b>\n"
             for session_data in closed_sessions[:5]:  # Show first 5
-                # Extract session info from entries
-                parsed_event = next(
-                    (e for e in session_data.get("entries", []) if e.get("type") == "parsed_event"),
-                    None
-                )
+                # Extract session info from top-level metadata
+                underlying = session_data.get("underlying", "?")
+                strike = session_data.get("strike", 0)
+                direction = session_data.get("direction", "?")
+
+                # Format direction (could be "CALL" or "PUT")
+                if direction and direction in ["CALL", "PUT"]:
+                    direction_short = "C" if direction == "CALL" else "P"
+                else:
+                    direction_short = "?"
+
+                symbol = f"{underlying} {strike}{direction_short}"
+
+                # Get P&L from session_closed entry
                 session_closed = next(
                     (e for e in session_data.get("entries", []) if e.get("type") == "session_closed"),
                     None
                 )
 
-                if parsed_event:
-                    underlying = parsed_event.get("underlying", "?")
-                    strike = parsed_event.get("strike", 0)
-                    direction = parsed_event.get("direction", "?")
-                    direction_short = direction[0] if direction else "?"
-                    symbol = f"{underlying} {strike}{direction_short}"
-
-                    pnl = session_closed.get("final_pnl", 0.0) if session_closed else 0.0
-                    pnl_emoji = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
-                    text += f"• {symbol} - {pnl_emoji} ${pnl:+.2f}\n"
+                pnl = session_closed.get("final_pnl", 0.0) if session_closed else 0.0
+                pnl_emoji = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
+                text += f"• {symbol} - {pnl_emoji} ${pnl:+.2f}\n"
 
             if len(closed_sessions) > 5:
                 text += f"<i>... and {len(closed_sessions) - 5} more</i>\n"
@@ -376,25 +378,27 @@ class TelegramNotifier:
         if open_sessions:
             text += f"<b>🔓 Open Positions</b>\n"
             for session_data in open_sessions[:5]:  # Show first 5
-                parsed_event = next(
-                    (e for e in session_data.get("entries", []) if e.get("type") == "parsed_event"),
-                    None
-                )
+                # Extract session info from top-level metadata
+                underlying = session_data.get("underlying", "?")
+                strike = session_data.get("strike", 0)
+                direction = session_data.get("direction", "?")
 
-                if parsed_event:
-                    underlying = parsed_event.get("underlying", "?")
-                    strike = parsed_event.get("strike", 0)
-                    direction = parsed_event.get("direction", "?")
-                    direction_short = direction[0] if direction else "?"
-                    symbol = f"{underlying} {strike}{direction_short}"
+                # Format direction (could be "CALL" or "PUT")
+                if direction and direction in ["CALL", "PUT"]:
+                    direction_short = "C" if direction == "CALL" else "P"
+                else:
+                    direction_short = "?"
 
-                    # Count filled orders to get quantity
-                    filled_orders = [
-                        e for e in session_data.get("entries", [])
-                        if e.get("type") == "order_result" and e.get("status") == "FILLED"
-                    ]
-                    qty = len(filled_orders)  # Simplified - each fill is 1 contract
+                symbol = f"{underlying} {strike}{direction_short}"
 
+                # Get quantity from session metadata (updated after each order)
+                qty = session_data.get("total_quantity", 0)
+
+                # Get average entry price if available
+                avg_entry = session_data.get("avg_entry_price")
+                if avg_entry:
+                    text += f"• {symbol} - {qty} @ ${avg_entry:.2f}\n"
+                else:
                     text += f"• {symbol} - {qty} contracts\n"
 
             if len(open_sessions) > 5:

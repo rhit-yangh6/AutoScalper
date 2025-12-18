@@ -30,34 +30,23 @@ EVENT TYPES:
 - IGNORE: Irrelevant chatter, vague commentary, or incomplete trade info
 
 PARSING GUIDELINES:
-- **CRITICAL**: If strike price is missing → event_type MUST be IGNORE (not NEW)
-- **CRITICAL**: If message is vague like "I am in at $0.50" without strike → IGNORE
-- **CRITICAL**: If message is just market commentary like "easy entries around $0.50" → IGNORE
-- **CRITICAL**: If message says "UP X%" or shows profit/gain → NOT NEW (it's an update on existing position)
-- **CRITICAL**: If message is celebration like "🔥" with price → likely TRIM or TP, NOT NEW
+- **CRITICAL - NEW event validation**:
+  * Strike price required. If missing → IGNORE
+  * Vague entries ("in at $0.50" without strike) or market commentary ("easy entries around $0.50") → IGNORE
+  * Profit announcements ("UP 50%") or celebrations ("🔥") → likely TRIM/TP, NOT NEW
 - Underlying: must be "SPY" or "QQQ"
 - Direction: CALL or PUT (REQUIRED for NEW events)
 - Strike: numeric value (REQUIRED for NEW events)
 - Entry price: premium paid per contract
 - Targets: array of price levels
-  * CRITICAL: Distinguish between underlying price targets and option premium targets
-  * If target > 100 → ALWAYS target_type = "UNDERLYING" (stock price, not premium)
-  * If target < 100 → target_type = "PREMIUM" (option premium)
-  * Option premiums are almost never > $100, stock prices are usually > $100
-  * Examples:
-    - "QQQ to 600" → targets: [600.0], target_type: "UNDERLYING"
-    - "SPY $674" → targets: [674.0], target_type: "UNDERLYING"
-    - "target 6.00" → targets: [6.0], target_type: "PREMIUM"
-    - "target $0.65" → targets: [0.65], target_type: "PREMIUM"
-    - "SPY hits 685" → targets: [685.0], target_type: "UNDERLYING"
+  * CRITICAL: target > 100 → "UNDERLYING" (stock price), target < 100 → "PREMIUM" (option premium)
+  * Examples: "QQQ to 600" → [600.0, "UNDERLYING"], "target 6.00" → [6.0, "PREMIUM"]
 - Risk level: LOW/MEDIUM/HIGH/EXTREME based on context clues
 
 EXPIRY DATE RULES (CRITICAL):
 - **DEFAULT**: If no expiry mentioned or unclear → use TODAY'S DATE (0DTE)
-- SPY/QQQ options typically expire on FRIDAYS (weekly) or 3rd Friday (monthly)
-- If message mentions a date that's NOT a Friday → IGNORE IT, use TODAY instead
-- Only use a future date if it's clearly stated AND is a Friday
-- When in doubt → TODAY'S DATE (safer for 0DTE trading)
+- Only use future date if explicitly stated AND is a Friday (SPY/QQQ weekly/monthly expirations)
+- If date is NOT a Friday or unclear → use TODAY (safer for 0DTE trading)
 
 OUTPUT FORMAT:
 CRITICAL: Return ONLY a valid JSON object. Nothing else.

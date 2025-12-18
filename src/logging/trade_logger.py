@@ -75,10 +75,19 @@ class TradeLogger:
         txt_path = self.current_day_dir / f"{base_name}.log"
         json_path = self.current_day_dir / f"{base_name}.json"
 
-        # Initialize session log
+        # Initialize session log with metadata
         self.session_logs[session.session_id] = {
             'txt_path': txt_path,
             'json_path': json_path,
+            'session_metadata': {
+                'session_id': session.session_id,
+                'underlying': session.underlying,
+                'direction': session.direction.value if session.direction else None,
+                'strike': session.strike,
+                'expiry': session.expiry,
+                'created_at': session.created_at.isoformat(),
+                'author': session.author,
+            },
             'entries': []
         }
 
@@ -281,6 +290,22 @@ class TradeLogger:
             'message': result.message
         })
 
+        # Update session metadata after order result
+        self.update_session_metadata(session)
+
+    def update_session_metadata(self, session: TradeSession):
+        """Update session metadata in logs (call after session state changes)."""
+        if session.session_id not in self.session_logs:
+            return
+
+        # Update metadata with current session state
+        self.session_logs[session.session_id]['session_metadata'].update({
+            'state': session.state.value if session.state else None,
+            'total_quantity': session.total_quantity,
+            'avg_entry_price': session.avg_entry_price,
+            'realized_pnl': session.realized_pnl,
+        })
+
     def log_session_closed(
         self,
         session: TradeSession,
@@ -289,6 +314,9 @@ class TradeLogger:
     ):
         """Log session closure."""
         txt_path, json_path = self._get_session_log_files(session)
+
+        # Update session metadata before closing
+        self.update_session_metadata(session)
 
         timestamp = datetime.now(timezone.utc)
 
@@ -357,11 +385,18 @@ class TradeLogger:
         logs = self.session_logs[session_id]
         json_path = logs['json_path']
 
+        # Include session metadata at top level
+        data = {
+            'session_id': session_id,
+            'entries': logs['entries']
+        }
+
+        # Add metadata if available
+        if 'session_metadata' in logs:
+            data.update(logs['session_metadata'])
+
         with open(json_path, 'w') as f:
-            json.dump({
-                'session_id': session_id,
-                'entries': logs['entries']
-            }, f, indent=2)
+            json.dump(data, f, indent=2)
 
     def flush_session(self, session_id: str):
         """Flush and finalize a session's JSON log."""

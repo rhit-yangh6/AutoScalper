@@ -46,7 +46,8 @@ class RiskGate:
         - risk_per_trade_percent: float (0.25 - 0.5)
         - daily_max_loss_percent: float (1.0 - 2.0)
         - max_loss_streak: int
-        - max_contracts: int
+        - initial_contracts: int (fixed contracts for NEW entries, e.g., 1)
+        - max_contracts: int (maximum total contracts per position, e.g., 2)
         - max_adds_per_trade: int
         - trading_hours_start: str (HH:MM)
         - trading_hours_end: str (HH:MM)
@@ -188,32 +189,49 @@ class RiskGate:
         self, event: Event, session: TradeSession
     ) -> int:
         """
-        Calculate appropriate position size based on risk parameters.
+        Calculate appropriate position size based on event type and risk parameters.
+
+        For NEW events: Always use initial_contracts (fixed sizing)
+        For ADD events: Calculate remaining capacity up to max_contracts
 
         Returns number of contracts to trade.
         """
-        # Base risk per trade
-        risk_percent = self.config["risk_per_trade_percent"]
-        risk_dollars = self.account_balance * (risk_percent / 100)
+        # For NEW events: always use configured initial contracts
+        if event.event_type == EventType.NEW:
+            return self.config.get("initial_contracts", 1)
 
-        # Adjust for risk level
-        if event.risk_level == RiskLevel.HIGH:
-            risk_dollars *= self.config.get("high_risk_size_reduction", 0.5)
-        elif event.risk_level == RiskLevel.EXTREME:
-            risk_dollars *= self.config.get("extreme_risk_size_reduction", 0.25)
+        # For ADD events: calculate how many more contracts we can add
+        if event.event_type == EventType.ADD:
+            current_quantity = session.total_quantity
+            max_contracts = self.config["max_contracts"]
+            remaining_capacity = max_contracts - current_quantity
 
-        # Calculate contracts (assume risk = entry price for simplicity)
-        entry_price = event.entry_price or session.avg_entry_price
-        if entry_price <= 0:
-            return 1  # Default minimum
+            if remaining_capacity <= 0:
+                return 0  # Already at max
 
-        contracts = int(risk_dollars / (entry_price * 100))  # Options are x100
-        contracts = max(1, contracts)  # At least 1
-        contracts = min(
-            contracts, self.config["max_contracts"]
-        )  # Cap at max
+            # Calculate risk-based quantity for ADD
+            risk_percent = self.config["risk_per_trade_percent"]
+            risk_dollars = self.account_balance * (risk_percent / 100)
 
-        return contracts
+            # Adjust for risk level
+            if event.risk_level == RiskLevel.HIGH:
+                risk_dollars *= self.config.get("high_risk_size_reduction", 0.5)
+            elif event.risk_level == RiskLevel.EXTREME:
+                risk_dollars *= self.config.get("extreme_risk_size_reduction", 0.25)
+
+            entry_price = event.entry_price or session.avg_entry_price
+            if entry_price <= 0:
+                contracts = 1
+            else:
+                contracts = int(risk_dollars / (entry_price * 100))  # Options are x100
+                contracts = max(1, contracts)  # At least 1
+
+            # Cap at remaining capacity
+            contracts = min(contracts, remaining_capacity)
+            return contracts
+
+        # For other event types (shouldn't reach here)
+        return 1
 
     def calculate_stop_and_target(
         self, event: Event, session: TradeSession

@@ -8,12 +8,11 @@ class SessionManager:
     """
     Manages trade sessions and correlates events to sessions.
 
-    Correlation rules (from proposal):
-    - Same author
-    - Same underlying (SPY/QQQ)
-    - Same direction (CALL/PUT)
-    - Same trading day
-    - Most recent open session wins
+    Correlation rules:
+    - CRITICAL: Only ONE active session per author at any time
+    - If author has active session, NEW events for different trades are REJECTED
+    - UPDATE events (ADD, TRIM, EXIT, etc.) correlate to the active session
+    - Session must be closed before starting a new trade
     """
 
     def __init__(self):
@@ -46,15 +45,33 @@ class SessionManager:
                 f"NEW event missing required fields: {event.raw_message}"
             )
 
-        # Check if there's an existing active session we should link to
-        # (edge case: user posts multiple NEW messages for same trade)
-        existing = self._find_matching_session(event)
-        if existing and existing.is_active():
-            # Link to existing session instead of creating new one
-            existing.add_event(event)
-            return existing
+        # CRITICAL: Only allow ONE active session at a time per author
+        # Check for ANY active session for this author
+        active_sessions = [
+            s for s in self.sessions.values()
+            if s.author == event.author and s.is_active()
+        ]
 
-        # Create new session
+        if active_sessions:
+            # Found active session(s) - check if it matches this trade
+            matching = self._find_matching_session(event)
+            if matching:
+                # Same trade - link to existing session instead of creating new one
+                print(f"⚠️ Linking NEW event to existing active session (duplicate NEW for same trade)")
+                matching.add_event(event)
+                return matching
+            else:
+                # Different trade - reject NEW event (only one active session allowed)
+                existing_session = active_sessions[0]
+                symbol = f"{existing_session.underlying} {existing_session.strike}{existing_session.direction.value[0]}"
+                print(f"⚠️ Cannot create new session - already have active session: {symbol}")
+                print(f"⚠️ Close existing position before opening new one")
+                raise ValueError(
+                    f"Only one active session allowed at a time. "
+                    f"Current active: {symbol} (session {existing_session.session_id[:8]}...)"
+                )
+
+        # No active sessions - safe to create new session
         session_id = self._generate_session_id()
         session = TradeSession(
             session_id=session_id,
@@ -106,47 +123,24 @@ class SessionManager:
         session.add_event(event)
         return session
 
+    def _session_matches_event(self, session: TradeSession, event: Event) -> bool:
+        """Check if session matches event criteria."""
+        return (
+            session.is_active() and
+            session.author == event.author and
+            (not event.underlying or session.underlying == event.underlying) and
+            (not event.direction or session.direction == event.direction) and
+            session.created_at.date() == event.timestamp.date()
+        )
+
     def _find_matching_session(self, event: Event) -> Optional[TradeSession]:
-        """
-        Find the most recent active session matching this event.
+        """Find the most recent active session matching this event."""
+        candidates = [
+            s for s in self.sessions.values()
+            if self._session_matches_event(s, event)
+        ]
 
-        Correlation rules:
-        - Same author
-        - Same underlying
-        - Same direction
-        - Same trading day
-        - Most recent wins
-        """
-        candidates = []
-
-        for session in self.sessions.values():
-            # Must be active
-            if not session.is_active():
-                continue
-
-            # Same author
-            if session.author != event.author:
-                continue
-
-            # Same underlying
-            if event.underlying and session.underlying != event.underlying:
-                continue
-
-            # Same direction
-            if event.direction and session.direction != event.direction:
-                continue
-
-            # Same trading day (compare dates only)
-            if session.created_at.date() != event.timestamp.date():
-                continue
-
-            candidates.append(session)
-
-        # Return most recent
-        if candidates:
-            return max(candidates, key=lambda s: s.updated_at)
-
-        return None
+        return max(candidates, key=lambda s: s.updated_at) if candidates else None
 
     def get_session(self, session_id: str) -> Optional[TradeSession]:
         """Get session by ID."""
