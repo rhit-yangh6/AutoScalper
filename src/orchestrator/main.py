@@ -702,6 +702,9 @@ class TradingOrchestrator:
                     action = "BUY" if quantity < 0 else "SELL"
                     close_quantity = abs(quantity)
 
+                    # Set exchange for proper routing (required by IBKR)
+                    contract.exchange = "SMART"
+
                     # Use MARKET order for fast emergency close
                     from ib_insync import MarketOrder
                     order = MarketOrder(action, close_quantity)
