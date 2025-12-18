@@ -88,6 +88,7 @@ class TradingOrchestrator:
             client_id=config["ibkr"]["client_id"],
             session_manager=self.session_manager,
             use_market_orders=use_market_orders,
+            config=config,
         )
 
         # Register bracket fill callback

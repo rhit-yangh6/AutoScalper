@@ -49,11 +49,13 @@ class ExecutionEngine:
         client_id: int = 1,
         session_manager=None,  # For bracket order monitoring
         use_market_orders: bool = True,  # True = market orders, False = limit orders with 5¢ flexibility
+        config: dict = None,  # Config for bracket calculations
     ):
         self.host = host
         self.port = port
         self.client_id = client_id
         self.use_market_orders = use_market_orders
+        self.config = config or {}
         self.ib = IB()
         self.connected = False
         self.kill_switch_active = False
@@ -571,18 +573,11 @@ class ExecutionEngine:
             session.total_quantity = quantity
             session.avg_entry_price = actual_fill_price
 
-            # Step 5: Calculate bracket prices
-            # CRITICAL: For LIMIT orders, use limit price for brackets
-            #           For MARKET orders, use actual fill price
-            bracket_base_price = actual_fill_price  # Default to fill price
-            if isinstance(parent_order, LimitOrder):
-                # For limit orders, brackets based on intended entry (limit price)
-                bracket_base_price = parent_order.lmtPrice
-                if bracket_base_price != actual_fill_price:
-                    print(f"  ⓘ Using limit price ${bracket_base_price:.2f} for brackets (filled at ${actual_fill_price:.2f})")
-
+            # Step 5: Calculate bracket prices using ACTUAL fill price
+            # CRITICAL: Always use actual fill price, not limit price
+            # This ensures risk management is based on real execution, not intended price
             stop_price, final_target_price = self._calculate_bracket_prices(
-                bracket_base_price,
+                actual_fill_price,
                 event.stop_loss,
                 target_price,
             )
@@ -666,17 +661,17 @@ class ExecutionEngine:
                     )
 
             # Step 8: Store bracket percentages for future ADD operations (Issue 4)
-            # CRITICAL: Use bracket_base_price for percentage calculations
+            # CRITICAL: Use actual_fill_price for percentage calculations
             # (same price used to calculate the brackets)
-            if bracket_base_price <= 0:
-                print(f"  ⚠️ WARNING: Invalid bracket base price {bracket_base_price}, cannot calculate bracket percentages")
+            if actual_fill_price <= 0:
+                print(f"  ⚠️ WARNING: Invalid fill price {actual_fill_price}, cannot calculate bracket percentages")
                 print(f"  ⚠️ ADD operations will not be able to update brackets")
                 session.stop_loss_percent = None
                 session.target_percent = None
             else:
-                # Safe to calculate percentages based on bracket base price
-                session.stop_loss_percent = self._calculate_bracket_percent(stop_price, bracket_base_price, "stop_loss_percent") if stop_price else None
-                session.target_percent = self._calculate_bracket_percent(final_target_price, bracket_base_price, "target_percent") if final_target_price else None
+                # Safe to calculate percentages based on actual fill price
+                session.stop_loss_percent = self._calculate_bracket_percent(stop_price, actual_fill_price, "stop_loss_percent") if stop_price else None
+                session.target_percent = self._calculate_bracket_percent(final_target_price, actual_fill_price, "target_percent") if final_target_price else None
 
             # Build success message
             msg = f"Entry filled at ${actual_fill_price:.2f}"
@@ -1192,27 +1187,28 @@ class ExecutionEngine:
 
         # Calculate from fill price if not provided
         if not stop_price:
-            # Default: 25% stop loss from fill price
-            stop_percent = 25.0  # This should come from config
+            # Get stop percent from config (default: 50% for options)
+            stop_percent = self.config.get('risk', {}).get('auto_stop_loss_percent', 50.0)
             stop_price = actual_fill_price * (1 - stop_percent / 100)
             print(f"  ⓘ Auto stop-loss: ${stop_price:.2f} ({stop_percent}% below fill)")
 
         if not target_price:
-            # Default: 2:1 risk/reward ratio
+            # Get risk/reward ratio from config (default: 0.6 for 0DTE)
+            rr_ratio = self.config.get('risk', {}).get('risk_reward_ratio', 0.6)
             risk = actual_fill_price - stop_price
 
             # Validate risk is positive (stop is below entry)
             if risk <= 0:
                 print(f"  ⚠️ WARNING: Negative/zero risk detected (entry: ${actual_fill_price:.2f}, stop: ${stop_price:.2f})")
-                print(f"  ⚠️ Recalculating both stop and target with defaults")
-                # Recalculate stop with default percentage
-                stop_percent = 25.0
+                print(f"  ⚠️ Recalculating both stop and target with config defaults")
+                # Recalculate stop with config percentage
+                stop_percent = self.config.get('risk', {}).get('auto_stop_loss_percent', 50.0)
                 stop_price = actual_fill_price * (1 - stop_percent / 100)
                 risk = actual_fill_price - stop_price
                 print(f"  ⓘ Auto stop-loss: ${stop_price:.2f} ({stop_percent}% below fill)")
 
-            target_price = actual_fill_price + (risk * 2.0)
-            print(f"  ⓘ Auto target: ${target_price:.2f} (2:1 R/R)")
+            target_price = actual_fill_price + (risk * rr_ratio)
+            print(f"  ⓘ Auto target: ${target_price:.2f} (R:R = 1:{rr_ratio})")
 
         # Round to 2 decimals for option premiums
         if stop_price:
@@ -1231,10 +1227,11 @@ class ExecutionEngine:
         session: TradeSession,
     ) -> Optional[dict]:
         """
-        Create independent stop and target orders (not parent-child linked).
+        Create OCO bracket orders (stop and target linked via OcaGroup).
 
         These are standalone orders created AFTER entry fills.
-        They act as OCO (One Cancels Other) through our monitoring callbacks.
+        They use IBKR's native OCO mechanism - when one fills, IBKR automatically
+        cancels the other. This is more reliable than manual callback cancellation.
 
         Args:
             contract: Qualified option contract
@@ -1249,23 +1246,38 @@ class ExecutionEngine:
         order_ids = {}
 
         try:
-            # Create stop loss order
+            # Generate unique OCA group name for this session
+            # IBKR will automatically cancel other orders in same OCA group when one fills
+            oca_group = f"OCA_{session.session_id[:8]}"
+
+            # Create stop loss order (STOP order triggers when price drops to stop_price)
             if stop_price:
-                stop_order = LimitOrder("SELL", quantity, stop_price)
+                from ib_insync import StopOrder
+                stop_order = StopOrder("SELL", quantity, stop_price)
                 stop_order.tif = "DAY"
+                stop_order.outsideRth = True  # Allow stop to work outside regular hours
+                stop_order.ocaGroup = oca_group  # Link to OCO group
+                stop_order.ocaType = 1  # 1 = Cancel all other orders in group on fill
                 stop_trade = self.ib.placeOrder(contract, stop_order)
                 await asyncio.sleep(0.2)  # Small delay for order submission
                 order_ids['stop_order_id'] = stop_trade.order.orderId
-                print(f"  ✓ Stop order created: ${stop_price:.2f} (Order #{stop_trade.order.orderId})")
+                print(f"  ✓ Stop order created: ${stop_price:.2f} (Order #{stop_trade.order.orderId}, OCO: {oca_group})")
 
             # Create target order
             if target_price:
                 target_order = LimitOrder("SELL", quantity, target_price)
                 target_order.tif = "DAY"
+                target_order.outsideRth = True  # Allow target to work outside regular hours
+                target_order.ocaGroup = oca_group  # Link to same OCO group
+                target_order.ocaType = 1  # 1 = Cancel all other orders in group on fill
                 target_trade = self.ib.placeOrder(contract, target_order)
                 await asyncio.sleep(0.2)
                 order_ids['target_order_ids'] = [target_trade.order.orderId]
-                print(f"  ✓ Target order created: ${target_price:.2f} (Order #{target_trade.order.orderId})")
+                print(f"  ✓ Target order created: ${target_price:.2f} (Order #{target_trade.order.orderId}, OCO: {oca_group})")
+
+            # Log OCO confirmation
+            if stop_price and target_price:
+                print(f"  ✓ OCO group '{oca_group}' created - IBKR will auto-cancel remaining order when one fills")
 
             return order_ids
 
