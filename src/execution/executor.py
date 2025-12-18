@@ -328,18 +328,48 @@ class ExecutionEngine:
         if not order_ids:
             return
 
+        cancelled_count = 0
+        failed_count = 0
+
         for order_id in order_ids:
             try:
                 # Find the trade by order ID
                 trades = self.ib.trades()
+                trade_found = False
+
                 for trade in trades:
                     if trade.order.orderId == order_id:
+                        trade_found = True
+                        status = trade.orderStatus.status
+
                         if trade.isActive():
                             self.ib.cancelOrder(trade.order)
-                            print(f"  ✓ Cancelled sibling order {order_id}")
+                            cancelled_count += 1
+                            print(f"  ✓ Cancelled bracket order {order_id}")
+                        else:
+                            # Order not active - may be filling or filled
+                            print(f"  ⚠️ Cannot cancel order {order_id} - Status: {status}")
+                            if status in ["Filled", "PartiallyFilled"]:
+                                print(f"     🚨 CRITICAL: Bracket filled after session closed!")
+                                print(f"     🚨 This may create a SHORT position if entry was already closed!")
+                                failed_count += 1
                         break
+
+                if not trade_found:
+                    print(f"  ⚠️ Order {order_id} not found in active trades (may have already filled)")
+                    failed_count += 1
+
             except Exception as e:
                 print(f"  ⚠️ Failed to cancel order {order_id}: {e}")
+                failed_count += 1
+
+        # Log summary
+        total = len(order_ids)
+        if cancelled_count > 0:
+            print(f"  Bracket cancellation: {cancelled_count}/{total} cancelled")
+        if failed_count > 0:
+            print(f"  ⚠️ WARNING: {failed_count}/{total} brackets could not be cancelled!")
+            print(f"  ⚠️ Check for orphaned positions in IBKR")
 
     async def execute_event(
         self,

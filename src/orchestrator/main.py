@@ -203,6 +203,7 @@ class TradingOrchestrator:
             print("Starting Telegram command handler...")
             self.notifier.register_command_handler("status", self._handle_status_command)
             self.notifier.register_command_handler("server", self._handle_server_command)
+            self.notifier.register_command_handler("closeall", self._handle_closeall_command)
             asyncio.create_task(self._telegram_command_polling_task())
 
         # Start connection monitoring (if not in dry-run mode)
@@ -379,7 +380,8 @@ class TradingOrchestrator:
 
         Checks for commands every 5 seconds.
         """
-        print("Telegram command polling active (send /status to check positions)")
+        print("Telegram command polling active")
+        print("  Available commands: /status, /server, /closeall")
 
         while self.running:
             try:
@@ -658,6 +660,97 @@ class TradingOrchestrator:
 
         except Exception as e:
             return f"❌ Error getting server health: {str(e)}"
+
+    async def _handle_closeall_command(self, cmd: dict) -> str:
+        """
+        Handle /closeall command from Telegram.
+
+        Emergency command to close ALL IBKR positions regardless of session state.
+        Used to handle orphaned positions, SHORT positions, or emergency exits.
+        """
+        try:
+            if self.dry_run:
+                return "❌ Cannot close positions in DRY-RUN mode"
+
+            if not self.executor.connected:
+                return "❌ Not connected to IBKR"
+
+            # Get all current positions
+            positions = await self.executor.get_positions()
+
+            if not positions:
+                return "✅ No positions to close"
+
+            text = f"<b>🚨 EMERGENCY: Closing All Positions</b>\n\n"
+            text += f"Found {len(positions)} position(s):\n"
+
+            closed_count = 0
+            failed_count = 0
+
+            for pos in positions:
+                contract = pos.contract
+                quantity = pos.position
+                avg_cost = pos.avgCost
+
+                symbol = f"{contract.symbol} {contract.strike}{contract.right}" if hasattr(contract, 'strike') else contract.symbol
+                position_type = "SHORT" if quantity < 0 else "LONG"
+
+                text += f"\n• {symbol}: {quantity} ({position_type})\n"
+
+                try:
+                    # Determine order action (BUY to close SHORT, SELL to close LONG)
+                    action = "BUY" if quantity < 0 else "SELL"
+                    close_quantity = abs(quantity)
+
+                    # Use MARKET order for fast emergency close
+                    from ib_insync import MarketOrder
+                    order = MarketOrder(action, close_quantity)
+                    trade = self.executor.ib.placeOrder(contract, order)
+
+                    # Wait briefly for fill
+                    filled = await self.executor._wait_for_fill(trade, timeout=10)
+
+                    if filled:
+                        fill_price = trade.orderStatus.avgFillPrice
+                        pnl = (fill_price - avg_cost) * quantity * 100 if hasattr(contract, 'strike') else 0
+
+                        text += f"  ✅ Closed @ ${fill_price:.2f}"
+                        if pnl != 0:
+                            pnl_emoji = "💰" if pnl > 0 else "📉"
+                            text += f" | {pnl_emoji} P&L: ${pnl:+,.2f}"
+                        text += f"\n"
+
+                        closed_count += 1
+
+                        # Close any associated sessions
+                        if hasattr(contract, 'strike'):
+                            session_key = f"{contract.symbol} {contract.strike} {contract.right} {contract.lastTradeDateOrContractMonth}"
+                            for session in self.session_manager.sessions.values():
+                                if session.state == SessionState.OPEN:
+                                    sess_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
+                                    if sess_key == session_key:
+                                        session.state = SessionState.CLOSED
+                                        session.closed_at = datetime.now(timezone.utc)
+                                        session.exit_reason = "EMERGENCY_CLOSEALL"
+                                        session.total_quantity = 0
+                                        break
+                    else:
+                        text += f"  ⚠️ Close order timed out\n"
+                        failed_count += 1
+
+                except Exception as e:
+                    text += f"  ❌ Error: {str(e)}\n"
+                    failed_count += 1
+
+            text += f"\n<b>Summary:</b>\n"
+            text += f"• Closed: {closed_count}\n"
+            text += f"• Failed: {failed_count}\n"
+            text += f"\n<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
+
+            return text
+
+        except Exception as e:
+            return f"❌ Error executing closeall: {str(e)}"
 
     async def on_discord_message(
         self, message: str, author: str, message_id: str, timestamp: datetime
@@ -1038,6 +1131,9 @@ class TradingOrchestrator:
                 # Check all OPEN sessions
                 open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
 
+                # Track which positions we've matched to sessions
+                matched_positions = set()
+
                 for session in open_sessions:
                     # Skip recently updated sessions (grace period for settlement)
                     # IBKR positions take time to settle after fills
@@ -1047,6 +1143,10 @@ class TradingOrchestrator:
 
                     # Build session key
                     session_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
+
+                    # Mark this position as matched (tracked by a session)
+                    if session_key in position_map:
+                        matched_positions.add(session_key)
 
                     # Check if position exists
                     ibkr_quantity = position_map.get(session_key, 0)
@@ -1085,6 +1185,60 @@ class TradingOrchestrator:
                                 f"{pnl_text}\n"
                                 f"<i>Session closed via position reconciliation</i>"
                             )
+
+                # Reverse check: IBKR has positions that bot doesn't track
+                unmatched_positions = set(position_map.keys()) - matched_positions
+
+                # CRITICAL: Check for SHORT positions (negative quantity)
+                short_positions = {key: qty for key, qty in position_map.items() if qty < 0}
+                if short_positions:
+                    print(f"🚨 CRITICAL: {len(short_positions)} SHORT position(s) detected!")
+                    for pos_key, quantity in short_positions.items():
+                        print(f"   - {pos_key}: {quantity} contracts (SHORT)")
+                        print(f"     🚨 Bot only trades LONG - this should NEVER happen!")
+                        print(f"     🚨 Likely cause: Bracket filled after session closed")
+                        print(f"     🚨 ACTION REQUIRED: Close manually in TWS immediately!")
+
+                    # Send urgent Telegram alert
+                    if self.notifier:
+                        short_text = "\n".join([f"• {key}: {qty} contracts" for key, qty in short_positions.items()])
+                        await self.notifier.send_message(
+                            f"<b>🚨 CRITICAL: SHORT POSITION DETECTED</b>\n\n"
+                            f"The bot has detected SHORT positions:\n\n"
+                            f"{short_text}\n\n"
+                            f"<b>⚠️ This bot only trades LONG positions!</b>\n\n"
+                            f"<b>Likely cause:</b>\n"
+                            f"• Bracket order filled after session closed\n"
+                            f"• Race condition in position reconciliation\n\n"
+                            f"<b>🚨 IMMEDIATE ACTION REQUIRED:</b>\n"
+                            f"1. Open TWS\n"
+                            f"2. BUY TO CLOSE these positions NOW\n"
+                            f"3. Check for unlimited loss risk\n\n"
+                            f"<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
+                        )
+
+                if unmatched_positions:
+                    print(f"⚠️ WARNING: {len(unmatched_positions)} IBKR position(s) have no active session:")
+                    for pos_key in unmatched_positions:
+                        quantity = position_map[pos_key]
+                        is_short = quantity < 0
+                        print(f"   - {pos_key}: {quantity} contracts{' (SHORT!)' if is_short else ''}")
+                        if not is_short:
+                            print(f"     This position was likely opened manually or is an orphaned bracket order")
+
+                    # Send Telegram warning
+                    if self.notifier and unmatched_positions:
+                        positions_text = "\n".join([f"• {key}: {position_map[key]} contracts" for key in unmatched_positions])
+                        await self.notifier.send_message(
+                            f"<b>⚠️ Orphaned Positions Detected</b>\n\n"
+                            f"IBKR has positions that the bot is not tracking:\n\n"
+                            f"{positions_text}\n\n"
+                            f"<b>Possible causes:</b>\n"
+                            f"• Position opened manually outside bot\n"
+                            f"• Bracket order filled after session closed\n"
+                            f"• Bug in session management\n\n"
+                            f"<i>⚠️ Please check TWS and close manually if needed</i>"
+                        )
 
             except Exception as e:
                 print(f"⚠️ Error in position reconciliation: {e}")
