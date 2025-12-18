@@ -259,8 +259,10 @@ class ExecutionEngine:
 
         # Update session
         from ..models import SessionState
+        now = datetime.now(timezone.utc)
         session.state = SessionState.CLOSED
-        session.closed_at = datetime.now(timezone.utc)
+        session.closed_at = now
+        session.updated_at = now  # Update timestamp
         session.exit_reason = "STOP_HIT"
         session.exit_order_id = trade.order.orderId
         session.exit_price = fill_price
@@ -295,8 +297,10 @@ class ExecutionEngine:
 
         # Update session
         from ..models import SessionState
+        now = datetime.now(timezone.utc)
         session.state = SessionState.CLOSED
-        session.closed_at = datetime.now(timezone.utc)
+        session.closed_at = now
+        session.updated_at = now  # Update timestamp
         session.exit_reason = "TARGET_HIT"
         session.exit_order_id = trade.order.orderId
         session.exit_price = fill_price
@@ -567,8 +571,10 @@ class ExecutionEngine:
             print(f"  ✓ Entry filled at ${actual_fill_price:.2f}")
 
             # Step 4: Update session BEFORE creating brackets
+            now = datetime.now(timezone.utc)
             session.state = SessionState.OPEN
-            session.opened_at = datetime.now(timezone.utc)
+            session.opened_at = now
+            session.updated_at = now  # CRITICAL: Update timestamp for reconciliation
             session.entry_order_id = parent_trade.order.orderId
             session.total_quantity = quantity
             session.avg_entry_price = actual_fill_price
@@ -806,6 +812,7 @@ class ExecutionEngine:
             session.total_quantity = new_quantity
             session.avg_entry_price = new_avg_price
             session.num_adds += 1
+            session.updated_at = datetime.now(timezone.utc)  # Update timestamp
 
             # Update brackets based on new average (Issue 4)
             await self._update_brackets_for_add(session, contract)
@@ -870,8 +877,10 @@ class ExecutionEngine:
             filled = await self._wait_for_fill(trade, timeout=30)
 
             if filled:
+                now = datetime.now(timezone.utc)
                 session.state = SessionState.CLOSED
-                session.closed_at = datetime.now(timezone.utc)
+                session.closed_at = now
+                session.updated_at = now  # Update timestamp
 
                 return OrderResult(
                     success=True,
@@ -967,13 +976,16 @@ class ExecutionEngine:
             # Update session
             session.total_quantity -= trim_qty
             session.realized_pnl += trim_pnl
+            session.updated_at = datetime.now(timezone.utc)  # Update timestamp
 
             # Check if position is fully closed
             if session.total_quantity == 0:
                 print(f"  ⓘ TRIM reduced position to 0, auto-closing session")
 
+                now = datetime.now(timezone.utc)
                 session.state = SessionState.CLOSED
-                session.closed_at = datetime.now(timezone.utc)
+                session.closed_at = now
+                session.updated_at = now  # Update timestamp
                 session.exit_reason = "TRIM_TO_ZERO"
                 session.exit_price = fill_price
 

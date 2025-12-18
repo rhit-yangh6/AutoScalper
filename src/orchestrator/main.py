@@ -437,16 +437,43 @@ class TradingOrchestrator:
                     qty = pos.position
                     avg_cost = pos.avgCost
 
-                    # Try to calculate current P&L
+                    # Get current market price for live P&L
+                    current_price = None
                     pnl_text = ""
                     try:
-                        unrealized_pnl = pos.unrealizedPNL
-                        if unrealized_pnl and avg_cost > 0 and abs(qty) > 0:
-                            pnl_pct = (unrealized_pnl / (avg_cost * abs(qty) * 100)) * 100
+                        # Request market data snapshot
+                        ticker = self.executor.ib.reqMktData(contract, snapshot=True)
+                        await asyncio.sleep(0.5)  # Wait for market data
+
+                        import math
+                        # Try to get current price from market data
+                        if ticker.last and not math.isnan(ticker.last):
+                            current_price = ticker.last
+                        elif ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+                            current_price = (ticker.bid + ticker.ask) / 2  # Use midpoint
+                        elif ticker.close and not math.isnan(ticker.close):
+                            current_price = ticker.close
+
+                        # Cancel market data subscription
+                        self.executor.ib.cancelMktData(contract)
+
+                        # Calculate P&L if we have current price
+                        if current_price and avg_cost > 0 and abs(qty) > 0:
+                            unrealized_pnl = (current_price - avg_cost) * qty * 100  # Options multiplier
+                            pnl_pct = ((current_price - avg_cost) / avg_cost) * 100
                             pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
-                            pnl_text = f" {pnl_emoji} {unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
-                    except (ZeroDivisionError, TypeError, AttributeError):
-                        pass
+                            pnl_text = f" → ${current_price:.2f} | {pnl_emoji} ${unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
+
+                    except Exception as e:
+                        # Fallback to IBKR's unrealized P&L if market data fails
+                        try:
+                            unrealized_pnl = pos.unrealizedPNL
+                            if unrealized_pnl and avg_cost > 0 and abs(qty) > 0:
+                                pnl_pct = (unrealized_pnl / (avg_cost * abs(qty) * 100)) * 100
+                                pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
+                                pnl_text = f" {pnl_emoji} ${unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
+                        except:
+                            pass
 
                     text += f"• {symbol}: {qty} @ ${avg_cost:.2f}{pnl_text}\n"
             else:
