@@ -11,8 +11,8 @@ services:
       - TIME_ZONE=America/New_York
       - READ_ONLY_API=no
     ports:
-      - "127.0.0.1:4001:4001"  # CHANGED: Live trading port (was 4001:4003)
-      - "127.0.0.1:4002:4002"  # CHANGED: Paper trading port (was 4002:4004)
+      - "127.0.0.1:4001:4003"  # Host 4001 → Container 4003 (live trading API)
+      - "127.0.0.1:4002:4004"  # Host 4002 → Container 4004 (paper trading API)
       - "127.0.0.1:5900:5900"  # VNC for remote desktop access
 
   bot:
