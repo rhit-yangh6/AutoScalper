@@ -1024,6 +1024,15 @@ class TradingOrchestrator:
                     result=result,
                 )
 
+                # Check if session closed after execution (EXIT, TRIM to zero, etc.)
+                if result.success and session.state == SessionState.CLOSED:
+                    print(f"  ⓘ Session closed: {session.exit_reason}")
+                    self.logger.log_session_closed(
+                        session,
+                        reason=session.exit_reason or "ORDER_EXECUTION",
+                        final_pnl=session.realized_pnl
+                    )
+
                 # Send Telegram notification for order fill
                 if self.notifier:
                     await self.notifier.notify_order_filled(

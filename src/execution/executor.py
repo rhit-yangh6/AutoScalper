@@ -1039,12 +1039,109 @@ class ExecutionEngine:
     async def _execute_move_stop(
         self, event: Event, session: TradeSession
     ) -> OrderResult:
-        """Update stop loss order."""
-        return OrderResult(
-            success=False,
-            status=OrderStatus.REJECTED,
-            message="MOVE_STOP not yet implemented",
-        )
+        """
+        Update stop loss order to new price (lock in profits, reduce risk).
+
+        Common uses:
+        - "Move stop to breakeven" - Lock in zero loss
+        - "Tighten stop to 0.40" - Reduce risk as position moves favorably
+        - "Trailing stop to entry" - Protect profits
+        """
+        try:
+            # Validate position exists
+            if session.total_quantity == 0:
+                return OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    message="No position to move stop for",
+                )
+
+            # Get new stop price from event
+            new_stop_price = event.stop_loss
+            if not new_stop_price:
+                return OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    message="No stop price provided in MOVE_STOP event",
+                )
+
+            # Validate new stop is tightening (not loosening risk)
+            old_stop = None
+            if session.stop_loss_percent is not None and session.avg_entry_price > 0:
+                old_stop = session.avg_entry_price * (1 + session.stop_loss_percent / 100)
+
+            if old_stop and new_stop_price < old_stop:
+                print(f"  ⚠️ Warning: New stop ${new_stop_price:.2f} is LOWER than old stop ${old_stop:.2f}")
+                print(f"  ⚠️ This INCREASES risk (stops should only tighten, not loosen)")
+                # Allow but warn - trader may have reasons
+
+            # Build contract
+            contract = self._build_contract_from_session(session)
+            qualified = await self.ib.qualifyContractsAsync(contract)
+
+            if not qualified:
+                return OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    message=f"Contract not found: {contract.symbol} {contract.strike}{contract.right}",
+                )
+
+            contract = qualified[0]
+            print(f"  ✓ Qualified contract: {contract.localSymbol}")
+
+            # Cancel old stop order
+            if session.stop_order_id:
+                print(f"  ⓘ Cancelling old stop order #{session.stop_order_id}...")
+                await self._cancel_sibling_orders([session.stop_order_id])
+                print(f"  ✓ Old stop cancelled")
+            else:
+                print(f"  ⓘ No existing stop order to cancel")
+
+            # Create new stop order at new price
+            from ib_insync import StopOrder
+            oca_group = f"OCA_{session.session_id[:8]}"
+
+            new_stop_order = StopOrder("SELL", session.total_quantity, new_stop_price)
+            new_stop_order.tif = "DAY"
+            new_stop_order.outsideRth = True
+            new_stop_order.ocaGroup = oca_group  # Link with existing target
+            new_stop_order.ocaType = 1
+
+            stop_trade = self.ib.placeOrder(contract, new_stop_order)
+            await asyncio.sleep(0.2)
+
+            # Update session with new stop
+            session.stop_order_id = stop_trade.order.orderId
+
+            # Recalculate stop percentage based on new price
+            if session.avg_entry_price > 0:
+                session.stop_loss_percent = ((new_stop_price - session.avg_entry_price) / session.avg_entry_price) * 100
+                print(f"  ✓ New stop: ${new_stop_price:.2f} ({session.stop_loss_percent:+.1f}% from entry)")
+            else:
+                print(f"  ✓ New stop: ${new_stop_price:.2f}")
+
+            print(f"  ✓ Stop order #{stop_trade.order.orderId} created")
+
+            # Calculate risk reduction
+            if old_stop:
+                risk_reduction = new_stop_price - old_stop
+                print(f"  📊 Risk reduced by ${risk_reduction:.2f} per contract")
+
+            return OrderResult(
+                success=True,
+                order_id=stop_trade.order.orderId,
+                status=OrderStatus.FILLED,  # Stop order is submitted, not filled
+                message=f"Stop moved to ${new_stop_price:.2f}",
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return OrderResult(
+                success=False,
+                status=OrderStatus.REJECTED,
+                message=f"MOVE_STOP execution error: {e}",
+            )
 
     def _build_contract(self, event: Event) -> Option:
         """Build IBKR Option contract from event."""

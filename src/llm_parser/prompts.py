@@ -21,7 +21,9 @@ EVENT TYPES:
 - ADD: Explicit add-on (e.g., "added 1 more @ 0.35")
 - TARGETS: Profit targets (e.g., "targeting 686, 687")
 - TRIM: Partial exit (e.g., "took off half @ 0.65")
-- MOVE_STOP: Tightening stop (e.g., "stop now at 0.40")
+- MOVE_STOP: Adjusting stop-loss (e.g., "stop now at 0.40", "moving stop to breakeven", "trailing stop to 0.50")
+  * Used when trader tightens/adjusts stop to lock in profits or reduce risk
+  * NOT for initial stop (that's part of NEW event)
 - TP: Target hit announcement (e.g., "hit target, out")
 - SL: Stop hit announcement (e.g., "stopped out")
 - EXIT: Full position close (e.g., "closed entire position")

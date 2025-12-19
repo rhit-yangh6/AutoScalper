@@ -387,10 +387,18 @@ class TelegramNotifier:
                 text += f"<i>... and {len(closed_sessions) - 5} more</i>\n"
             text += "\n"
 
-        # List open positions
-        if open_sessions:
+        # List open positions (filter out sessions with 0 quantity)
+        open_sessions_with_positions = []
+        for session_data in open_sessions:
+            # Get quantity from session_metadata (updated after each order)
+            session_metadata = session_data.get("session_metadata", {})
+            qty = session_metadata.get("total_quantity", session_data.get("total_quantity", 0))
+            if qty > 0:  # Only include sessions with actual positions
+                open_sessions_with_positions.append(session_data)
+
+        if open_sessions_with_positions:
             text += f"<b>🔓 Open Positions</b>\n"
-            for session_data in open_sessions[:5]:  # Show first 5
+            for session_data in open_sessions_with_positions[:5]:  # Show first 5
                 # Extract session info from top-level metadata
                 underlying = session_data.get("underlying", "?")
                 strike = session_data.get("strike", 0)
@@ -404,18 +412,18 @@ class TelegramNotifier:
 
                 symbol = f"{underlying} {strike}{direction_short}"
 
-                # Get quantity from session metadata (updated after each order)
-                qty = session_data.get("total_quantity", 0)
+                # Get quantity and avg price from session_metadata
+                session_metadata = session_data.get("session_metadata", {})
+                qty = session_metadata.get("total_quantity", session_data.get("total_quantity", 0))
+                avg_entry = session_metadata.get("avg_entry_price", session_data.get("avg_entry_price"))
 
-                # Get average entry price if available
-                avg_entry = session_data.get("avg_entry_price")
                 if avg_entry:
                     text += f"• {symbol} - {qty} @ ${avg_entry:.2f}\n"
                 else:
                     text += f"• {symbol} - {qty} contracts\n"
 
-            if len(open_sessions) > 5:
-                text += f"<i>... and {len(open_sessions) - 5} more</i>\n"
+            if len(open_sessions_with_positions) > 5:
+                text += f"<i>... and {len(open_sessions_with_positions) - 5} more</i>\n"
             text += "\n"
 
         text += f"<i>Summary generated at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
