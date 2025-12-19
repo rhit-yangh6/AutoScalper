@@ -510,6 +510,13 @@ class TradingOrchestrator:
             if open_orders:
                 entry_orders, stop_orders, target_orders = self._categorize_orders(open_orders, open_sessions)
 
+                # Debug: Log session bracket tracking
+                for session in open_sessions:
+                    print(f"[DEBUG] Session {session.session_id[:8]}: stop_id={session.stop_order_id}, target_ids={session.target_order_ids}")
+
+                # Debug: Log all open order IDs
+                print(f"[DEBUG] Open order IDs: {[t.order.orderId for t in open_orders]}")
+
                 # Display entry orders
                 if entry_orders:
                     text += "  <i>Entry Orders:</i>\n"

@@ -328,7 +328,7 @@ class TradeLogger:
             if final_pnl is not None:
                 pnl_symbol = "+" if final_pnl >= 0 else ""
                 f.write(f"Final P&L: {pnl_symbol}${final_pnl:.2f}\n")
-            f.write(f"Total Events: {len(session.events)}\n")
+            f.write(f"Total Events: {len(session.all_events)}\n")
             f.write(f"Total Quantity: {session.total_quantity}\n")
             f.write("=" * 80 + "\n")
 
@@ -338,7 +338,7 @@ class TradeLogger:
             'timestamp': timestamp.isoformat(),
             'reason': reason,
             'final_pnl': final_pnl,
-            'total_events': len(session.events),
+            'total_events': len(session.all_events),
             'total_quantity': session.total_quantity
         })
 
