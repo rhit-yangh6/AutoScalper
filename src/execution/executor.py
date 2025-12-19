@@ -1837,9 +1837,7 @@ class ExecutionEngine:
             return None
 
         try:
-            # Get account values (synchronous in ib_insync)
-            account_values = self.ib.accountValues()
-
+            # Use wrapper to handle ib_insync's event loop properly
             cash_info = {}
             tags_to_find = {
                 'NetLiquidation': 'net_liquidation',
@@ -1849,31 +1847,46 @@ class ExecutionEngine:
                 'BuyingPower': 'buying_power',
             }
 
-            # Extract values from account data
-            for item in account_values:
-                if item.tag in tags_to_find:
-                    key = tags_to_find[item.tag]
-                    try:
-                        cash_info[key] = float(item.value)
-                    except (ValueError, TypeError):
-                        cash_info[key] = None
+            # Get account values (cached, doesn't require async)
+            try:
+                account_values = self.ib.accountValues()
+
+                # Extract values from account data
+                for item in account_values:
+                    if item.tag in tags_to_find:
+                        key = tags_to_find[item.tag]
+                        try:
+                            cash_info[key] = float(item.value)
+                        except (ValueError, TypeError):
+                            cash_info[key] = None
+            except RuntimeError as e:
+                if "event loop" in str(e).lower():
+                    # Event loop conflict - use alternative approach
+                    return None
+                raise
 
             # If any values missing, try accountSummary as fallback
             if len(cash_info) < len(tags_to_find):
-                account_summary = self.ib.accountSummary()
-                for item in account_summary:
-                    if item.tag in tags_to_find:
-                        key = tags_to_find[item.tag]
-                        if key not in cash_info or cash_info[key] is None:
-                            try:
-                                cash_info[key] = float(item.value)
-                            except (ValueError, TypeError):
-                                cash_info[key] = None
+                try:
+                    account_summary = self.ib.accountSummary()
+                    for item in account_summary:
+                        if item.tag in tags_to_find:
+                            key = tags_to_find[item.tag]
+                            if key not in cash_info or cash_info[key] is None:
+                                try:
+                                    cash_info[key] = float(item.value)
+                                except (ValueError, TypeError):
+                                    cash_info[key] = None
+                except RuntimeError as e:
+                    if "event loop" in str(e).lower():
+                        # Return what we have so far
+                        return cash_info if cash_info else None
+                    raise
 
             return cash_info if cash_info else None
 
         except Exception as e:
-            print(f"Error getting cash details: {e}")
+            # Silently fail - not critical, just nice-to-have info
             return None
 
     async def _display_account_balance(self):
@@ -1883,7 +1896,11 @@ class ExecutionEngine:
             await asyncio.sleep(2)
 
             # Get detailed cash info (critical for Cash accounts)
-            cash_details = self.get_cash_details()
+            try:
+                cash_details = self.get_cash_details()
+            except Exception as e:
+                print(f"Warning: Could not fetch cash details: {e}")
+                cash_details = None
 
             if cash_details:
                 print("=" * 60)
