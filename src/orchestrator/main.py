@@ -951,6 +951,24 @@ class TradingOrchestrator:
                 )
                 print(f"✓ Position size: {quantity} contracts")
 
+                # Check if quantity is 0 (already at max position)
+                if quantity == 0:
+                    print(f"⚠️ Position size = 0 (already at MAX_CONTRACTS limit)")
+                    print(f"  Current: {session.total_quantity} contracts")
+                    print(f"  Max allowed: {self.config['risk']['max_contracts']}")
+                    print(f"  ACTION: NO TRADE (position limit reached)")
+
+                    # Send Telegram notification
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            f"⚠️ <b>Trade Blocked - Position Limit</b>\n\n"
+                            f"{event.underlying} {event.strike}{event.direction.value[0]}\n\n"
+                            f"Current: {session.total_quantity} contracts\n"
+                            f"Max allowed: {self.config['risk']['max_contracts']}\n\n"
+                            f"<i>Cannot add more contracts - already at maximum</i>"
+                        )
+                    return
+
                 # Calculate stop loss and target based on CONFIG (ignore Discord targets)
                 if event.event_type == EventType.NEW:
                     # CRITICAL: Clear Discord-parsed targets for NEW orders

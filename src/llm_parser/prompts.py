@@ -12,13 +12,16 @@ CRITICAL RULES:
 EVENT TYPES:
 - NEW: Initial trade entry signal - MUST include strike price and direction (e.g., "bought SPY 685C @ 0.43")
   * REQUIRED: underlying (SPY/QQQ), strike price (685), direction (CALL/PUT)
-  * REQUIRED: Clear indication of entry (bought, entered, in at, etc.)
+  * REQUIRED: Clear indication of FIRST entry (bought, entered, in at, etc.)
+  * If message says "added", "adding more", "scaling in" → NOT NEW, use ADD instead!
   * If message just says "I am in at $0.50" without strike → IGNORE (too vague)
   * If message just says "SPY around $0.50" without clear entry → IGNORE (market commentary)
   * If message says "UP X%" or celebrates profit → NOT NEW, likely TRIM or TP
   * If message just announces current price without entry verb → IGNORE
 - PLAN: Intent statement (e.g., "may add if it dips", "will notify when I add")
-- ADD: Explicit add-on (e.g., "added 1 more @ 0.35")
+- ADD: Adding to existing position (e.g., "added 1 more @ 0.35", "adding here @ 0.30", "scaling in @ 0.25")
+  * Keywords: "added", "adding", "more", "scale in", "averaging", "add here"
+  * IMPORTANT: If trader already announced entry earlier, subsequent entries = ADD not NEW
 - TARGETS: Profit targets (e.g., "targeting 686, 687")
 - TRIM: Partial exit (e.g., "took off half @ 0.65")
 - MOVE_STOP: Adjusting stop-loss (e.g., "stop now at 0.40", "moving stop to breakeven", "trailing stop to 0.50")

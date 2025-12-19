@@ -718,6 +718,14 @@ class ExecutionEngine:
         4. Recalculate and update brackets based on new average
         """
         try:
+            # Validate quantity is positive
+            if quantity <= 0:
+                return OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    message=f"Cannot ADD {quantity} contracts - must be positive number",
+                )
+
             contract = self._build_contract_from_session(session)
 
             # Qualify contract with IBKR

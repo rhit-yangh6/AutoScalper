@@ -56,8 +56,13 @@ class SessionManager:
             # Found active session(s) - check if it matches this trade
             matching = self._find_matching_session(event)
             if matching:
-                # Same trade - link to existing session instead of creating new one
-                print(f"⚠️ Linking NEW event to existing active session (duplicate NEW for same trade)")
+                # Same trade (same strike/expiry) - convert NEW to ADD
+                print(f"⚠️ Detected duplicate NEW signal for existing position")
+                print(f"  Existing: {matching.underlying} {matching.strike}{matching.direction.value[0]} @ ${matching.avg_entry_price:.2f} ({matching.total_quantity} contracts)")
+                print(f"  Converting NEW → ADD (averaging down/up)")
+
+                # CRITICAL: Convert event type from NEW to ADD
+                event.event_type = EventType.ADD
                 matching.add_event(event)
                 return matching
             else:
@@ -124,14 +129,44 @@ class SessionManager:
         return session
 
     def _session_matches_event(self, session: TradeSession, event: Event) -> bool:
-        """Check if session matches event criteria."""
-        return (
-            session.is_active() and
-            session.author == event.author and
-            (not event.underlying or session.underlying == event.underlying) and
-            (not event.direction or session.direction == event.direction) and
-            session.created_at.date() == event.timestamp.date()
-        )
+        """
+        Check if session matches event criteria.
+
+        For precise matching (NEW/ADD to same contract), checks:
+        - Same author
+        - Same underlying (SPY/QQQ)
+        - Same direction (CALL/PUT)
+        - Same strike (if event has strike)
+        - Same expiry (if event has expiry)
+        - Same trading day
+        """
+        # Basic checks
+        if not session.is_active() or session.author != event.author:
+            return False
+
+        # Underlying check (allow None event.underlying for update events)
+        if event.underlying and session.underlying != event.underlying:
+            return False
+
+        # Direction check (allow None event.direction for update events)
+        if event.direction and session.direction != event.direction:
+            return False
+
+        # CRITICAL: Strike check (for NEW/ADD to same contract)
+        # If event has strike (NEW/ADD), it MUST match session strike
+        if event.strike is not None and session.strike != event.strike:
+            return False
+
+        # CRITICAL: Expiry check (for NEW/ADD to same contract)
+        # If event has expiry, it MUST match session expiry
+        if event.expiry and session.expiry != event.expiry:
+            return False
+
+        # Same trading day check
+        if session.created_at.date() != event.timestamp.date():
+            return False
+
+        return True
 
     def _find_matching_session(self, event: Event) -> Optional[TradeSession]:
         """Find the most recent active session matching this event."""
