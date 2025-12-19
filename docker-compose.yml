@@ -6,14 +6,14 @@ services:
     environment:
       - TWS_USERID=${IB_USERNAME}
       - TWS_PASSWORD=${IB_PASSWORD}
-      - TRADING_MODE=paper
+      - TRADING_MODE=live  # CHANGED: live instead of paper
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-changeme}
       - TIME_ZONE=America/New_York
       - READ_ONLY_API=no
     ports:
-      - "127.0.0.1:4001:4003"
-      - "127.0.0.1:4002:4004"
-      - "127.0.0.1:5900:5900"
+      - "127.0.0.1:4001:4001"  # CHANGED: Live trading port (was 4001:4003)
+      - "127.0.0.1:4002:4002"  # CHANGED: Paper trading port (was 4002:4004)
+      - "127.0.0.1:5900:5900"  # VNC for remote desktop access
 
   bot:
     build: .
@@ -24,7 +24,7 @@ services:
       - .env
     environment:
       - IBKR_HOST=127.0.0.1
-      - IBKR_PORT=4002
+      - IBKR_PORT=4001  # CHANGED: Connect to live port (was 4002 for paper)
     volumes:
       - ./logs:/app/logs
     depends_on:
