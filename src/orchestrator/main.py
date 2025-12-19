@@ -401,10 +401,12 @@ class TradingOrchestrator:
         try:
             mode = "📝 DRY-RUN" if self.dry_run else "🔴 LIVE"
 
-            # Get account balance
+            # Get account balance and cash details
             account_balance = None
+            cash_details = None
             if not self.dry_run and self.executor.connected:
                 account_balance = await self.executor.get_account_balance()
+                cash_details = await self.executor.get_cash_details()
 
             # Get positions
             positions = []
@@ -422,8 +424,24 @@ class TradingOrchestrator:
             # Build response
             text = f"<b>📊 {mode} STATUS</b>\n\n"
 
-            # Account balance
-            if account_balance:
+            # Account balance with cash details
+            if cash_details:
+                text += f"<b>💰 Account Value:</b> ${cash_details.get('net_liquidation', 0):,.2f}\n"
+
+                # Show available cash (critical for Cash accounts)
+                available = cash_details.get('available_funds')
+                settled = cash_details.get('settled_cash')
+
+                if available is not None:
+                    text += f"<b>💵 Available Cash:</b> ${available:,.2f}"
+                    if settled is not None and settled != available:
+                        text += f" (${settled:,.2f} settled)"
+                    text += "\n"
+                elif account_balance:
+                    text += f"<b>💵 Cash:</b> ${account_balance:,.2f}\n"
+
+                text += "\n"
+            elif account_balance:
                 text += f"<b>💰 Account Balance:</b> ${account_balance:,.2f}\n\n"
             else:
                 text += f"<b>💰 Account Balance:</b> Not available\n\n"
@@ -900,6 +918,30 @@ class TradingOrchestrator:
                     for check in risk_result.failed_checks:
                         print(f"    - {check}")
                 return
+
+            # Cash check for NEW trades (Cash account with T+1 settlement)
+            if event.event_type == EventType.NEW and not self.dry_run and self.executor.connected:
+                cash_details = await self.executor.get_cash_details()
+                if cash_details:
+                    available_cash = cash_details.get('available_funds') or cash_details.get('settled_cash')
+                    if available_cash is not None:
+                        # Estimate cost for 1 contract (will be refined after position sizing)
+                        estimated_cost = (event.entry_price or 0.50) * 100  # Premium × 100
+                        if available_cash < estimated_cost:
+                            print(f"⚠️ INSUFFICIENT SETTLED CASH")
+                            print(f"  Available: ${available_cash:,.2f}")
+                            print(f"  Estimated cost: ${estimated_cost:,.2f}")
+                            print(f"  ACTION: NO TRADE (waiting for T+1 settlement)")
+                            await self.telegram.send_message(
+                                f"⚠️ <b>Trade Blocked - Insufficient Cash</b>\n\n"
+                                f"Cannot enter {event.underlying} {event.strike}{event.direction.value[0]}\n"
+                                f"Available: ${available_cash:,.2f}\n"
+                                f"Needed: ~${estimated_cost:,.2f}\n\n"
+                                f"<i>Waiting for T+1 settlement from previous trades</i>"
+                            )
+                            return
+                        else:
+                            print(f"✓ Settled cash check passed: ${available_cash:,.2f} available")
 
             # Step 4: Calculate position size and stops/targets
             print("\n[4/5] Calculating position size and risk parameters...")

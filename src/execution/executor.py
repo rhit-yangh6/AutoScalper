@@ -1811,19 +1811,112 @@ class ExecutionEngine:
             print(f"Error getting account balance: {e}")
             return None
 
+    async def get_cash_details(self) -> Optional[dict]:
+        """
+        Get detailed cash information from IBKR (critical for Cash accounts with T+1 settlement).
+
+        Returns:
+            Dict with cash breakdown, or None if unavailable:
+            {
+                'net_liquidation': float,      # Total account value
+                'total_cash': float,            # Total cash (including unsettled)
+                'available_funds': float,       # Cash available for trading TODAY
+                'settled_cash': float,          # Fully settled cash only (T+1)
+                'buying_power': float,          # Available buying power
+            }
+        """
+        if not self.connected:
+            return None
+
+        try:
+            # Wait a moment for initial data to populate after connection
+            await asyncio.sleep(1)
+
+            # Get account values
+            account_values = self.ib.accountValues()
+
+            cash_info = {}
+            tags_to_find = {
+                'NetLiquidation': 'net_liquidation',
+                'TotalCashValue': 'total_cash',
+                'AvailableFunds': 'available_funds',
+                'SettledCash': 'settled_cash',
+                'BuyingPower': 'buying_power',
+            }
+
+            # Extract values from account data
+            for item in account_values:
+                if item.tag in tags_to_find:
+                    key = tags_to_find[item.tag]
+                    try:
+                        cash_info[key] = float(item.value)
+                    except (ValueError, TypeError):
+                        cash_info[key] = None
+
+            # If any values missing, try accountSummary as fallback
+            if len(cash_info) < len(tags_to_find):
+                account_summary = self.ib.accountSummary()
+                for item in account_summary:
+                    if item.tag in tags_to_find:
+                        key = tags_to_find[item.tag]
+                        if key not in cash_info or cash_info[key] is None:
+                            try:
+                                cash_info[key] = float(item.value)
+                            except (ValueError, TypeError):
+                                cash_info[key] = None
+
+            return cash_info if cash_info else None
+
+        except Exception as e:
+            print(f"Error getting cash details: {e}")
+            return None
+
     async def _display_account_balance(self):
-        """Display account balance on connection."""
+        """Display account balance and cash details on connection."""
         try:
             # Give IBKR extra time to populate account data after connection
             await asyncio.sleep(2)
 
-            balance = await self.get_account_balance()
-            if balance:
-                print(f"Account Balance: ${balance:,.2f}")
+            # Get detailed cash info (critical for Cash accounts)
+            cash_details = await self.get_cash_details()
+
+            if cash_details:
+                print("=" * 60)
+                print("💰 ACCOUNT SUMMARY")
+                print("=" * 60)
+
+                net_liq = cash_details.get('net_liquidation')
+                if net_liq:
+                    print(f"Total Value:      ${net_liq:,.2f}")
+
+                available = cash_details.get('available_funds')
+                if available is not None:
+                    print(f"Available Cash:   ${available:,.2f}")
+
+                settled = cash_details.get('settled_cash')
+                if settled is not None and settled != available:
+                    print(f"Settled Cash:     ${settled:,.2f}  (T+1 settlement)")
+
+                total_cash = cash_details.get('total_cash')
+                if total_cash is not None and total_cash != available:
+                    print(f"Total Cash:       ${total_cash:,.2f}  (includes unsettled)")
+
+                buying_power = cash_details.get('buying_power')
+                if buying_power is not None:
+                    print(f"Buying Power:     ${buying_power:,.2f}")
+
+                print("=" * 60)
+
             else:
-                print("Account Balance: Unable to retrieve (data may not be ready yet)")
+                # Fallback to simple balance display
+                balance = await self.get_account_balance()
+                if balance:
+                    print(f"Account Balance: ${balance:,.2f}")
+                else:
+                    print("Account Balance: Unable to retrieve (data may not be ready yet)")
+
         except Exception as e:
-            print(f"Could not retrieve account balance: {e}")
+            print(f"Could not retrieve account info: {e}")
 
     async def get_positions(self) -> list:
         """
