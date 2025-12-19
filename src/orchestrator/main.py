@@ -909,6 +909,7 @@ class TradingOrchestrator:
             print(f"✓ Linked to session {session.session_id[:8]}...")
             print(f"  Session state: {session.state}")
             print(f"  Trade: {session.underlying} {session.strike} {session.direction}")
+            print(f"  Current qty: {session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"  Current qty: {session.total_quantity}")
 
             # Step 3: Risk validation
             print("\n[3/5] Validating with risk gate...")

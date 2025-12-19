@@ -579,6 +579,8 @@ class ExecutionEngine:
             session.total_quantity = quantity
             session.avg_entry_price = actual_fill_price
 
+            print(f"  ✓ Session updated: {session.session_id[:8]}... | qty={quantity} @ ${actual_fill_price:.2f}")
+
             # Step 5: Calculate bracket prices using ACTUAL fill price
             # CRITICAL: Always use actual fill price, not limit price
             # This ensures risk management is based on real execution, not intended price
@@ -847,13 +849,45 @@ class ExecutionEngine:
     ) -> OrderResult:
         """Execute full exit."""
         try:
-            # Get current position size
+            # Get current position size from session
             total_quantity = session.total_quantity
+
+            print(f"  📊 EXIT check: Session {session.session_id[:8]}... has qty={total_quantity}")
+            print(f"     Session state: {session.state}, avg_entry={session.avg_entry_price}")
+
+            # CRITICAL: If session says 0 but we think there's a position,
+            # check IBKR directly (state sync bug protection)
+            if total_quantity == 0:
+                print(f"  ⚠️ Session shows 0 quantity, checking IBKR positions...")
+
+                # Build contract and check IBKR
+                contract = self._build_contract_from_session(session)
+                qualified = await self.ib.qualifyContractsAsync(contract)
+
+                if qualified:
+                    contract = qualified[0]
+                    positions = self.ib.positions()
+
+                    # Find matching position
+                    for pos in positions:
+                        if (hasattr(pos.contract, 'conId') and
+                            hasattr(contract, 'conId') and
+                            pos.contract.conId == contract.conId):
+                            ibkr_quantity = int(pos.position)
+                            if ibkr_quantity > 0:
+                                print(f"  🔧 State sync fix: IBKR has {ibkr_quantity} contracts, session shows 0")
+                                print(f"  🔧 Using IBKR quantity for EXIT")
+                                total_quantity = ibkr_quantity
+                                # Update session to fix state
+                                session.total_quantity = ibkr_quantity
+                                break
+
+            # Final check after IBKR fallback
             if total_quantity == 0:
                 return OrderResult(
                     success=False,
                     status=OrderStatus.REJECTED,
-                    message="No position to exit",
+                    message="No position to exit (confirmed with IBKR)",
                 )
 
             contract = self._build_contract_from_session(session)
