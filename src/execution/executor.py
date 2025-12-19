@@ -1819,6 +1819,42 @@ class ExecutionEngine:
             print(f"Error getting account balance: {e}")
             return None
 
+    async def get_unrealized_pnl(self) -> float:
+        """
+        Get total unrealized P&L from IBKR.
+
+        Returns:
+            Total unrealized P&L in base currency (USD), or 0.0 if unavailable
+        """
+        if not self.connected:
+            return 0.0
+
+        try:
+            # Get account values (already populated by ib_insync after connection)
+            account_values = self.ib.accountValues()
+
+            # Find UnrealizedPnL value
+            for item in account_values:
+                if item.tag == 'UnrealizedPnL':
+                    try:
+                        return float(item.value)
+                    except ValueError:
+                        continue
+
+            # If not found, try accountSummary
+            account_summary = self.ib.accountSummary()
+            for item in account_summary:
+                if item.tag == 'UnrealizedPnL':
+                    try:
+                        return float(item.value)
+                    except ValueError:
+                        continue
+
+            return 0.0
+        except Exception as e:
+            print(f"Error getting unrealized P&L: {e}")
+            return 0.0
+
     def get_cash_details(self) -> Optional[dict]:
         """
         Get detailed cash information from IBKR (critical for Cash accounts with T+1 settlement).

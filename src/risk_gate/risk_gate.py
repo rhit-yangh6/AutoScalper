@@ -60,12 +60,18 @@ class RiskGate:
         self.loss_streak = 0  # Track consecutive losses
         self.trades_today = []  # Track all trades today
 
+    def update_account_balance(self, balance: float) -> None:
+        """Update account balance dynamically."""
+        if balance > 0:
+            self.account_balance = balance
+
     def validate(
         self,
         event: Event,
         session: TradeSession,
         current_price: Optional[float] = None,
         bid_ask_spread: Optional[float] = None,
+        unrealized_pnl: float = 0.0,
     ) -> RiskCheckResult:
         """
         Validate if an event should be executed.
@@ -75,9 +81,7 @@ class RiskGate:
             session: The associated trade session
             current_price: Current option price (for spread check)
             bid_ask_spread: Current bid-ask spread
-
-        Returns:
-            RiskCheckResult with approval or rejection
+            unrealized_pnl: Current unrealized P&L from open positions
         """
         failed_checks = []
 
@@ -88,9 +92,9 @@ class RiskGate:
                 reason="Non-actionable event (PLAN, TARGETS, RISK_NOTE, etc.)",
             )
 
-        # 1. Daily max loss check
-        if not self._check_daily_max_loss():
-            failed_checks.append("Daily max loss exceeded")
+        # 1. Daily max loss check (including unrealized P&L)
+        if not self._check_daily_max_loss(unrealized_pnl):
+            failed_checks.append(f"Daily max loss exceeded (Realized: ${self.daily_pnl:.2f}, Unrealized: ${unrealized_pnl:.2f})")
 
         # 2. Loss streak check
         if not self._check_loss_streak():
@@ -138,12 +142,19 @@ class RiskGate:
             decision=RiskDecision.APPROVE, reason="All risk checks passed"
         )
 
-    def _check_daily_max_loss(self) -> bool:
-        """Check if daily max loss has been exceeded."""
+    def _check_daily_max_loss(self, unrealized_pnl: float = 0.0) -> bool:
+        """
+        Check if daily max loss has been exceeded.
+        
+        Now includes unrealized P&L to prevent revenge trading.
+        Condition: Daily Realized P&L + Unrealized P&L > -Max Loss Dollars
+        """
         max_loss_dollars = (
             self.account_balance * self.config["daily_max_loss_percent"] / 100
         )
-        return self.daily_pnl > -max_loss_dollars
+        
+        total_pnl = self.daily_pnl + unrealized_pnl
+        return total_pnl > -max_loss_dollars
 
     def _check_loss_streak(self) -> bool:
         """Check if loss streak limit has been exceeded."""

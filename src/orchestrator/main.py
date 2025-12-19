@@ -905,9 +905,24 @@ class TradingOrchestrator:
 
             # Step 3: Risk validation
             print("\n[3/5] Validating with risk gate...")
+
+            # Update account balance and get unrealized P&L
+            unrealized_pnl = 0.0
+            if not self.dry_run and self.executor.connected:
+                # Update balance
+                balance = await self.executor.get_account_balance()
+                if balance:
+                    self.risk_gate.update_account_balance(balance)
+                    print(f"  Account balance updated: ${balance:,.2f}")
+
+                # Get unrealized P&L
+                unrealized_pnl = await self.executor.get_unrealized_pnl()
+                print(f"  Current unrealized P&L: ${unrealized_pnl:+.2f}")
+
             risk_result = self.risk_gate.validate(
                 event=event,
                 session=session,
+                unrealized_pnl=unrealized_pnl,
             )
 
             print(f"{'✓' if risk_result.decision == RiskDecision.APPROVE else '✗'} {risk_result.decision}: {risk_result.reason}")
