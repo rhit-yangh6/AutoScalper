@@ -1811,7 +1811,7 @@ class ExecutionEngine:
             print(f"Error getting account balance: {e}")
             return None
 
-    async def get_cash_details(self) -> Optional[dict]:
+    def get_cash_details(self) -> Optional[dict]:
         """
         Get detailed cash information from IBKR (critical for Cash accounts with T+1 settlement).
 
@@ -1829,10 +1829,7 @@ class ExecutionEngine:
             return None
 
         try:
-            # Wait a moment for initial data to populate after connection
-            await asyncio.sleep(1)
-
-            # Get account values
+            # Get account values (synchronous in ib_insync)
             account_values = self.ib.accountValues()
 
             cash_info = {}
@@ -1878,7 +1875,7 @@ class ExecutionEngine:
             await asyncio.sleep(2)
 
             # Get detailed cash info (critical for Cash accounts)
-            cash_details = await self.get_cash_details()
+            cash_details = self.get_cash_details()
 
             if cash_details:
                 print("=" * 60)

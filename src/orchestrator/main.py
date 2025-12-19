@@ -406,7 +406,7 @@ class TradingOrchestrator:
             cash_details = None
             if not self.dry_run and self.executor.connected:
                 account_balance = await self.executor.get_account_balance()
-                cash_details = await self.executor.get_cash_details()
+                cash_details = self.executor.get_cash_details()
 
             # Get positions
             positions = []
@@ -921,7 +921,7 @@ class TradingOrchestrator:
 
             # Cash check for NEW trades (Cash account with T+1 settlement)
             if event.event_type == EventType.NEW and not self.dry_run and self.executor.connected:
-                cash_details = await self.executor.get_cash_details()
+                cash_details = self.executor.get_cash_details()
                 if cash_details:
                     available_cash = cash_details.get('available_funds') or cash_details.get('settled_cash')
                     if available_cash is not None:
