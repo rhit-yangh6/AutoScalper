@@ -50,12 +50,14 @@ class ExecutionEngine:
         session_manager=None,  # For bracket order monitoring
         use_market_orders: bool = True,  # True = market orders, False = limit orders with 5¢ flexibility
         config: dict = None,  # Config for bracket calculations
+        notifier=None,  # Telegram notifier for real-time updates
     ):
         self.host = host
         self.port = port
         self.client_id = client_id
         self.use_market_orders = use_market_orders
         self.config = config or {}
+        self.notifier = notifier
         self.ib = IB()
         self.connected = False
         self.kill_switch_active = False
@@ -555,8 +557,14 @@ class ExecutionEngine:
                     parent_trade = self.ib.placeOrder(contract, parent_order)
                     print(f"  ⓘ LIMIT order submitted @ ${entry_price:.2f}")
 
-            # Step 2: Wait for parent fill
-            filled = await self._wait_for_fill(parent_trade, timeout=30)
+            # Step 2: Wait for parent fill with real-time Telegram updates
+            filled = await self._wait_for_fill(
+                parent_trade,
+                timeout=30,
+                notifier=self.notifier,
+                session=session,
+                order_type="ENTRY"
+            )
 
             if not filled:
                 self.ib.cancelOrder(parent_trade.order)
@@ -784,8 +792,14 @@ class ExecutionEngine:
                     trade = self.ib.placeOrder(contract, order)
                     print(f"  ⓘ ADD LIMIT order submitted @ ${add_price:.2f}")
 
-            # Wait for fill
-            filled = await self._wait_for_fill(trade, timeout=30)
+            # Wait for fill with real-time Telegram updates
+            filled = await self._wait_for_fill(
+                trade,
+                timeout=30,
+                notifier=self.notifier,
+                session=session,
+                order_type="ADD"
+            )
 
             if not filled:
                 self.ib.cancelOrder(trade.order)
@@ -916,7 +930,14 @@ class ExecutionEngine:
 
             print(f"  ⓘ EXIT MARKET order submitted for {total_quantity} contracts")
 
-            filled = await self._wait_for_fill(trade, timeout=30)
+            # Market orders usually fill instantly, but monitor anyway
+            filled = await self._wait_for_fill(
+                trade,
+                timeout=30,
+                notifier=self.notifier,
+                session=session,
+                order_type="EXIT"
+            )
 
             if filled:
                 now = datetime.now(timezone.utc)
@@ -1013,8 +1034,14 @@ class ExecutionEngine:
 
             print(f"  ⓘ TRIM MARKET order submitted: {trim_qty} contracts")
 
-            # Wait for fill
-            filled = await self._wait_for_fill(trade, timeout=30)
+            # Wait for fill with real-time Telegram updates
+            filled = await self._wait_for_fill(
+                trade,
+                timeout=30,
+                notifier=self.notifier,
+                session=session,
+                order_type="TRIM"
+            )
 
             if not filled:
                 self.ib.cancelOrder(trade.order)
@@ -1779,12 +1806,20 @@ class ExecutionEngine:
             return None
 
     async def _wait_for_fill(
-        self, trade: Trade, timeout: int = 30
+        self, trade: Trade, timeout: int = 30, notifier=None, session=None, order_type: str = "ORDER"
     ) -> bool:
         """
-        Wait for order to fill.
+        Wait for order to fill with real-time Telegram updates.
 
-        Returns True if filled, False if cancelled/timeout.
+        Args:
+            trade: The order trade to monitor
+            timeout: Max seconds to wait (default 30)
+            notifier: Telegram notifier for status updates (optional)
+            session: Trade session for context (optional)
+            order_type: Type of order (NEW, ADD, EXIT, etc.) for messaging
+
+        Returns:
+            True if filled, False if cancelled/timeout
         """
         # Check initial status immediately
         if trade.orderStatus.status == "Filled":
@@ -1793,7 +1828,25 @@ class ExecutionEngine:
             print(f"  ✗ Order cancelled: {trade.orderStatus.status}")
             return False
 
-        # Wait for status changes
+        # Get contract info for market data
+        contract = trade.contract
+        order = trade.order
+        limit_price = order.lmtPrice if hasattr(order, 'lmtPrice') and order.lmtPrice else None
+        is_limit_order = limit_price is not None
+
+        # Request market data for real-time updates
+        ticker = None
+        if is_limit_order:
+            try:
+                ticker = self.ib.reqMktData(contract, snapshot=False)
+                await asyncio.sleep(0.5)  # Let data populate
+            except:
+                pass  # If market data fails, continue without it
+
+        # Wait for status changes with periodic Telegram updates
+        last_telegram_update = 0
+        telegram_interval = 5  # Send updates every 5 seconds
+
         for i in range(timeout):
             await asyncio.sleep(1)
 
@@ -1801,6 +1854,12 @@ class ExecutionEngine:
 
             # Check for fill
             if status == "Filled":
+                # Cancel market data subscription
+                if ticker:
+                    try:
+                        self.ib.cancelMktData(contract)
+                    except:
+                        pass
                 return True
 
             # Check for cancellations/errors
@@ -1811,14 +1870,166 @@ class ExecutionEngine:
                     last_log = trade.log[-1]
                     if last_log.message:
                         print(f"    Reason: {last_log.message}")
+
+                # Cancel market data subscription
+                if ticker:
+                    try:
+                        self.ib.cancelMktData(contract)
+                    except:
+                        pass
                 return False
 
-            # Log progress every 5 seconds
-            if i % 5 == 0 and i > 0:
-                print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status})")
+            # Send periodic updates (every 5 seconds)
+            if i > 0 and i % telegram_interval == 0:
+                # Terminal log with current market prices
+                if ticker:
+                    import math
+                    bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+                    ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
 
+                    if bid and ask:
+                        print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status})")
+                        print(f"     Market: Bid ${bid:.2f} | Ask ${ask:.2f} | Limit ${limit_price:.2f}")
+                        print(f"     Ticker update: {ticker.time if hasattr(ticker, 'time') else 'live'}")
+                    else:
+                        print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status}, market data pending...)")
+                else:
+                    print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status})")
+
+                # Telegram update with market analysis
+                if notifier and is_limit_order and ticker:
+                    await self._send_fill_status_update(
+                        notifier=notifier,
+                        session=session,
+                        order_type=order_type,
+                        limit_price=limit_price,
+                        ticker=ticker,
+                        status=status,
+                        elapsed=i,
+                        timeout=timeout,
+                        order_action=order.action,
+                        order_quantity=order.totalQuantity
+                    )
+                    last_telegram_update = i
+
+        # Timeout - send final update
         print(f"  ✗ Order timed out after {timeout}s (status: {trade.orderStatus.status})")
+
+        if notifier and is_limit_order and ticker:
+            await self._send_timeout_alert(
+                notifier=notifier,
+                session=session,
+                order_type=order_type,
+                limit_price=limit_price,
+                ticker=ticker,
+                final_status=trade.orderStatus.status,
+                order_action=order.action
+            )
+
+        # Cancel market data subscription
+        if ticker:
+            try:
+                self.ib.cancelMktData(contract)
+            except:
+                pass
+
         return False
+
+    async def _send_fill_status_update(
+        self,
+        notifier,
+        session,
+        order_type: str,
+        limit_price: float,
+        ticker,
+        status: str,
+        elapsed: int,
+        timeout: int,
+        order_action: str = "BUY",
+        order_quantity: int = 1
+    ):
+        """Send real-time fill status update to Telegram."""
+        try:
+            import math
+
+            # Get current market prices
+            bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+            ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+            last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+
+            # Build symbol
+            symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session else "Position"
+
+            # Build concise message
+            text = f"⏳ <b>{symbol}</b> - {order_action} {order_quantity} @ ${limit_price:.2f} ({elapsed}/{timeout}s)\n\n"
+
+            if bid and ask:
+                spread = ask - bid
+                text += f"Market: ${bid:.2f} / ${ask:.2f} (spread ${spread:.2f})\n"
+
+                # Determine why not filling
+                if order_action == "BUY":
+                    if limit_price < ask:
+                        gap = ask - limit_price
+                        text += f"❌ Limit too low by ${gap:.2f}"
+                    elif limit_price >= ask:
+                        text += f"✅ Should fill soon"
+                elif order_action == "SELL":
+                    if limit_price > bid:
+                        gap = limit_price - bid
+                        text += f"❌ Limit too high by ${gap:.2f}"
+                    elif limit_price <= bid:
+                        text += f"✅ Should fill soon"
+            else:
+                text += f"<i>Market data pending...</i>"
+
+            await notifier.send_message(text)
+
+        except Exception as e:
+            print(f"  Warning: Could not send fill status update: {e}")
+
+    async def _send_timeout_alert(
+        self,
+        notifier,
+        session,
+        order_type: str,
+        limit_price: float,
+        ticker,
+        final_status: str,
+        order_action: str = "BUY"
+    ):
+        """Send timeout alert with explanation to Telegram."""
+        try:
+            import math
+
+            bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+            ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+
+            symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session else "Position"
+
+            # Build concise timeout message
+            text = f"⏱️ <b>{symbol}</b> - Order TIMEOUT @ ${limit_price:.2f}\n\n"
+
+            if bid and ask:
+                text += f"Market: ${bid:.2f} / ${ask:.2f}\n"
+
+                if order_action == "BUY" and limit_price < ask:
+                    gap = ask - limit_price
+                    text += f"Limit too low by ${gap:.2f} - market didn't come down"
+                elif order_action == "SELL" and limit_price > bid:
+                    gap = limit_price - bid
+                    text += f"Limit too high by ${gap:.2f} - market didn't come up"
+                else:
+                    text += f"Order didn't fill within timeout"
+            else:
+                text += f"Order didn't fill within timeout"
+
+            text += f"\n\n<i>Order cancelled</i>"
+
+            await notifier.send_message(text)
+
+        except Exception as e:
+            print(f"  Warning: Could not send timeout alert: {e}")
 
     async def get_account_balance(self) -> Optional[float]:
         """

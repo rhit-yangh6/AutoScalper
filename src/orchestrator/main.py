@@ -89,6 +89,7 @@ class TradingOrchestrator:
             session_manager=self.session_manager,
             use_market_orders=use_market_orders,
             config=config,
+            notifier=self.notifier,  # Pass Telegram notifier for real-time updates
         )
 
         # Register bracket fill callback

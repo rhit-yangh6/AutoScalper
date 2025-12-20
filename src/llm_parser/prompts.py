@@ -19,14 +19,24 @@ EVENT TYPES:
   * If message says "UP X%" or celebrates profit → NOT NEW, likely TRIM or TP
   * If message just announces current price without entry verb → IGNORE
 - PLAN: Intent statement (e.g., "may add if it dips", "will notify when I add")
-- ADD: Adding to existing position (e.g., "added 1 more @ 0.35", "adding here @ 0.30", "scaling in @ 0.25")
-  * Keywords: "added", "adding", "more", "scale in", "averaging", "add here"
+- ADD: Adding to existing position (scaling in, averaging down/up)
+  * Explicit keywords: "added", "adding", "more", "scale in", "averaging", "add here"
+  * **CRITICAL - Context-only patterns** (no strike/symbol mentioned):
+    - "$.44 AVERAGE" or "$.42 AVG" → ADD event with entry_price from the average
+    - "averaged down to $.40" → ADD event
+    - Just announces NEW average price → ADD (e.g., "$.44 avg 🚨")
   * IMPORTANT: If trader already announced entry earlier, subsequent entries = ADD not NEW
+  * For context-only ADD: underlying/direction/strike = null (will correlate to active session)
 - TARGETS: Profit targets (e.g., "targeting 686, 687")
 - TRIM: Partial exit (e.g., "took off half @ 0.65")
 - MOVE_STOP: Adjusting stop-loss (e.g., "stop now at 0.40", "moving stop to breakeven", "trailing stop to 0.50")
   * Used when trader tightens/adjusts stop to lock in profits or reduce risk
   * NOT for initial stop (that's part of NEW event)
+  * **CRITICAL - Context-only patterns** (no strike/symbol mentioned):
+    - "$.22 SL IN PLACE" → MOVE_STOP with stop_loss = 0.22
+    - "stop at $.30" → MOVE_STOP
+    - Just announces new stop price → MOVE_STOP (e.g., "SL $.25 🚨")
+  * For context-only MOVE_STOP: underlying/direction/strike = null (will correlate to active session)
 - TP: Target hit announcement (e.g., "hit target, out")
 - SL: Stop hit announcement (e.g., "stopped out")
 - EXIT: Full position close (e.g., "closed entire position")
@@ -39,6 +49,11 @@ PARSING GUIDELINES:
   * Strike price required. If missing → IGNORE
   * Vague entries ("in at $0.50" without strike) or market commentary ("easy entries around $0.50") → IGNORE
   * Profit announcements ("UP 50%") or celebrations ("🔥") → likely TRIM/TP, NOT NEW
+- **CRITICAL - Context-only patterns** (trader assumes you remember active trade):
+  * "$.44 AVERAGE" without strike/symbol → ADD event, entry_price = 0.44, other fields = null
+  * "$.22 SL IN PLACE" without strike/symbol → MOVE_STOP event, stop_loss = 0.22, other fields = null
+  * System will correlate these to active session automatically
+  * High confidence (0.85-0.95) even with missing fields if pattern is clear
 - Underlying: must be "SPY" or "QQQ"
 - Direction: CALL or PUT (REQUIRED for NEW events)
 - Strike: numeric value (REQUIRED for NEW events)
@@ -78,6 +93,12 @@ Required fields for Event JSON:
 
 Example for NEW trade:
 {"event_type": "NEW", "underlying": "SPY", "direction": "CALL", "strike": 685.0, "expiry": "2025-12-12", "entry_price": 0.51, "targets": null, "stop_loss": null, "quantity": null, "risk_level": "EXTREME", "risk_notes": "High theta risk, size light", "llm_reasoning": "Clear entry signal with SPY 685 CALLS", "parsing_confidence": 0.95}
+
+Example for ADD (context-only, no strike mentioned):
+{"event_type": "ADD", "underlying": null, "direction": null, "strike": null, "expiry": null, "entry_price": 0.44, "targets": null, "stop_loss": null, "quantity": null, "risk_level": null, "risk_notes": null, "llm_reasoning": "Trader announced new average $.44, indicates adding to position", "parsing_confidence": 0.85}
+
+Example for MOVE_STOP (context-only):
+{"event_type": "MOVE_STOP", "underlying": null, "direction": null, "strike": null, "expiry": null, "entry_price": null, "targets": null, "stop_loss": 0.22, "quantity": null, "risk_level": null, "risk_notes": null, "llm_reasoning": "Trader announced new stop loss at $.22", "parsing_confidence": 0.9}
 
 Example for EXIT:
 {"event_type": "EXIT", "underlying": null, "direction": null, "strike": null, "expiry": null, "entry_price": null, "targets": null, "stop_loss": null, "quantity": null, "risk_level": null, "risk_notes": null, "llm_reasoning": "Exit signal", "parsing_confidence": 0.9}
