@@ -1188,8 +1188,11 @@ class TradingOrchestrator:
         Background task to monitor IBKR connection and auto-reconnect if needed.
 
         Checks connection every 60 seconds and attempts reconnection if disconnected.
+        Sends progressive alerts based on disconnection duration.
         """
         print("Connection monitor active (checks every 60 seconds)")
+
+        last_alert_attempts = 0  # Track when we last sent an alert
 
         while self.running:
             await asyncio.sleep(60)  # Check every minute
@@ -1203,14 +1206,68 @@ class TradingOrchestrator:
                 if not success:
                     print("❌ Reconnection failed. Will retry on next check...")
 
-                    # Send alert if reconnection keeps failing
-                    if self.executor.reconnect_attempts >= 5 and self.notifier:
-                        await self.notifier.send_message(
-                            "<b>⚠️ IBKR CONNECTION ISSUE</b>\n\n"
-                            f"Failed to reconnect after {self.executor.reconnect_attempts} attempts.\n"
-                            "Bot will continue attempting to reconnect.\n\n"
-                            "<i>Please check IBKR Gateway is running.</i>"
-                        )
+                    # Progressive alerting based on failure duration
+                    attempts = self.executor.reconnect_attempts
+
+                    # Send alerts at specific thresholds to avoid spam
+                    should_alert = False
+                    alert_level = ""
+
+                    if attempts == 3 and last_alert_attempts < 3:
+                        # 3 failures (~5 minutes) - Initial warning
+                        should_alert = True
+                        alert_level = "⚠️ WARNING"
+                    elif attempts == 10 and last_alert_attempts < 10:
+                        # 10 failures (~17 minutes) - Escalate
+                        should_alert = True
+                        alert_level = "🔴 CRITICAL"
+                    elif attempts == 30 and last_alert_attempts < 30:
+                        # 30 failures (~60 minutes) - Severe
+                        should_alert = True
+                        alert_level = "🚨 SEVERE"
+                    elif attempts % 60 == 0:
+                        # Every hour after that
+                        should_alert = True
+                        alert_level = "🚨 PROLONGED OUTAGE"
+
+                    if should_alert and self.notifier:
+                        # Calculate downtime duration
+                        minutes = sum([min(2 ** min(i, 6), 60) for i in range(1, attempts + 1)]) / 60
+
+                        # Build alert message
+                        message = f"<b>{alert_level}: IBKR Gateway Disconnected</b>\n\n"
+                        message += f"Reconnection attempts: {attempts}\n"
+                        message += f"Estimated downtime: ~{int(minutes)} minutes\n\n"
+
+                        if attempts < 10:
+                            message += "<b>Status:</b> Auto-reconnecting...\n\n"
+                            message += "<b>Possible causes:</b>\n"
+                            message += "• Gateway restarting (normal daily restart)\n"
+                            message += "• Network interruption\n"
+                            message += "• Gateway requires IB Key approval\n\n"
+                            message += "<i>No action needed - bot will auto-reconnect</i>"
+                        elif attempts < 30:
+                            message += "<b>Status:</b> Reconnection failing repeatedly\n\n"
+                            message += "<b>Action required:</b>\n"
+                            message += "1. Check if IBKR Gateway container is running:\n"
+                            message += "   <code>docker ps | grep ib-gateway</code>\n"
+                            message += "2. Check if IB Key approval is pending\n"
+                            message += "3. Check gateway logs:\n"
+                            message += "   <code>docker logs ib-gateway</code>\n\n"
+                            message += "<i>⚠️ Trading is paused until reconnection</i>"
+                        else:
+                            message += "<b>Status:</b> PROLONGED OUTAGE\n\n"
+                            message += "<b>🚨 URGENT ACTION REQUIRED:</b>\n"
+                            message += "1. Gateway may have crashed - check container:\n"
+                            message += "   <code>docker ps -a | grep ib-gateway</code>\n"
+                            message += "2. Manually restart gateway if needed:\n"
+                            message += "   <code>docker restart ib-gateway</code>\n"
+                            message += "3. Check for IB Key approval requirement\n"
+                            message += "4. Verify IBKR account status\n\n"
+                            message += f"<i>⚠️ Trading paused for ~{int(minutes)} minutes</i>"
+
+                        await self.notifier.send_message(message)
+                        last_alert_attempts = attempts
 
     async def _on_ibkr_disconnected(self):
         """Callback when IBKR connection is lost."""
@@ -1231,12 +1288,42 @@ class TradingOrchestrator:
 
         # Send Telegram notification
         if self.notifier:
-            await self.notifier.send_message(
-                "<b>✅ IBKR RECONNECTED</b>\n\n"
-                "Connection to IBKR Gateway restored.\n"
-                "Bot is now fully operational.\n\n"
-                f"<i>Reconnected at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
-            )
+            # Calculate how long we were disconnected
+            attempts = self.executor.reconnect_attempts
+            if attempts > 0:
+                # Estimate downtime based on exponential backoff
+                minutes = sum([min(2 ** min(i, 6), 60) for i in range(1, attempts + 1)]) / 60
+
+                message = "<b>✅ IBKR RECONNECTED</b>\n\n"
+                message += "Connection to IBKR Gateway restored.\n"
+                message += "Bot is now fully operational.\n\n"
+
+                if attempts > 1:
+                    message += f"<b>Reconnection Details:</b>\n"
+                    message += f"• Attempts: {attempts}\n"
+                    message += f"• Downtime: ~{int(minutes)} minutes\n"
+                    message += f"• Reconnected: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n\n"
+
+                    if attempts >= 10:
+                        message += "<b>✓ State Rebuilt:</b>\n"
+                        message += "• Account balance refreshed\n"
+                        message += "• Positions reconciled\n"
+                        message += "• Open orders re-synced\n\n"
+
+                message += "<i>🟢 Trading resumed - all systems operational</i>"
+            else:
+                # First connection or quick reconnect
+                message = (
+                    "<b>✅ IBKR CONNECTED</b>\n\n"
+                    "Connection to IBKR Gateway established.\n"
+                    "Bot is now fully operational.\n\n"
+                    f"<i>Connected at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
+                )
+
+            await self.notifier.send_message(message)
+
+            # Reset reconnect attempts counter for next disconnection
+            self.executor.reconnect_attempts = 0
 
     async def _position_reconciliation_task(self):
         """

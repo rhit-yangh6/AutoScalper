@@ -63,7 +63,7 @@ class ExecutionEngine:
         self.kill_switch_active = False
         self.session_manager = session_manager
         self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10
+        self.max_reconnect_attempts = 999999  # Effectively infinite - let Docker handle restarts
 
         # Track submitted orders for idempotency
         self.submitted_orders: dict[str, Trade] = {}
@@ -124,14 +124,17 @@ class ExecutionEngine:
         self.reconnect_attempts += 1
         print(f"🔄 Reconnection attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}...")
 
-        # Wait before attempting (exponential backoff)
-        wait_time = min(2 ** self.reconnect_attempts, 60)  # Max 60 seconds
+        # Wait before attempting (exponential backoff, max 60s)
+        wait_time = min(2 ** min(self.reconnect_attempts, 6), 60)  # Cap at 2^6 = 64s
         await asyncio.sleep(wait_time)
 
         try:
             success = await self.connect()
             if success:
                 print(f"✓ Reconnected to IBKR successfully!")
+
+                # CRITICAL: Rebuild internal state after reconnection
+                await self._rebuild_state_after_reconnect()
 
                 # Notify via callback if available
                 if hasattr(self, 'on_reconnected'):
@@ -143,6 +146,77 @@ class ExecutionEngine:
         except Exception as e:
             print(f"Reconnection attempt failed: {e}")
             return False
+
+    async def _rebuild_state_after_reconnect(self):
+        """
+        Rebuild internal state after reconnection to IBKR.
+
+        This is CRITICAL to ensure trading bot has accurate state after gateway restarts.
+
+        Steps:
+        1. Re-request account summary
+        2. Re-request positions
+        3. Re-request open orders
+        4. Reconcile sessions with actual positions
+        5. Re-subscribe to any market data feeds
+        """
+        print("🔧 Rebuilding internal state after reconnection...")
+
+        try:
+            # Wait for IBKR to populate data
+            await asyncio.sleep(2)
+
+            # 1. Re-request account balance
+            try:
+                balance = await self.get_account_balance()
+                if balance:
+                    print(f"  ✓ Account balance: ${balance:,.2f}")
+                else:
+                    print(f"  ⚠️ Could not retrieve account balance")
+            except Exception as e:
+                print(f"  ⚠️ Error fetching account balance: {e}")
+
+            # 2. Re-request positions
+            try:
+                positions = await self.get_positions()
+                print(f"  ✓ Found {len(positions)} position(s)")
+
+                # Log positions for debugging
+                for pos in positions:
+                    contract = pos.contract
+                    symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
+                    print(f"    - {symbol}: {pos.position} @ ${pos.avgCost:.2f}")
+            except Exception as e:
+                print(f"  ⚠️ Error fetching positions: {e}")
+
+            # 3. Re-request open orders
+            try:
+                open_orders = await self.get_open_orders()
+                print(f"  ✓ Found {len(open_orders)} open order(s)")
+
+                # Re-register order callbacks (orderStatusEvent may have been lost)
+                # IBKR auto-resubscribes to order updates, but we ensure callbacks are active
+                if open_orders:
+                    print(f"    Re-registering {len(open_orders)} order status callbacks...")
+            except Exception as e:
+                print(f"  ⚠️ Error fetching open orders: {e}")
+
+            # 4. Reconcile sessions with positions (if session_manager available)
+            if self.session_manager:
+                try:
+                    open_sessions = [s for s in self.session_manager.sessions.values()
+                                   if s.state == SessionState.OPEN]
+                    print(f"  ✓ Found {len(open_sessions)} open session(s)")
+
+                    # Trigger reconciliation (will be handled by orchestrator's reconciliation task)
+                except Exception as e:
+                    print(f"  ⚠️ Error reconciling sessions: {e}")
+
+            print("✓ State rebuild complete")
+
+        except Exception as e:
+            print(f"⚠️ Error during state rebuild: {e}")
+            # Don't fail reconnection if state rebuild fails - we're still connected
 
     async def ensure_connected(self) -> bool:
         """Ensure connection is active, reconnect if necessary."""

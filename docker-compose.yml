@@ -6,14 +6,25 @@ services:
     environment:
       - TWS_USERID=${IB_USERNAME}
       - TWS_PASSWORD=${IB_PASSWORD}
-      - TRADING_MODE=live  # CHANGED: live instead of paper
+      - TRADING_MODE=live  # live or paper
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-changeme}
       - TIME_ZONE=America/New_York
       - READ_ONLY_API=no
+      - TWOFA_TIMEOUT_ACTION=restart  # Auto-restart on 2FA timeout
     ports:
       - "127.0.0.1:4001:4003"  # Host 4001 → Container 4003 (live trading API)
       - "127.0.0.1:4002:4004"  # Host 4002 → Container 4004 (paper trading API)
       - "127.0.0.1:5900:5900"  # VNC for remote desktop access
+    volumes:
+      - gateway-settings:/root/Jts
+    healthcheck:
+      # CRITICAL: Check if IB Gateway API port is accepting connections
+      # Trading bot depends on this healthcheck passing
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4003 || exit 1"]
+      interval: 10s      # Check every 10 seconds
+      timeout: 3s        # Fail if check takes >3s
+      retries: 30        # Try 30 times (5 minutes) before marking unhealthy
+      start_period: 60s  # Allow 60s for gateway to initialize
 
   bot:
     build: .
@@ -24,8 +35,20 @@ services:
       - .env
     environment:
       - IBKR_HOST=127.0.0.1
-      - IBKR_PORT=4001  # CHANGED: Connect to live port (was 4002 for paper)
+      - IBKR_PORT=4001  # Connect to live port (maps to container 4003)
     volumes:
       - ./logs:/app/logs
     depends_on:
-      - ib-gateway
+      ib-gateway:
+        condition: service_healthy  # Wait for gateway healthcheck to pass
+    healthcheck:
+      # Check if bot process is running (basic liveness check)
+      test: ["CMD-SHELL", "pgrep -f 'python -m src.orchestrator.main' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  gateway-settings:
+    driver: local
