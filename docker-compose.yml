@@ -26,29 +26,6 @@ services:
       retries: 30        # Try 30 times (5 minutes) before marking unhealthy
       start_period: 60s  # Allow 60s for gateway to initialize
 
-  bot:
-    build: .
-    container_name: autoscalper
-    restart: unless-stopped
-    network_mode: host
-    env_file:
-      - .env
-    environment:
-      - IBKR_HOST=127.0.0.1
-      - IBKR_PORT=4001  # Connect to live port (maps to container 4003)
-    volumes:
-      - ./logs:/app/logs
-    depends_on:
-      ib-gateway:
-        condition: service_healthy  # Wait for gateway healthcheck to pass
-    healthcheck:
-      # Check if bot process is running (basic liveness check)
-      test: ["CMD-SHELL", "pgrep -f 'python -m src.orchestrator.main' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
   autoheal:
     image: willfarrell/autoheal:latest
     container_name: autoheal
