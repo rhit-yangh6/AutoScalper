@@ -92,10 +92,15 @@ class ExecutionEngine:
                 # IBKR Paper account or no real-time data: Use delayed data + market orders
                 self.ib.reqMarketDataType(3)  # 3 = delayed data (free)
                 print("📊 Order Strategy: MARKET orders (delayed data)")
+                print("   ⓘ Using delayed/frozen data - no live market prices during order")
             else:
                 # IBKR Live account with real-time data: Use real-time data + limit orders
                 self.ib.reqMarketDataType(1)  # 1 = real-time (subscription required)
                 print("📊 Order Strategy: LIMIT orders with 5¢ flexibility (real-time data)")
+                print("   ⓘ Requires IBKR market data subscription for live prices")
+                print("   ⓘ If you see 'Market data pending', check:")
+                print("      - Markets are open (9:30 AM - 4:00 PM ET)")
+                print("      - IBKR subscription: US Securities Snapshot or OPRA")
 
             # Get and display account balance
             await self._display_account_balance()
@@ -1924,9 +1929,29 @@ class ExecutionEngine:
         if is_limit_order:
             try:
                 ticker = self.ib.reqMktData(contract, snapshot=False)
-                await asyncio.sleep(0.5)  # Let data populate
-            except:
-                pass  # If market data fails, continue without it
+                # Wait longer for market data to populate (up to 3 seconds)
+                for attempt in range(6):  # 6 attempts × 0.5s = 3 seconds
+                    await asyncio.sleep(0.5)
+
+                    # Check if we got valid market data
+                    import math
+                    bid_valid = ticker.bid and not math.isnan(ticker.bid)
+                    ask_valid = ticker.ask and not math.isnan(ticker.ask)
+                    last_valid = ticker.last and not math.isnan(ticker.last)
+
+                    if bid_valid or ask_valid or last_valid:
+                        if bid_valid and ask_valid:
+                            print(f"  ✓ Live market data: Bid ${ticker.bid:.2f} / Ask ${ticker.ask:.2f}")
+                        elif last_valid:
+                            print(f"  ✓ Last trade: ${ticker.last:.2f} (delayed)")
+                        break
+
+                    if attempt == 5:  # Last attempt
+                        print(f"  ⚠️ No market data after 3s (markets closed or no subscription)")
+                        print(f"     You'll see 'Market data pending...' in Telegram updates")
+            except Exception as e:
+                print(f"  ⚠️ Market data request failed: {e}")
+                ticker = None
 
         # Wait for status changes with periodic Telegram updates
         last_telegram_update = 0
@@ -1982,13 +2007,14 @@ class ExecutionEngine:
                     print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status})")
 
                 # Telegram update with market analysis
-                if notifier and is_limit_order and ticker:
+                # Send updates even if ticker is None (will show "no market data" message)
+                if notifier and is_limit_order:
                     await self._send_fill_status_update(
                         notifier=notifier,
                         session=session,
                         order_type=order_type,
                         limit_price=limit_price,
-                        ticker=ticker,
+                        ticker=ticker,  # Can be None - function handles it
                         status=status,
                         elapsed=i,
                         timeout=timeout,
@@ -2000,13 +2026,14 @@ class ExecutionEngine:
         # Timeout - send final update
         print(f"  ✗ Order timed out after {timeout}s (status: {trade.orderStatus.status})")
 
-        if notifier and is_limit_order and ticker:
+        # Send timeout alert even if ticker is None
+        if notifier and is_limit_order:
             await self._send_timeout_alert(
                 notifier=notifier,
                 session=session,
                 order_type=order_type,
                 limit_price=limit_price,
-                ticker=ticker,
+                ticker=ticker,  # Can be None - function handles it
                 final_status=trade.orderStatus.status,
                 order_action=order.action
             )
@@ -2037,10 +2064,15 @@ class ExecutionEngine:
         try:
             import math
 
-            # Get current market prices
-            bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-            ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-            last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+            # Get current market prices (handle ticker being None)
+            bid = None
+            ask = None
+            last = None
+
+            if ticker:
+                bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+                ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+                last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
 
             # Build symbol
             symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session else "Position"
@@ -2065,8 +2097,19 @@ class ExecutionEngine:
                         text += f"❌ Limit too high by ${gap:.2f}"
                     elif limit_price <= bid:
                         text += f"✅ Should fill soon"
+            elif last:
+                # Only last trade available (delayed data)
+                text += f"Last: ${last:.2f} (delayed)\n"
+                text += f"<i>Live market data unavailable</i>"
             else:
-                text += f"<i>Market data pending...</i>"
+                # No market data at all
+                from datetime import datetime
+                now_et = datetime.now()  # Approximate ET time
+                hour_et = now_et.hour - 6  # CST to ET approximation
+                if hour_et < 9 or hour_et >= 16:
+                    text += f"<i>Markets closed - no live data</i>"
+                else:
+                    text += f"<i>Market data pending (check IBKR subscription)</i>"
 
             await notifier.send_message(text)
 
@@ -2087,8 +2130,12 @@ class ExecutionEngine:
         try:
             import math
 
-            bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-            ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+            # Handle ticker being None
+            bid = None
+            ask = None
+            if ticker:
+                bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+                ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
 
             symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session else "Position"
 
