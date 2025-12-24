@@ -49,6 +49,17 @@ services:
       retries: 3
       start_period: 30s
 
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all  # Monitor all containers with healthchecks
+      - AUTOHEAL_INTERVAL=60          # Check every 60 seconds
+      - AUTOHEAL_START_PERIOD=300     # Wait 5 minutes before first check
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
 volumes:
   gateway-settings:
     driver: local
