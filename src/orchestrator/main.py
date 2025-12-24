@@ -1335,13 +1335,15 @@ class TradingOrchestrator:
         """
         Background task to reconcile sessions with actual IBKR positions.
 
-        Runs every 60 seconds. For each OPEN session:
-        - Check if position still exists in IBKR
-        - If position is 0 (or doesn't exist), auto-close session
+        Runs every 60 seconds:
+        1. OPEN sessions: Auto-close if position no longer exists (3-min grace period)
+        2. PENDING/CANCELLED sessions: Auto-close if no position and >5 min old
 
-        This handles cases where positions are manually closed outside the bot.
+        This prevents:
+        - Orphaned OPEN sessions when positions are manually closed
+        - Stale PENDING/CANCELLED sessions blocking new trades on same contract
         """
-        print("Position reconciliation active (checks every 60 seconds, 3-minute grace period)")
+        print("Position reconciliation active (checks every 60 seconds)")
 
         while self.running:
             await asyncio.sleep(60)
@@ -1421,6 +1423,42 @@ class TradingOrchestrator:
                                 f"{pnl_text}\n"
                                 f"<i>Session closed via position reconciliation</i>"
                             )
+
+                # Clean up stale PENDING/CANCELLED sessions without positions
+                # These can block new trades on the same contract
+                stale_sessions = [s for s in self.session_manager.sessions.values()
+                                 if s.state in [SessionState.PENDING, SessionState.CANCELLED]]
+
+                for session in stale_sessions:
+                    # Build session key
+                    session_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
+
+                    # Check age (only clean up sessions older than 5 minutes)
+                    time_since_update = (datetime.now(timezone.utc) - session.updated_at).total_seconds()
+                    if time_since_update < 300:  # 5 minutes
+                        continue  # Too new, might still be processing
+
+                    # Check if there's an actual position
+                    ibkr_quantity = position_map.get(session_key, 0)
+
+                    if ibkr_quantity == 0:
+                        # No position in IBKR, session is truly stale → Close it
+                        print(f"🧹 Cleaning stale {session.state.value} session: {session_key} (no position, {int(time_since_update/60)} min old)")
+
+                        old_state = session.state
+                        session.state = SessionState.CLOSED
+                        session.closed_at = datetime.now(timezone.utc)
+                        session.exit_reason = f"STALE_{old_state.value}_CLEANUP"
+                        session.total_quantity = 0
+
+                        # Log closure
+                        self.logger.log_session_closed(
+                            session,
+                            reason=f"Stale {old_state.value} session cleanup (no position)",
+                            final_pnl=0.0
+                        )
+
+                        print(f"  ✓ Stale session closed: {session.session_id[:8]}...")
 
                 # Reverse check: IBKR has positions that bot doesn't track
                 unmatched_positions = set(position_map.keys()) - matched_positions
