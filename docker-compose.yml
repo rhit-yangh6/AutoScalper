@@ -20,11 +20,11 @@ services:
     healthcheck:
       # CRITICAL: Check if IB Gateway API port is accepting connections
       # Trading bot depends on this healthcheck passing
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 4003 || exit 1"]
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/4003' || exit 1"]
       interval: 10s      # Check every 10 seconds
       timeout: 3s        # Fail if check takes >3s
       retries: 30        # Try 30 times (5 minutes) before marking unhealthy
-      start_period: 60s  # Allow 60s for gateway to initialize
+      start_period: 120s # Allow 2 minutes for MFA approval
 
   autoheal:
     image: willfarrell/autoheal:latest
