@@ -642,6 +642,17 @@ class ExecutionEngine:
 
             if not filled:
                 self.ib.cancelOrder(parent_trade.order)
+
+                # CRITICAL: Close session when entry times out
+                # Prevents stale PENDING sessions blocking future trades
+                session.state = SessionState.CLOSED
+                session.closed_at = datetime.now(timezone.utc)
+                session.updated_at = datetime.now(timezone.utc)
+                session.exit_reason = "ENTRY_TIMEOUT"
+                session.total_quantity = 0
+
+                print(f"  ✗ Entry timeout - session closed: {session.session_id[:8]}...")
+
                 return OrderResult(
                     success=False,
                     status=OrderStatus.CANCELLED,

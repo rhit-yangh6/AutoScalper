@@ -1114,8 +1114,9 @@ class TradingOrchestrator:
                     result=result,
                 )
 
-                # Check if session closed after execution (EXIT, TRIM to zero, etc.)
-                if result.success and session.state == SessionState.CLOSED:
+                # Check if session closed after execution
+                # Can happen on success (EXIT, TRIM to zero) OR failure (ENTRY timeout)
+                if session.state == SessionState.CLOSED:
                     print(f"  ⓘ Session closed: {session.exit_reason}")
                     self.logger.log_session_closed(
                         session,
