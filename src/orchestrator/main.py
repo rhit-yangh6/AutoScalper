@@ -650,9 +650,15 @@ class TradingOrchestrator:
             total_sessions = len(self.session_manager.sessions)
             open_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN])
             closed_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.CLOSED])
+            pending_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.PENDING])
+            cancelled_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.CANCELLED])
             text += f"• Total Sessions: {total_sessions}\n"
             text += f"• Open: 🟢 {open_sessions}\n"
             text += f"• Closed: ⚪ {closed_sessions}\n"
+            if pending_sessions > 0:
+                text += f"• Pending: 🟡 {pending_sessions}\n"
+            if cancelled_sessions > 0:
+                text += f"• Cancelled: ⚫ {cancelled_sessions}\n"
             text += f"\n"
 
             # System Resources (if psutil available)
