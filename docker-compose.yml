@@ -3,6 +3,8 @@ services:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     container_name: ib-gateway
     restart: unless-stopped
+    labels:
+      autoheal: "true"  # Enable autoheal to restart on unhealthy
     environment:
       - TWS_USERID=${IB_USERNAME}
       - TWS_PASSWORD=${IB_PASSWORD}
@@ -18,22 +20,22 @@ services:
     volumes:
       - gateway-settings:/root/Jts
     healthcheck:
-      # CRITICAL: Check if IB Gateway API port is accepting connections
-      # Trading bot depends on this healthcheck passing
-      test: ["CMD-SHELL", "timeout 2 bash -c 'echo > /dev/tcp/127.0.0.1/4003' 2>&1"]
+      # CRITICAL: Check if IB Gateway has completed authentication
+      # Port opens BEFORE MFA completes, so we check logs instead
+      test: ["CMD-SHELL", "grep -q 'Login has completed' /root/Jts/*/launcher.log 2>/dev/null || exit 1"]
       interval: 10s      # Check every 10 seconds
       timeout: 5s        # Fail if check takes >5s
       retries: 30        # Try 30 times (5 minutes) before marking unhealthy
-      start_period: 30s  # Start checking after 30s (MFA + init time)
+      start_period: 180s # Allow 3 minutes for MFA approval before checking
 
   autoheal:
     image: willfarrell/autoheal:latest
     container_name: autoheal
     restart: unless-stopped
     environment:
-      - AUTOHEAL_CONTAINER_LABEL=all  # Monitor all containers with healthchecks
-      - AUTOHEAL_INTERVAL=60          # Check every 60 seconds
-      - AUTOHEAL_START_PERIOD=300     # Wait 5 minutes before first check
+      - AUTOHEAL_INTERVAL=10           # Check every 10 seconds
+      - AUTOHEAL_START_PERIOD=180      # Wait 3 minutes before first check (MFA window)
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10  # Stop timeout before restart
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
