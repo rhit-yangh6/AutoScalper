@@ -11,6 +11,7 @@ from ..risk_gate import RiskGate, RiskDecision
 from ..execution import ExecutionEngine
 from ..execution.executor import OrderResult
 from ..discord_listener import DiscordListener
+from ..tradingview_listener import TradingViewListener
 from .session_manager import SessionManager
 from ..models import Event, EventType, SessionState, TradeSession
 from ..logging import init_logger, get_logger, DailySnapshotManager
@@ -28,9 +29,16 @@ class TradingOrchestrator:
     """
     Main orchestrator that coordinates all components.
 
-    Flow:
+    Flow (MIKE mode - Discord):
     1. Discord message received
     2. LLM parses to Event
+    3. Session manager correlates Event to TradeSession
+    4. Risk gate validates
+    5. Execution engine executes (if approved)
+
+    Flow (INDICATOR mode - TradingView):
+    1. TradingView webhook received
+    2. Parse structured JSON to Event (no LLM)
     3. Session manager correlates Event to TradeSession
     4. Risk gate validates
     5. Execution engine executes (if approved)
@@ -41,6 +49,9 @@ class TradingOrchestrator:
 
         # Initialize components
         print("Initializing Trading Orchestrator...")
+
+        # Get signal source mode
+        self.mode = config.get("mode", "MIKE").upper()
 
         # Initialize logger
         log_dir = config.get("log_dir", "logs")
@@ -61,10 +72,14 @@ class TradingOrchestrator:
             self.notifier = None
             print("Telegram notifications disabled")
 
-        self.parser = LLMParser(
-            api_key=config["anthropic_api_key"],
-            model=config.get("llm_model", "claude-opus-4-5-20251101"),
-        )
+        # Initialize LLM parser (only needed for MIKE mode)
+        if self.mode == "MIKE":
+            self.parser = LLMParser(
+                api_key=config["anthropic_api_key"],
+                model=config.get("llm_model", "claude-opus-4-5-20251101"),
+            )
+        else:
+            self.parser = None  # Not needed for INDICATOR mode
 
         self.session_manager = SessionManager()
 
@@ -99,12 +114,28 @@ class TradingOrchestrator:
         self.executor.on_disconnected = self._on_ibkr_disconnected
         self.executor.on_reconnected = self._on_ibkr_reconnected
 
-        self.discord_listener = DiscordListener(
-            token=config["discord"]["user_token"],
-            channel_ids=config["discord"]["channel_ids"],
-            monitored_users=config["discord"].get("monitored_users"),
-            message_callback=self.on_discord_message,
-        )
+        # Initialize signal listener based on mode
+        if self.mode == "MIKE":
+            # MIKE mode: Discord + LLM parsing
+            self.discord_listener = DiscordListener(
+                token=config["discord"]["user_token"],
+                channel_ids=config["discord"]["channel_ids"],
+                monitored_users=config["discord"].get("monitored_users"),
+                message_callback=self.on_discord_message,
+            )
+            self.tradingview_listener = None
+            print(f"✓ Signal source: MIKE mode (Discord + LLM)")
+        elif self.mode == "INDICATOR":
+            # INDICATOR mode: TradingView webhook
+            self.tradingview_listener = TradingViewListener(
+                port=config["tradingview"]["webhook_port"],
+                webhook_secret=config["tradingview"]["webhook_secret"],
+                on_signal=self.on_tradingview_signal,
+            )
+            self.discord_listener = None
+            print(f"✓ Signal source: INDICATOR mode (TradingView webhook)")
+        else:
+            raise ValueError(f"Invalid MODE: {self.mode}. Must be 'MIKE' or 'INDICATOR'")
 
         # State
         self.running = False
@@ -190,9 +221,13 @@ class TradingOrchestrator:
         else:
             print("Skipping IBKR connection (paper mode - no orders will be sent)")
 
-        # Start Discord listener
-        print("Starting Discord listener...")
-        asyncio.create_task(self.discord_listener.start())
+        # Start signal listener based on mode
+        if self.mode == "MIKE":
+            print("Starting Discord listener...")
+            asyncio.create_task(self.discord_listener.start())
+        elif self.mode == "INDICATOR":
+            print("Starting TradingView webhook server...")
+            await self.tradingview_listener.start()
 
         # Start daily summary and snapshot tasks if Telegram enabled
         if self.notifier:
@@ -233,7 +268,11 @@ class TradingOrchestrator:
         print("\nStopping orchestrator...")
         self.running = False
 
-        await self.discord_listener.stop()
+        # Stop signal listener based on mode
+        if self.mode == "MIKE" and self.discord_listener:
+            await self.discord_listener.stop()
+        elif self.mode == "INDICATOR" and self.tradingview_listener:
+            await self.tradingview_listener.stop()
 
         # Only disconnect from IBKR if we connected
         if not self.dry_run:
@@ -1153,6 +1192,207 @@ class TradingOrchestrator:
             import traceback
             traceback.print_exc()
 
+    async def on_tradingview_signal(self, event: Event):
+        """
+        Callback for TradingView webhook signals.
+
+        Skips LLM parsing since TradingView sends structured data.
+        Starts from Step 2 (correlation) of the processing pipeline.
+        """
+        session = None
+        try:
+            print(f"\n{'='*60}")
+            print(f"TRADINGVIEW SIGNAL RECEIVED")
+            print(f"{'='*60}")
+            print(f"Action: {event.event_type.value}")
+            print(f"Ticker: {event.underlying} {event.strike}{event.direction.value[0]} {event.expiry}")
+            print(f"Entry: ${event.entry_price:.2f}")
+            print(f"{'='*60}\n")
+
+            # Step 1: SKIPPED (no LLM parsing needed for structured webhook data)
+
+            # Step 2: Correlate to session
+            print("[2/5] Correlating to trade session...")
+            session = self.session_manager.process_event(event)
+
+            # Log webhook signal (even if not actionable)
+            self.logger.log_parsed_event(session=session, event=event)
+
+            if not session:
+                print("✓ Event processed (non-actionable or ignored)")
+                return
+
+            print(f"✓ Linked to session {session.session_id[:8]}...")
+            print(f"  Session state: {session.state}")
+            print(f"  Trade: {session.underlying} {session.strike} {session.direction}")
+            print(f"  Current qty: {session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"  Current qty: {session.total_quantity}")
+
+            # Step 3: Risk validation
+            print("\n[3/5] Validating with risk gate...")
+
+            # Update account balance and get unrealized P&L
+            unrealized_pnl = 0.0
+            if not self.dry_run and self.executor.connected:
+                # Update balance
+                balance = await self.executor.get_account_balance()
+                if balance:
+                    self.risk_gate.update_account_balance(balance)
+                    print(f"  Account balance updated: ${balance:,.2f}")
+
+                # Get unrealized P&L
+                unrealized_pnl = await self.executor.get_unrealized_pnl()
+                print(f"  Current unrealized P&L: ${unrealized_pnl:+.2f}")
+
+            risk_result = self.risk_gate.validate(
+                event=event,
+                session=session,
+                unrealized_pnl=unrealized_pnl,
+            )
+
+            print(f"{'✓' if risk_result.decision == RiskDecision.APPROVE else '✗'} {risk_result.decision}: {risk_result.reason}")
+
+            if risk_result.decision == RiskDecision.REJECT:
+                print("  ACTION: NO TRADE (risk gate rejection)")
+                if risk_result.failed_checks:
+                    for check in risk_result.failed_checks:
+                        print(f"    - {check}")
+
+                # Log risk rejection
+                self.logger.log_risk_decision(
+                    session=session,
+                    event=event,
+                    decision=risk_result.decision,
+                    reason=risk_result.reason,
+                )
+                return
+
+            # Step 4: Execute order (same as Discord flow)
+            print("\n[4/5] Executing order...")
+            await self._execute_order(event, session, risk_result)
+
+        except Exception as e:
+            print(f"\n❌ CRITICAL ERROR processing TradingView signal: {e}")
+            if session:
+                self.logger.log_error(session, "CRITICAL_ERROR", str(e))
+
+            import traceback
+            traceback.print_exc()
+
+    async def _execute_order(self, event: Event, session: TradeSession, risk_result):
+        """
+        Common order execution logic for both MIKE and INDICATOR modes.
+
+        Extracted from on_discord_message to be reusable.
+        """
+        try:
+            quantity = risk_result.adjusted_quantity
+
+            if not self.dry_run:
+                # LIVE TRADING - Execute via IBKR
+                order_details = f"{event.event_type.value}: {quantity} contracts @ ${event.entry_price:.2f}"
+
+                # Log order attempt
+                self.logger.log_order_attempt(
+                    session=session,
+                    event_type=event.event_type,
+                    order_details=order_details,
+                )
+
+                # Send Telegram notification for order submission
+                if self.notifier:
+                    await self.notifier.notify_order_submitted(
+                        session=session,
+                        event_type=event.event_type,
+                        order_details=order_details,
+                        dry_run=False,
+                    )
+
+                # Execute the order
+                result = await self.executor.execute_event(
+                    event=event,
+                    session=session,
+                    quantity=quantity,
+                )
+
+                # Log order result
+                self.logger.log_order_result(
+                    session=session,
+                    event_type=event.event_type,
+                    result=result,
+                )
+
+                # Check if session closed after execution
+                # Can happen on success (EXIT, TRIM to zero) OR failure (ENTRY timeout)
+                if session.state == SessionState.CLOSED:
+                    print(f"  ⓘ Session closed: {session.exit_reason}")
+                    self.logger.log_session_closed(
+                        session,
+                        reason=session.exit_reason or "ORDER_EXECUTION",
+                        final_pnl=session.realized_pnl
+                    )
+
+                # Send Telegram notification for order fill
+                if self.notifier:
+                    await self.notifier.notify_order_filled(
+                        session=session,
+                        event_type=event.event_type,
+                        result=result,
+                        dry_run=False,
+                    )
+
+                if result.success:
+                    print(f"✓ Order executed successfully")
+                    print(f"  Order ID: {result.order_id}")
+                    print(f"  Filled at: ${result.filled_price}")
+                else:
+                    print(f"✗ Order execution failed: {result.message}")
+
+            else:
+                # DRY-RUN MODE - Simulate trade
+                order_details = f"{event.event_type.value}: {quantity} contracts @ ${event.entry_price:.2f} (DRY-RUN)"
+
+                print(f"  ⚠️  DRY-RUN MODE - No order sent to IBKR")
+                print(f"  Would execute: {order_details}")
+
+                # Log simulated order attempt
+                self.logger.log_order_attempt(
+                    session=session,
+                    event_type=event.event_type,
+                    order_details=order_details,
+                )
+
+                # Send Telegram notification for order submission
+                if self.notifier:
+                    await self.notifier.notify_order_submitted(
+                        session=session,
+                        event_type=event.event_type,
+                        order_details=order_details,
+                        dry_run=True,
+                    )
+
+                # Log simulated result
+                from ..execution.executor import OrderResult, OrderStatus
+                simulated_result = OrderResult(
+                    success=True,
+                    status=OrderStatus.FILLED,
+                    filled_price=event.entry_price,
+                    message="Simulated fill (dry-run mode)"
+                )
+
+                self.logger.log_order_result(
+                    session=session,
+                    event_type=event.event_type,
+                    result=simulated_result,
+                )
+
+            print(f"[5/5] Processing complete\n")
+
+        except Exception as e:
+            print(f"❌ Error executing order: {e}")
+            if session:
+                self.logger.log_error(session, "EXECUTION_ERROR", str(e))
+            raise
+
     async def _on_bracket_filled(self, session, event_type: EventType, result: OrderResult):
         """
         Callback when bracket order fills (stop loss or take profit).
@@ -1651,6 +1891,7 @@ async def main():
 
     # Build config (in production, load from YAML)
     config = {
+        "mode": os.getenv("MODE", "MIKE").upper(),  # MIKE or INDICATOR
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"),
         "discord": {
             "user_token": os.getenv("DISCORD_USER_TOKEN"),
@@ -1664,6 +1905,10 @@ async def main():
             )
             if os.getenv("DISCORD_MONITORED_USERS")
             else None,
+        },
+        "tradingview": {
+            "webhook_port": int(os.getenv("TRADINGVIEW_WEBHOOK_PORT", "8080")),
+            "webhook_secret": os.getenv("TRADINGVIEW_WEBHOOK_SECRET", ""),
         },
         "ibkr": {
             "host": os.getenv("IBKR_HOST", "127.0.0.1"),

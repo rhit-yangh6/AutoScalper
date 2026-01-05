@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "README.md",
+                "file": "TRADINGVIEW_FINAL.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "README"
+              "title": "TRADINGVIEW_FINAL"
             }
           }
         ]
@@ -185,8 +185,9 @@
   },
   "active": "b98d20507c559b6f",
   "lastOpenFiles": [
-    "EVENT_TYPES.md",
     "README.md",
+    "TRADINGVIEW_FINAL.md",
+    "EVENT_TYPES.md",
     "DEPLOYMENT.md",
     "DOCKER_COMBINED.md",
     "docker-compose.combined.yml",
