@@ -1303,9 +1303,53 @@ class TradingOrchestrator:
 
                 return
 
-            # Step 4: Execute order (same as Discord flow)
-            print("\n[4/5] Executing order...")
-            await self._execute_order(event, session, risk_result)
+            # Step 4: Calculate position size and stops/targets
+            print("\n[4/5] Calculating position size and risk parameters...")
+            if event.is_actionable():
+                quantity = self.risk_gate.calculate_position_size(
+                    event=event, session=session
+                )
+                print(f"✓ Position size: {quantity} contracts")
+
+                # Check if quantity is 0 (already at max position)
+                if quantity == 0:
+                    print(f"⚠️ Position size = 0 (already at MAX_CONTRACTS limit)")
+                    print(f"  Current: {session.total_quantity} contracts")
+                    print(f"  Max allowed: {self.config['risk']['max_contracts']}")
+                    print(f"  ACTION: NO TRADE (position limit reached)")
+
+                    # Cancel session
+                    if event.event_type == EventType.NEW and session.state == SessionState.PENDING:
+                        session.state = SessionState.CANCELLED
+                        session.closed_at = datetime.now(timezone.utc)
+                        session.exit_reason = "Position limit reached"
+                        self.logger.log_session_closed(session, reason="Position limit reached", final_pnl=0.0)
+
+                    # Send Telegram notification
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            f"⚠️ <b>Trade Blocked - Position Limit</b>\n\n"
+                            f"{event.underlying} {event.strike}{event.direction.value[0]}\n\n"
+                            f"Current: {session.total_quantity} contracts\n"
+                            f"Max allowed: {self.config['risk']['max_contracts']}\n\n"
+                            f"<i>Cannot add more contracts - already at maximum</i>"
+                        )
+                    return
+
+                # For NEW orders: Clear Discord-parsed targets, brackets will be calculated from actual fill
+                if event.event_type == EventType.NEW:
+                    event.stop_loss = None  # Executor will calculate from actual fill
+                    event.targets = None    # Executor will calculate from actual fill
+                    print(f"  ℹ️  Brackets will be calculated from actual fill price using config:")
+                    print(f"     - Stop: {self.config['risk']['auto_stop_loss_percent']}% below fill")
+                    print(f"     - Target: {self.config['risk']['risk_reward_ratio']}x risk above fill")
+            else:
+                print("✓ Non-actionable event (informational only)")
+                return
+
+            # Step 5: Execute order
+            print("\n[5/5] Executing order...")
+            await self._execute_order(event, session, quantity)
 
         except Exception as e:
             print(f"\n❌ CRITICAL ERROR processing TradingView signal: {e}")
@@ -1315,14 +1359,18 @@ class TradingOrchestrator:
             import traceback
             traceback.print_exc()
 
-    async def _execute_order(self, event: Event, session: TradeSession, risk_result):
+    async def _execute_order(self, event: Event, session: TradeSession, quantity: int):
         """
         Common order execution logic for both MIKE and INDICATOR modes.
 
         Extracted from on_discord_message to be reusable.
+
+        Args:
+            event: The trading event
+            session: The trade session
+            quantity: Number of contracts to trade (pre-calculated)
         """
         try:
-            quantity = risk_result.adjusted_quantity
 
             if not self.dry_run:
                 # LIVE TRADING - Execute via IBKR
