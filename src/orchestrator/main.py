@@ -1271,14 +1271,6 @@ class TradingOrchestrator:
                 if risk_result.failed_checks:
                     for check in risk_result.failed_checks:
                         print(f"    - {check}")
-
-                # Log risk rejection
-                self.logger.log_risk_decision(
-                    session=session,
-                    event=event,
-                    decision=risk_result.decision,
-                    reason=risk_result.reason,
-                )
                 return
 
             # Step 4: Execute order (same as Discord flow)
