@@ -13,7 +13,7 @@ from ..execution.executor import OrderResult
 from ..discord_listener import DiscordListener
 from ..tradingview_listener import TradingViewListener
 from .session_manager import SessionManager
-from ..models import Event, EventType, SessionState, TradeSession
+from ..models import Event, EventType, SessionState, TradeSession, Direction
 from ..logging import init_logger, get_logger, DailySnapshotManager
 from ..notifications import init_notifier, get_notifier
 
@@ -1900,7 +1900,6 @@ class TradingOrchestrator:
             underlying: The underlying symbol (e.g., "SPY")
             new_direction: The new direction from the alert (CALL or PUT)
         """
-        from ..models.enums import Direction
         from ib_insync import MarketOrder
 
         # Determine opposite direction
