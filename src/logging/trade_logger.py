@@ -163,7 +163,9 @@ class TradeLogger:
         # Format for text log
         with open(txt_path, 'a') as f:
             f.write(f"[PARSED EVENT: {event.event_type.value}]\n")
-            f.write(f"  Confidence: {event.parsing_confidence:.2f}\n")
+            f.write(f"  Source: {event.author}\n")
+            if event.parsing_confidence is not None:
+                f.write(f"  Confidence: {event.parsing_confidence:.2f}\n")
             if event.llm_reasoning:
                 f.write(f"  Reasoning: {event.llm_reasoning}\n")
 
