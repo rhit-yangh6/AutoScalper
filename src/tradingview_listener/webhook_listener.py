@@ -142,11 +142,8 @@ class TradingViewListener:
             print(f"[TRADINGVIEW SIGNAL]")
             print(f"Action: {event.event_type.value}")
             print(f"Ticker: {event.underlying} {event.strike}{event.direction.value[0]} {event.expiry}")
-            print(f"Entry: ${event.entry_price:.2f}")
-            if event.stop_loss:
-                print(f"Stop: ${event.stop_loss:.2f}")
-            if event.target_price:
-                print(f"Target: ${event.target_price:.2f}")
+            print(f"Quantity: {event.quantity} contract(s)")
+            print(f"Note: Entry price and brackets will be calculated from live market data")
             print(f"{'='*60}\n")
 
             # Send to orchestrator
