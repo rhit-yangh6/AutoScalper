@@ -224,7 +224,7 @@ class TradingViewListener:
                 risk_level = RiskLevel.EXTREME
 
             # Build Event
-            # Note: entry_price, stop_loss, and target_price are left as 0/None
+            # Note: entry_price, stop_loss, and targets are left as 0/None
             # The execution engine will:
             # - Fetch real-time option premium from IBKR
             # - Auto-calculate stop loss from AUTO_STOP_LOSS_PERCENT
@@ -237,15 +237,14 @@ class TradingViewListener:
                 expiry=expiry,
                 entry_price=0,  # Will be fetched from IBKR market data
                 stop_loss=None,  # Will be auto-calculated
-                target_price=None,  # Will be auto-calculated
+                targets=None,  # Will be auto-calculated
                 quantity=int(payload.get('quantity', 1)),
                 risk_level=risk_level,
                 risk_notes=payload.get('notes', ''),
-                confidence=1.0,  # Structured data = 100% confidence
-                reasoning=f"TradingView signal: {action} {ticker} {strike:.0f}{direction[0]} (underlying ${underlying_price:.2f})",
                 message_id=f"tv_{datetime.now(timezone.utc).timestamp()}",
                 timestamp=datetime.now(timezone.utc),
-                raw_text=json.dumps(payload, indent=2)
+                author="TradingView",  # Required field - source of signal
+                raw_message=json.dumps(payload, indent=2)  # Required field - original webhook payload
             )
 
             return event
