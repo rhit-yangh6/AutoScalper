@@ -996,6 +996,21 @@ class TradingOrchestrator:
                 if risk_result.failed_checks:
                     for check in risk_result.failed_checks:
                         print(f"    - {check}")
+
+                # Cancel the session if it was a NEW trade (never entered)
+                if event.event_type == EventType.NEW and session.state == SessionState.PENDING:
+                    session.state = SessionState.CANCELLED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.exit_reason = f"Risk rejection: {risk_result.reason}"
+                    print(f"  ✓ Session cancelled (never entered)")
+
+                    # Log cancellation
+                    self.logger.log_session_closed(
+                        session,
+                        reason=f"Risk rejection: {risk_result.reason}",
+                        final_pnl=0.0
+                    )
+
                 return
 
             # Cash check for NEW trades (Cash account with T+1 settlement)
@@ -1271,6 +1286,21 @@ class TradingOrchestrator:
                 if risk_result.failed_checks:
                     for check in risk_result.failed_checks:
                         print(f"    - {check}")
+
+                # Cancel the session if it was a NEW trade (never entered)
+                if event.event_type == EventType.NEW and session.state == SessionState.PENDING:
+                    session.state = SessionState.CANCELLED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.exit_reason = f"Risk rejection: {risk_result.reason}"
+                    print(f"  ✓ Session cancelled (never entered)")
+
+                    # Log cancellation
+                    self.logger.log_session_closed(
+                        session,
+                        reason=f"Risk rejection: {risk_result.reason}",
+                        final_pnl=0.0
+                    )
+
                 return
 
             # Step 4: Execute order (same as Discord flow)
