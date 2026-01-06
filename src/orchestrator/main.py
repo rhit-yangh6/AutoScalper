@@ -1237,6 +1237,11 @@ class TradingOrchestrator:
             print(f"  Trade: {session.underlying} {session.strike} {session.direction}")
             print(f"  Current qty: {session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"  Current qty: {session.total_quantity}")
 
+            # Step 2.5: DIRECTION REVERSAL CHECK (TradingView only)
+            # If NEW signal for opposite direction, close existing positions first
+            if event.event_type == EventType.NEW and event.direction and not self.dry_run:
+                await self._check_and_close_opposite_direction(event.underlying, event.direction)
+
             # Step 3: Risk validation
             print("\n[3/5] Validating with risk gate...")
 
@@ -1880,6 +1885,115 @@ class TradingOrchestrator:
 
             except Exception as e:
                 print(f"  ⚠️ Error closing session {session.session_id}: {e}")
+
+    async def _check_and_close_opposite_direction(self, underlying: str, new_direction: Direction):
+        """
+        Check for open positions in the opposite direction and close them.
+
+        TradingView direction reversal logic:
+        - If CALL alert comes in while holding PUT → close PUT position
+        - If PUT alert comes in while holding CALL → close CALL position
+
+        This ensures we don't hold conflicting positions when indicator flips.
+
+        Args:
+            underlying: The underlying symbol (e.g., "SPY")
+            new_direction: The new direction from the alert (CALL or PUT)
+        """
+        from ..models.enums import Direction
+        from ib_insync import MarketOrder
+
+        # Determine opposite direction
+        opposite_direction = Direction.PUT if new_direction == Direction.CALL else Direction.CALL
+
+        # Find OPEN sessions for the same underlying but opposite direction
+        open_sessions = [
+            s for s in self.session_manager.sessions.values()
+            if s.state == SessionState.OPEN
+            and s.underlying == underlying
+            and s.direction == opposite_direction
+            and s.total_quantity > 0
+        ]
+
+        if not open_sessions:
+            return  # No opposite positions to close
+
+        print(f"\n⚠️ DIRECTION REVERSAL DETECTED")
+        print(f"  New signal: {underlying} {new_direction.value}")
+        print(f"  Found {len(open_sessions)} open {opposite_direction.value} position(s)")
+        print(f"  Closing opposite direction positions before entering new trade...")
+
+        for session in open_sessions:
+            try:
+                symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}"
+                print(f"\n  Closing {symbol}...")
+
+                # Cancel brackets FIRST to prevent SHORT positions
+                if session.stop_order_id or session.target_order_ids:
+                    await self._cancel_session_brackets(session)
+                    print(f"    ✓ Brackets cancelled")
+
+                # Build contract
+                contract = self.executor._build_contract_from_session(session)
+                qualified = await self.executor.ib.qualifyContractsAsync(contract)
+
+                if not qualified:
+                    print(f"    ✗ Could not qualify contract")
+                    continue
+
+                contract = qualified[0]
+                contract.exchange = "SMART"
+
+                # Use MARKET order for fast exit
+                order = MarketOrder("SELL", session.total_quantity)
+                trade = self.executor.ib.placeOrder(contract, order)
+
+                # Wait for fill
+                filled = await self.executor._wait_for_fill(trade, timeout=10)
+
+                if filled:
+                    fill_price = trade.orderStatus.avgFillPrice
+
+                    # Calculate P&L
+                    fill_value = fill_price * 100  # Premium to dollar value
+                    pnl = (fill_value - session.avg_entry_price) * session.total_quantity
+
+                    # Close session
+                    session.state = SessionState.CLOSED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.exit_reason = "DIRECTION_REVERSAL"
+                    session.exit_price = fill_price
+                    session.realized_pnl = pnl
+                    session.total_quantity = 0
+
+                    print(f"    ✓ Closed @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
+
+                    # Log closure
+                    self.logger.log_session_closed(
+                        session,
+                        reason=f"Direction reversal: {opposite_direction.value} → {new_direction.value}",
+                        final_pnl=pnl
+                    )
+
+                    # Send Telegram notification
+                    if self.notifier:
+                        pnl_emoji = "💰" if pnl > 0 else "📉"
+                        await self.notifier.send_message(
+                            f"<b>🔄 Direction Reversal - Position Closed</b>\n\n"
+                            f"<b>Closed:</b> {symbol}\n"
+                            f"<b>Exit:</b> ${fill_price:.2f}\n"
+                            f"<b>P&L:</b> {pnl_emoji} ${pnl:+,.2f}\n\n"
+                            f"<b>Reason:</b> New {new_direction.value} signal received\n"
+                            f"<b>Direction:</b> {opposite_direction.value} → {new_direction.value}\n\n"
+                            f"<i>Indicator flipped - opposite position auto-closed</i>"
+                        )
+                else:
+                    print(f"    ⚠️ Close order timeout")
+
+            except Exception as e:
+                print(f"    ✗ Error closing opposite position: {e}")
+                import traceback
+                traceback.print_exc()
 
     async def _cancel_session_brackets(self, session: TradeSession):
         """Cancel all bracket orders for a session."""
