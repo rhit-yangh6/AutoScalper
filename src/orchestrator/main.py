@@ -671,18 +671,28 @@ class TradingOrchestrator:
                     text += f"• Port: {self.config['ibkr']['port']}\n"
             text += f"\n"
 
-            # Discord Listener
-            text += f"<b>💬 Discord Listener</b>\n"
-            if self.discord_listener.running:
-                text += f"• Status: ✅ Running\n"
-                text += f"• Channels: {len(self.discord_listener.channel_ids)}\n"
-                if self.discord_listener.monitored_users:
-                    text += f"• Users: {len(self.discord_listener.monitored_users)}\n"
+            # Signal Source Listener (Discord or TradingView)
+            if self.mode == "MIKE" and self.discord_listener:
+                text += f"<b>💬 Discord Listener</b>\n"
+                if self.discord_listener.running:
+                    text += f"• Status: ✅ Running\n"
+                    text += f"• Channels: {len(self.discord_listener.channel_ids)}\n"
+                    if self.discord_listener.monitored_users:
+                        text += f"• Users: {len(self.discord_listener.monitored_users)}\n"
+                    else:
+                        text += f"• Users: All\n"
                 else:
-                    text += f"• Users: All\n"
-            else:
-                text += f"• Status: ❌ Stopped\n"
-            text += f"\n"
+                    text += f"• Status: ❌ Stopped\n"
+                text += f"\n"
+            elif self.mode == "INDICATOR" and self.tradingview_listener:
+                text += f"<b>📊 TradingView Webhook</b>\n"
+                if self.tradingview_listener.running:
+                    text += f"• Status: ✅ Running\n"
+                    text += f"• Port: {self.tradingview_listener.port}\n"
+                    text += f"• URL: https://webhook.hanyuyang.me/webhook\n"
+                else:
+                    text += f"• Status: ❌ Stopped\n"
+                text += f"\n"
 
             # Session Manager
             text += f"<b>📊 Session Manager</b>\n"
