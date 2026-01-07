@@ -1374,10 +1374,19 @@ class TradingOrchestrator:
 
             if not self.dry_run:
                 # LIVE TRADING - Execute via IBKR
-                order_details = f"{event.event_type.value}: {quantity} contracts @ ${event.entry_price:.2f}"
+                order_details = {
+                    "quantity": quantity,
+                    "entry_price": event.entry_price,
+                    "stop_loss": event.stop_loss,
+                    "targets": event.targets,
+                    "underlying": session.underlying,
+                    "strike": session.strike,
+                    "expiry": session.expiry,
+                    "direction": session.direction.value if session.direction else None
+                }
 
-                # Log order attempt
-                self.logger.log_order_attempt(
+                # Log order submission
+                self.logger.log_order_submitted(
                     session=session,
                     event_type=event.event_type,
                     order_details=order_details,
@@ -1434,13 +1443,19 @@ class TradingOrchestrator:
 
             else:
                 # DRY-RUN MODE - Simulate trade
-                order_details = f"{event.event_type.value}: {quantity} contracts @ ${event.entry_price:.2f} (DRY-RUN)"
+                order_details = {
+                    "quantity": quantity,
+                    "entry_price": event.entry_price,
+                    "stop_loss": event.stop_loss,
+                    "targets": event.targets,
+                    "mode": "DRY-RUN"
+                }
 
                 print(f"  ⚠️  DRY-RUN MODE - No order sent to IBKR")
-                print(f"  Would execute: {order_details}")
+                print(f"  Would execute: {event.event_type.value}: {quantity} contracts @ ${event.entry_price:.2f}")
 
-                # Log simulated order attempt
-                self.logger.log_order_attempt(
+                # Log simulated order submission
+                self.logger.log_order_submitted(
                     session=session,
                     event_type=event.event_type,
                     order_details=order_details,
