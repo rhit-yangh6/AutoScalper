@@ -817,10 +817,11 @@ class TradingOrchestrator:
                     # Find and cancel brackets before closing position
                     session_to_close = None
                     if hasattr(contract, 'strike'):
-                        session_key = f"{contract.symbol} {contract.strike} {contract.right} {contract.lastTradeDateOrContractMonth}"
+                        # Build session key matching IBKR format (use float for strike)
+                        session_key = f"{contract.symbol} {float(contract.strike)} {contract.right} {contract.lastTradeDateOrContractMonth}"
                         for session in self.session_manager.sessions.values():
                             if session.state == SessionState.OPEN:
-                                sess_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
+                                sess_key = f"{session.underlying} {float(session.strike)} {session.direction.value[0]} {session.expiry.replace('-', '')}"
                                 if sess_key == session_key:
                                     session_to_close = session
 
@@ -828,7 +829,11 @@ class TradingOrchestrator:
                                     if session.stop_order_id or session.target_order_ids:
                                         print(f"    Cancelling brackets for {symbol}...")
                                         await self._cancel_session_brackets(session)
-                                        text += f"  🛑 Cancelled {1 if session.stop_order_id else 0 + len(session.target_order_ids or [])} bracket order(s)\n"
+                                        bracket_count = (1 if session.stop_order_id else 0) + len(session.target_order_ids or [])
+                                        text += f"  🛑 Cancelled {bracket_count} bracket order(s)\n"
+
+                                        # Wait for cancellations to propagate through IBKR
+                                        await asyncio.sleep(0.5)
                                     break
 
                     # Determine order action (BUY to close SHORT, SELL to close LONG)
@@ -1226,6 +1231,11 @@ class TradingOrchestrator:
         """
         session = None
         try:
+            # Step 1.5: DIRECTION REVERSAL CHECK (TradingView only)
+            # If NEW signal for opposite direction, close existing positions FIRST
+            if event.event_type == EventType.NEW and event.direction and not self.dry_run:
+                await self._check_and_close_opposite_direction(event.underlying, event.direction)
+
             # Step 2: Correlate to session
             print("[2/5] Correlating to trade session...")
             session = self.session_manager.process_event(event)
@@ -1260,11 +1270,6 @@ class TradingOrchestrator:
 
                     session.strike = adjusted_strike
                     event.strike = adjusted_strike
-
-            # Step 2.6: DIRECTION REVERSAL CHECK (TradingView only)
-            # If NEW signal for opposite direction, close existing positions first
-            if event.event_type == EventType.NEW and event.direction and not self.dry_run:
-                await self._check_and_close_opposite_direction(event.underlying, event.direction)
 
             # Step 3: Risk validation
             print("\n[3/5] Validating with risk gate...")
@@ -1709,8 +1714,8 @@ class TradingOrchestrator:
                 position_map = {}
                 for pos in ibkr_positions:
                     contract = pos.contract
-                    # Create key: "SPY 685 C 20251217"
-                    key = f"{contract.symbol} {contract.strike} {contract.right} {contract.lastTradeDateOrContractMonth}"
+                    # Create key: "SPY 685.0 C 20251217" (use float for strike)
+                    key = f"{contract.symbol} {float(contract.strike)} {contract.right} {contract.lastTradeDateOrContractMonth}"
                     position_map[key] = pos.position
 
                 # Check all OPEN sessions
@@ -1780,8 +1785,8 @@ class TradingOrchestrator:
                                  if s.state in [SessionState.PENDING, SessionState.CANCELLED]]
 
                 for session in stale_sessions:
-                    # Build session key
-                    session_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
+                    # Build session key (use float for strike to match IBKR format)
+                    session_key = f"{session.underlying} {float(session.strike)} {session.direction.value[0]} {session.expiry.replace('-', '')}"
 
                     # Check age (only clean up sessions older than 5 minutes)
                     time_since_update = (datetime.now(timezone.utc) - session.updated_at).total_seconds()
@@ -2170,6 +2175,9 @@ class TradingOrchestrator:
                     await self._cancel_session_brackets(session)
                     print(f"    ✓ Brackets cancelled")
 
+                    # Wait for cancellations to propagate through IBKR
+                    await asyncio.sleep(0.5)
+
                 # Build contract
                 contract = self.executor._build_contract_from_session(session)
                 qualified = await self.executor.ib.qualifyContractsAsync(contract)
@@ -2181,8 +2189,31 @@ class TradingOrchestrator:
                 contract = qualified[0]
                 contract.exchange = "SMART"
 
+                # Verify actual IBKR position before closing
+                positions = self.executor.ib.positions()
+                matching_position = None
+                for pos in positions:
+                    if pos.contract.conId == contract.conId:
+                        matching_position = pos
+                        break
+
+                if not matching_position or matching_position.position == 0:
+                    print(f"    ⚠️ No IBKR position found - may have been manually closed")
+                    # Mark session as closed anyway
+                    session.state = SessionState.CLOSED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.exit_reason = "DIRECTION_REVERSAL (no position)"
+                    session.total_quantity = 0
+                    continue
+
+                # Use actual position quantity and determine correct action
+                actual_qty = abs(matching_position.position)
+                action = "SELL" if matching_position.position > 0 else "BUY"
+
+                print(f"    Position: {matching_position.position} contracts ({action} {actual_qty} to close)")
+
                 # Use MARKET order for fast exit
-                order = MarketOrder("SELL", session.total_quantity)
+                order = MarketOrder(action, actual_qty)
                 trade = self.executor.ib.placeOrder(contract, order)
 
                 # Wait for fill
