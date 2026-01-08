@@ -2113,14 +2113,22 @@ class TradingOrchestrator:
                     if premium is None:
                         continue
 
+                    # Restore stderr temporarily to print this strike's price
+                    sys.stderr = original_stderr
+
                     # Check if in target range
                     if TARGET_MIN_PREMIUM <= premium <= TARGET_MAX_PREMIUM:
+                        print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} ✓ TARGET")
                         # Wait for any pending IBKR cleanup
                         await asyncio.sleep(0.1)
-                        # Restore stderr before printing success
-                        sys.stderr = original_stderr
-                        print(f"  ✓ Found ${strike:.0f}{direction.value[0]} @ ${premium:.2f}")
                         return (strike, premium)
+                    elif premium > TARGET_MAX_PREMIUM:
+                        print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} (too expensive)")
+                    else:
+                        print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} (too cheap)")
+
+                    # Re-suppress stderr for next iteration
+                    sys.stderr = io.StringIO()
 
                 except Exception:
                     # Silently skip invalid strikes
@@ -2130,7 +2138,7 @@ class TradingOrchestrator:
             # Wait for any pending IBKR cleanup before restoring stderr
             await asyncio.sleep(0.1)
             sys.stderr = original_stderr
-            print(f"  ✗ No strike in range (checked {MAX_STRIKES_TO_CHECK} strikes)")
+            print(f"  ✗ No strike in target range ${TARGET_MIN_PREMIUM:.2f}-${TARGET_MAX_PREMIUM:.2f}")
             return (None, None)
         finally:
             # Ensure stderr is always restored
