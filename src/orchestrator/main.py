@@ -1240,71 +1240,26 @@ class TradingOrchestrator:
             qty_info = f"{session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"{session.total_quantity}"
             print(f"✓ Session {session.session_id[:8]} | {session.state.value} | {session.underlying} {session.strike}{session.direction.value[0]} | Qty: {qty_info}")
 
-            # Step 2.5: OPTIMAL STRIKE SELECTION (TradingView NEW only)
-            # Only search during trading hours to avoid delayed data issues
-            if event.event_type == EventType.NEW and event.underlying_price and not self.dry_run and self.executor.connected:
-                # Check trading hours first
-                now = datetime.now(timezone.utc).time()
-                trading_start = time(*map(int, self.config["risk"]["trading_hours_start"].split(":")))
-                trading_end = time(*map(int, self.config["risk"]["trading_hours_end"].split(":")))
+            # Step 2.5: STRIKE ADJUSTMENT (TradingView NEW only)
+            # Use fixed $2.50 offset from current price
+            if event.event_type == EventType.NEW and event.underlying_price:
+                original_strike = session.strike
 
-                if trading_start <= now <= trading_end:
-                    # Within trading hours - search for optimal strike
-                    print("\n[2.5/5] Finding optimal strike based on premium...")
-                    optimal_strike, premium = await self._find_optimal_strike(
-                        underlying=session.underlying,
-                        direction=session.direction,
-                        expiry=session.expiry,
-                        current_price=event.underlying_price
-                    )
+                # Calculate strike with $2.50 offset
+                if session.direction == Direction.CALL:
+                    # CALL: Add $2.50 and round to nearest $1
+                    adjusted_strike = round(event.underlying_price + 2.5)
+                else:
+                    # PUT: Subtract $2.50 and round to nearest $1
+                    adjusted_strike = round(event.underlying_price - 2.5)
 
-                    if optimal_strike is None:
-                        # No suitable strike found, cancel session and skip trade
-                        print(f"  ✗ No suitable strike found")
-                        print(f"  ACTION: NO TRADE (premium out of range)")
+                if adjusted_strike != original_strike:
+                    print(f"\n[2.5/5] Adjusting strike...")
+                    print(f"  Current price: ${event.underlying_price:.2f}")
+                    print(f"  Adjusted: ${original_strike:.0f} → ${adjusted_strike:.0f} (${2.5:.2f} offset)")
 
-                        session.state = SessionState.CANCELLED
-                        session.closed_at = datetime.now(timezone.utc)
-                        session.exit_reason = "No suitable strike (premium out of range)"
-
-                        self.logger.log_session_closed(
-                            session,
-                            reason="No suitable strike - premium out of range",
-                            final_pnl=0.0
-                        )
-
-                        if self.notifier:
-                            await self.notifier.send_message(
-                                f"⚠️ <b>Trade Skipped - No Suitable Strike</b>\n\n"
-                                f"{event.underlying} {event.direction.value}\n"
-                                f"Current price: ${event.underlying_price:.2f}\n\n"
-                                f"Could not find strike with premium $0.25-$0.65\n"
-                                f"All strikes either too cheap or too expensive\n\n"
-                                f"<i>Trade skipped - waiting for better opportunity</i>"
-                            )
-
-                        return
-
-                    if optimal_strike != session.strike:
-                        original_strike = session.strike
-                        print(f"  ✓ Adjusted: ${original_strike:.0f} → ${optimal_strike:.0f} (${premium:.2f})")
-                        session.strike = optimal_strike
-                        event.strike = optimal_strike
-
-                        # Send Telegram notification about strike adjustment
-                        if self.notifier:
-                            await self.notifier.send_message(
-                                f"🎯 <b>Optimal Strike Found</b>\n\n"
-                                f"<b>Signal:</b> {event.underlying} {event.direction.value}\n"
-                                f"<b>Current Price:</b> ${event.underlying_price:.2f}\n\n"
-                                f"<b>Original:</b> ${original_strike:.0f} (TradingView)\n"
-                                f"<b>Optimal:</b> ${optimal_strike:.0f}\n"
-                                f"<b>Premium:</b> ${premium:.2f}\n\n"
-                                f"<i>Adjusted for better pricing</i>"
-                            )
-                    else:
-                        print(f"  ✓ Strike ${optimal_strike:.0f} already optimal (${premium:.2f})")
-                # Outside trading hours - silently skip strike search, use TradingView's strike
+                    session.strike = adjusted_strike
+                    event.strike = adjusted_strike
 
             # Step 2.6: DIRECTION REVERSAL CHECK (TradingView only)
             # If NEW signal for opposite direction, close existing positions first
