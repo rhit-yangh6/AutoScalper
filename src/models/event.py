@@ -23,6 +23,7 @@ class Event(BaseModel):
     direction: Optional[Direction] = None
     strike: Optional[float] = None
     expiry: Optional[str] = None  # ISO date string for the option expiry
+    underlying_price: Optional[float] = None  # Current price of underlying (from TradingView)
 
     # Pricing
     entry_price: Optional[float] = None

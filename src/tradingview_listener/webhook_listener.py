@@ -232,6 +232,7 @@ class TradingViewListener:
                 strike=strike,
                 direction=option_direction,
                 expiry=expiry,
+                underlying_price=underlying_price,  # Store for optimal strike selection
                 entry_price=0,  # Will be fetched from IBKR market data
                 stop_loss=None,  # Will be auto-calculated
                 targets=None,  # Will be auto-calculated

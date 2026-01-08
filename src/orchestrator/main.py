@@ -1252,7 +1252,50 @@ class TradingOrchestrator:
             print(f"  Trade: {session.underlying} {session.strike} {session.direction}")
             print(f"  Current qty: {session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"  Current qty: {session.total_quantity}")
 
-            # Step 2.5: DIRECTION REVERSAL CHECK (TradingView only)
+            # Step 2.5: OPTIMAL STRIKE SELECTION (TradingView NEW only)
+            # Find strike with premium in target range ($0.25-$0.65)
+            if event.event_type == EventType.NEW and event.underlying_price and not self.dry_run and self.executor.connected:
+                print("\n[2.5/5] Finding optimal strike based on premium...")
+                optimal_strike = await self._find_optimal_strike(
+                    underlying=session.underlying,
+                    direction=session.direction,
+                    expiry=session.expiry,
+                    current_price=event.underlying_price
+                )
+
+                if optimal_strike is None:
+                    # No suitable strike found, cancel session and skip trade
+                    print(f"  ✗ No suitable strike found with premium $0.25-$0.65")
+                    print(f"  ACTION: NO TRADE (premium out of range)")
+
+                    session.state = SessionState.CANCELLED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.exit_reason = "No suitable strike (premium out of range)"
+
+                    self.logger.log_session_closed(
+                        session,
+                        reason="No suitable strike - premium out of range",
+                        final_pnl=0.0
+                    )
+
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            f"⚠️ <b>Trade Skipped - No Suitable Strike</b>\n\n"
+                            f"{event.underlying} {event.direction.value}\n"
+                            f"Current price: ${event.underlying_price:.2f}\n\n"
+                            f"Could not find strike with premium $0.25-$0.65\n"
+                            f"All strikes either too cheap or too expensive\n\n"
+                            f"<i>Trade skipped - waiting for better opportunity</i>"
+                        )
+
+                    return
+
+                if optimal_strike != session.strike:
+                    print(f"  ✓ Adjusted strike: ${session.strike:.0f} → ${optimal_strike:.0f}")
+                    session.strike = optimal_strike
+                    event.strike = optimal_strike
+
+            # Step 2.6: DIRECTION REVERSAL CHECK (TradingView only)
             # If NEW signal for opposite direction, close existing positions first
             if event.event_type == EventType.NEW and event.direction and not self.dry_run:
                 await self._check_and_close_opposite_direction(event.underlying, event.direction)
@@ -1970,6 +2013,103 @@ class TradingOrchestrator:
 
             except Exception as e:
                 print(f"  ⚠️ Error closing session {session.session_id}: {e}")
+
+    async def _find_optimal_strike(self, underlying: str, direction: Direction, expiry: str, current_price: float) -> Optional[float]:
+        """
+        Find optimal strike based on premium pricing.
+
+        Searches for strikes with premium in the target range ($0.25-$0.65).
+        Avoids strikes that are too cheap (far OTM) or too expensive (near/ITM).
+
+        Args:
+            underlying: Symbol (e.g., "SPY")
+            direction: CALL or PUT
+            expiry: Expiry date (YYYY-MM-DD)
+            current_price: Current underlying price
+
+        Returns:
+            Optimal strike price, or None if no suitable strike found
+        """
+        from ib_insync import Option
+        import math
+
+        TARGET_MIN_PREMIUM = 0.25
+        TARGET_MAX_PREMIUM = 0.65
+        MAX_STRIKES_TO_CHECK = 20  # Search up to $10 away (20 strikes × $0.50)
+
+        print(f"  Searching for strike with premium ${TARGET_MIN_PREMIUM:.2f}-${TARGET_MAX_PREMIUM:.2f}...")
+        print(f"  Current price: ${current_price:.2f}")
+
+        # Round current price to nearest $0.50
+        base_strike = round(current_price / 0.5) * 0.5
+
+        # Determine search direction
+        if direction == Direction.CALL:
+            # For calls, search upward (OTM calls are above current price)
+            strikes_to_check = [base_strike + (i * 0.5) for i in range(MAX_STRIKES_TO_CHECK)]
+        else:
+            # For puts, search downward (OTM puts are below current price)
+            strikes_to_check = [base_strike - (i * 0.5) for i in range(MAX_STRIKES_TO_CHECK)]
+            strikes_to_check = [s for s in strikes_to_check if s > 0]  # No negative strikes
+
+        # Convert expiry to IBKR format (YYYYMMDD)
+        expiry_ibkr = expiry.replace('-', '')
+
+        for strike in strikes_to_check:
+            try:
+                # Build option contract
+                option = Option(
+                    symbol=underlying,
+                    lastTradeDateOrContractMonth=expiry_ibkr,
+                    strike=strike,
+                    right='C' if direction == Direction.CALL else 'P',
+                    exchange='SMART'
+                )
+
+                # Qualify contract
+                qualified = await self.executor.ib.qualifyContractsAsync(option)
+                if not qualified:
+                    continue
+
+                contract = qualified[0]
+
+                # Get market data (snapshot)
+                ticker = self.executor.ib.reqMktData(contract, snapshot=True)
+                await self.executor.ib.sleep(0.5)  # Wait for data
+
+                # Get premium (use mid price if available)
+                premium = None
+                if ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+                    premium = (ticker.bid + ticker.ask) / 2
+                elif ticker.last and not math.isnan(ticker.last):
+                    premium = ticker.last
+                elif ticker.close and not math.isnan(ticker.close):
+                    premium = ticker.close
+
+                # Cancel market data
+                self.executor.ib.cancelMktData(contract)
+
+                if premium is None:
+                    continue
+
+                print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f}", end="")
+
+                # Check if in target range
+                if TARGET_MIN_PREMIUM <= premium <= TARGET_MAX_PREMIUM:
+                    print(f" ✓ TARGET RANGE")
+                    return strike
+                elif premium > TARGET_MAX_PREMIUM:
+                    print(f" (too expensive)")
+                else:
+                    print(f" (too cheap)")
+
+            except Exception as e:
+                print(f"    Error checking ${strike:.0f}: {e}")
+                continue
+
+        # No strike found in target range - return None to skip trade
+        print(f"  ⚠️ No strike found in target range $0.25-$0.65")
+        return None
 
     async def _check_and_close_opposite_direction(self, underlying: str, new_direction: Direction):
         """
