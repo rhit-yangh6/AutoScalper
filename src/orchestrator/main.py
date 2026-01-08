@@ -2073,6 +2073,7 @@ class TradingOrchestrator:
         sys.stderr = io.StringIO()
 
         try:
+            strikes_checked = 0
             for strike in strikes_to_check:
                 try:
                     # Build option contract
@@ -2087,6 +2088,10 @@ class TradingOrchestrator:
                     # Qualify contract
                     qualified = await self.executor.ib.qualifyContractsAsync(option)
                     if not qualified:
+                        # Restore stderr temporarily
+                        sys.stderr = original_stderr
+                        print(f"    ${strike:.0f}{direction.value[0]}: [contract not found]")
+                        sys.stderr = io.StringIO()
                         continue
 
                     contract = qualified[0]
@@ -2110,11 +2115,15 @@ class TradingOrchestrator:
                     except:
                         pass
 
-                    if premium is None:
-                        continue
-
                     # Restore stderr temporarily to print this strike's price
                     sys.stderr = original_stderr
+
+                    if premium is None:
+                        print(f"    ${strike:.0f}{direction.value[0]}: [no price data]")
+                        sys.stderr = io.StringIO()
+                        continue
+
+                    strikes_checked += 1
 
                     # Check if in target range
                     if TARGET_MIN_PREMIUM <= premium <= TARGET_MAX_PREMIUM:
@@ -2130,8 +2139,11 @@ class TradingOrchestrator:
                     # Re-suppress stderr for next iteration
                     sys.stderr = io.StringIO()
 
-                except Exception:
-                    # Silently skip invalid strikes
+                except Exception as e:
+                    # Print unexpected errors
+                    sys.stderr = original_stderr
+                    print(f"    ${strike:.0f}{direction.value[0]}: [error: {str(e)[:50]}]")
+                    sys.stderr = io.StringIO()
                     continue
 
             # No strike found in target range
