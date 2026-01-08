@@ -592,56 +592,56 @@ class ExecutionEngine:
                     print(f"  ⚠️ Could not fetch underlying price, falling back to auto-calculated target")
                     target_price = None  # Let bracket calculation use R/R ratio
 
-            # Step 1: Submit entry order (Market or Limit based on data availability)
+            # Step 1: Fetch market data and validate premium
             from ib_insync import MarketOrder, LimitOrder
+            import math
 
+            print(f"  Fetching current market data...")
+            ticker = self.ib.reqMktData(contract)
+            await asyncio.sleep(1)  # Wait for real-time data
+
+            # Handle NaN and None values
+            market_bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+            market_ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+            market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+
+            if market_bid and market_ask:
+                last_str = f"${market_last:.2f}" if market_last else "N/A"
+                print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last {last_str}")
+            elif market_last:
+                print(f"  📊 Market: Last ${market_last:.2f}")
+
+            # Check minimum premium requirement ($0.15) - APPLIES TO ALL ORDERS
+            # Prevents trading options that are too cheap (too far OTM or illiquid)
+            MIN_PREMIUM = 0.15
+            premium_to_check = market_ask if market_ask else market_last
+
+            if premium_to_check and premium_to_check < MIN_PREMIUM:
+                print(f"  ❌ Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f} - REJECTING trade")
+                print(f"     Options this cheap are typically too far OTM or illiquid")
+
+                # Close session immediately
+                session.state = SessionState.CLOSED
+                session.closed_at = datetime.now(timezone.utc)
+                session.updated_at = datetime.now(timezone.utc)
+                session.exit_reason = "PREMIUM_TOO_LOW"
+
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    status=OrderStatus.REJECTED,
+                    filled_price=None,
+                    message=f"Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f}"
+                )
+
+            # Step 2: Submit entry order (Market or Limit based on configuration)
             if self.use_market_orders:
-                # Use MARKET order (IBKR paper or no real-time data)
+                # Use MARKET order (IBKR paper or no real-time data subscription)
                 parent_order = MarketOrder("BUY", quantity)
                 parent_trade = self.ib.placeOrder(contract, parent_order)
                 print(f"  ⓘ MARKET order submitted for {quantity} contracts")
             else:
                 # Use LIMIT order with 5¢ flexibility (real-time data available)
-                # Get current market data
-                print(f"  Fetching current market data...")
-                ticker = self.ib.reqMktData(contract)
-                await asyncio.sleep(1)  # Wait for real-time data
-
-                # Handle NaN and None values
-                import math
-                market_bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-                market_ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-                market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
-
-                if market_bid and market_ask:
-                    last_str = f"${market_last:.2f}" if market_last else "N/A"
-                    print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last {last_str}")
-                elif market_last:
-                    print(f"  📊 Market: Last ${market_last:.2f}")
-
-                # Check minimum premium requirement ($0.15)
-                # Prevents trading options that are too cheap (too far OTM or illiquid)
-                MIN_PREMIUM = 0.15
-                premium_to_check = market_ask if market_ask else market_last
-
-                if premium_to_check and premium_to_check < MIN_PREMIUM:
-                    print(f"  ❌ Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f} - REJECTING trade")
-                    print(f"     Options this cheap are typically too far OTM or illiquid")
-
-                    # Close session immediately
-                    session.state = SessionState.CLOSED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.updated_at = datetime.now(timezone.utc)
-                    session.exit_reason = "PREMIUM_TOO_LOW"
-
-                    return OrderResult(
-                        success=False,
-                        order_id=None,
-                        status=OrderStatus.REJECTED,
-                        filled_price=None,
-                        message=f"Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f}"
-                    )
-
                 # Determine entry price with 5-cent flexibility
                 alert_price = event.entry_price or (market_ask if market_ask else market_last)
 
@@ -677,7 +677,7 @@ class ExecutionEngine:
                     parent_trade = self.ib.placeOrder(contract, parent_order)
                     print(f"  ⓘ LIMIT order submitted @ ${entry_price:.2f}")
 
-            # Step 2: Wait for parent fill with real-time Telegram updates
+            # Step 3: Wait for parent fill with real-time Telegram updates
             filled = await self._wait_for_fill(
                 parent_trade,
                 timeout=30,
@@ -705,11 +705,11 @@ class ExecutionEngine:
                     message="Entry order timed out",
                 )
 
-            # Step 3: Capture ACTUAL fill price
+            # Step 4: Capture ACTUAL fill price
             actual_fill_price = parent_trade.orderStatus.avgFillPrice
             print(f"  ✓ Entry filled at ${actual_fill_price:.2f}")
 
-            # Step 4: Update session BEFORE creating brackets
+            # Step 5: Update session BEFORE creating brackets
             now = datetime.now(timezone.utc)
             session.state = SessionState.OPEN
             session.opened_at = now
@@ -720,7 +720,7 @@ class ExecutionEngine:
 
             print(f"  ✓ Session updated: {session.session_id[:8]}... | qty={quantity} @ ${actual_fill_price:.2f}")
 
-            # Step 5: Calculate bracket prices using ACTUAL fill price
+            # Step 6: Calculate bracket prices using ACTUAL fill price
             # CRITICAL: Always use actual fill price, not limit price
             # This ensures risk management is based on real execution, not intended price
             stop_price, final_target_price = self._calculate_bracket_prices(
@@ -729,7 +729,7 @@ class ExecutionEngine:
                 target_price,
             )
 
-            # Step 6: Create bracket orders using actual fill price
+            # Step 7: Create bracket orders using actual fill price
             bracket_result = await self._create_bracket_orders(
                 contract=contract,
                 quantity=quantity,
@@ -738,7 +738,7 @@ class ExecutionEngine:
                 session=session,
             )
 
-            # Step 7: Store bracket order IDs
+            # Step 8: Store bracket order IDs
             if bracket_result:
                 session.stop_order_id = bracket_result.get('stop_order_id')
                 session.target_order_ids = bracket_result.get('target_order_ids', [])
@@ -807,7 +807,7 @@ class ExecutionEngine:
                         message=f"CRITICAL: Bracket failure. Emergency exit EXCEPTION. CLOSE POSITION MANUALLY!",
                     )
 
-            # Step 8: Store bracket percentages for future ADD operations (Issue 4)
+            # Step 9: Store bracket percentages for future ADD operations (Issue 4)
             # CRITICAL: Use actual_fill_price for percentage calculations
             # (same price used to calculate the brackets)
             if actual_fill_price <= 0:
