@@ -1722,8 +1722,8 @@ class TradingOrchestrator:
                 matched_positions = set()
 
                 for session in open_sessions:
-                    # Build session key
-                    session_key = f"{session.underlying} {session.strike} {session.direction.value[0]} {session.expiry.replace('-', '')}"
+                    # Build session key (match IBKR format with float strike)
+                    session_key = f"{session.underlying} {float(session.strike)} {session.direction.value[0]} {session.expiry.replace('-', '')}"
 
                     # Mark this position as matched (tracked by a session)
                     # This prevents false "orphaned" warnings
