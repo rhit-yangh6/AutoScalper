@@ -1241,15 +1241,15 @@ class TradingOrchestrator:
             print(f"✓ Session {session.session_id[:8]} | {session.state.value} | {session.underlying} {session.strike}{session.direction.value[0]} | Qty: {qty_info}")
 
             # Step 2.5: OPTIMAL STRIKE SELECTION (TradingView NEW only)
-            # Find strike with premium in target range ($0.25-$0.65)
             # Only search during trading hours to avoid delayed data issues
             if event.event_type == EventType.NEW and event.underlying_price and not self.dry_run and self.executor.connected:
-                # Check if in trading hours first
+                # Check trading hours first
                 now = datetime.now(timezone.utc).time()
                 trading_start = time(*map(int, self.config["risk"]["trading_hours_start"].split(":")))
                 trading_end = time(*map(int, self.config["risk"]["trading_hours_end"].split(":")))
 
                 if trading_start <= now <= trading_end:
+                    # Within trading hours - search for optimal strike
                     print("\n[2.5/5] Finding optimal strike based on premium...")
                     optimal_strike, premium = await self._find_optimal_strike(
                         underlying=session.underlying,
@@ -1304,8 +1304,7 @@ class TradingOrchestrator:
                             )
                     else:
                         print(f"  ✓ Strike ${optimal_strike:.0f} already optimal (${premium:.2f})")
-                else:
-                    print(f"  ⚠️ Outside trading hours, skipping strike search")
+                # Outside trading hours - silently skip strike search, use TradingView's strike
 
             # Step 2.6: DIRECTION REVERSAL CHECK (TradingView only)
             # If NEW signal for opposite direction, close existing positions first
