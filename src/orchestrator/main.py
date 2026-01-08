@@ -2035,21 +2035,21 @@ class TradingOrchestrator:
 
         TARGET_MIN_PREMIUM = 0.25
         TARGET_MAX_PREMIUM = 0.65
-        MAX_STRIKES_TO_CHECK = 20  # Search up to $10 away (20 strikes × $0.50)
+        MAX_STRIKES_TO_CHECK = 20  # Search up to $20 away (20 strikes × $1)
 
         print(f"  Searching for strike with premium ${TARGET_MIN_PREMIUM:.2f}-${TARGET_MAX_PREMIUM:.2f}...")
         print(f"  Current price: ${current_price:.2f}")
 
-        # Round current price to nearest $0.50
-        base_strike = round(current_price / 0.5) * 0.5
+        # Round current price to nearest $1 (SPY options trade in $1 increments)
+        base_strike = round(current_price)
 
         # Determine search direction
         if direction == Direction.CALL:
             # For calls, search upward (OTM calls are above current price)
-            strikes_to_check = [base_strike + (i * 0.5) for i in range(MAX_STRIKES_TO_CHECK)]
+            strikes_to_check = [base_strike + i for i in range(MAX_STRIKES_TO_CHECK)]
         else:
             # For puts, search downward (OTM puts are below current price)
-            strikes_to_check = [base_strike - (i * 0.5) for i in range(MAX_STRIKES_TO_CHECK)]
+            strikes_to_check = [base_strike - i for i in range(MAX_STRIKES_TO_CHECK)]
             strikes_to_check = [s for s in strikes_to_check if s > 0]  # No negative strikes
 
         # Convert expiry to IBKR format (YYYYMMDD)
@@ -2075,7 +2075,7 @@ class TradingOrchestrator:
 
                 # Get market data (snapshot)
                 ticker = self.executor.ib.reqMktData(contract, snapshot=True)
-                await self.executor.ib.sleep(0.5)  # Wait for data
+                await asyncio.sleep(0.5)  # Wait for data
 
                 # Get premium (use mid price if available)
                 premium = None
