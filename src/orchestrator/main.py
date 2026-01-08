@@ -2098,7 +2098,12 @@ class TradingOrchestrator:
 
                     # Get market data (snapshot)
                     ticker = self.executor.ib.reqMktData(contract, snapshot=True)
-                    await asyncio.sleep(0.5)  # Wait for data
+
+                    # Wait longer for snapshot data (delayed data takes time)
+                    await asyncio.sleep(2.0)
+
+                    # Force update to get latest data
+                    await self.executor.ib.sleepAsync(0)
 
                     # Get premium (use mid price if available)
                     premium = None
@@ -2108,6 +2113,8 @@ class TradingOrchestrator:
                         premium = ticker.last
                     elif ticker.close and not math.isnan(ticker.close):
                         premium = ticker.close
+                    elif ticker.marketPrice() and not math.isnan(ticker.marketPrice()):
+                        premium = ticker.marketPrice()
 
                     # Cancel market data (ignore cleanup errors)
                     try:
