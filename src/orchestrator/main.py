@@ -1226,16 +1226,6 @@ class TradingOrchestrator:
         """
         session = None
         try:
-            print(f"\n{'='*60}")
-            print(f"TRADINGVIEW SIGNAL RECEIVED")
-            print(f"{'='*60}")
-            print(f"Action: {event.event_type.value}")
-            print(f"Ticker: {event.underlying} {event.strike}{event.direction.value[0]} {event.expiry}")
-            print(f"Entry: ${event.entry_price:.2f}")
-            print(f"{'='*60}\n")
-
-            # Step 1: SKIPPED (no LLM parsing needed for structured webhook data)
-
             # Step 2: Correlate to session
             print("[2/5] Correlating to trade session...")
             session = self.session_manager.process_event(event)
@@ -1247,53 +1237,75 @@ class TradingOrchestrator:
                 print("✓ Event processed (non-actionable or ignored)")
                 return
 
-            print(f"✓ Linked to session {session.session_id[:8]}...")
-            print(f"  Session state: {session.state}")
-            print(f"  Trade: {session.underlying} {session.strike} {session.direction}")
-            print(f"  Current qty: {session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"  Current qty: {session.total_quantity}")
+            qty_info = f"{session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"{session.total_quantity}"
+            print(f"✓ Session {session.session_id[:8]} | {session.state.value} | {session.underlying} {session.strike}{session.direction.value[0]} | Qty: {qty_info}")
 
             # Step 2.5: OPTIMAL STRIKE SELECTION (TradingView NEW only)
             # Find strike with premium in target range ($0.25-$0.65)
+            # Only search during trading hours to avoid delayed data issues
             if event.event_type == EventType.NEW and event.underlying_price and not self.dry_run and self.executor.connected:
-                print("\n[2.5/5] Finding optimal strike based on premium...")
-                optimal_strike = await self._find_optimal_strike(
-                    underlying=session.underlying,
-                    direction=session.direction,
-                    expiry=session.expiry,
-                    current_price=event.underlying_price
-                )
+                # Check if in trading hours first
+                now = datetime.now(timezone.utc).time()
+                trading_start = time(*map(int, self.config["risk"]["trading_hours_start"].split(":")))
+                trading_end = time(*map(int, self.config["risk"]["trading_hours_end"].split(":")))
 
-                if optimal_strike is None:
-                    # No suitable strike found, cancel session and skip trade
-                    print(f"  ✗ No suitable strike found with premium $0.25-$0.65")
-                    print(f"  ACTION: NO TRADE (premium out of range)")
-
-                    session.state = SessionState.CANCELLED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.exit_reason = "No suitable strike (premium out of range)"
-
-                    self.logger.log_session_closed(
-                        session,
-                        reason="No suitable strike - premium out of range",
-                        final_pnl=0.0
+                if trading_start <= now <= trading_end:
+                    print("\n[2.5/5] Finding optimal strike based on premium...")
+                    optimal_strike, premium = await self._find_optimal_strike(
+                        underlying=session.underlying,
+                        direction=session.direction,
+                        expiry=session.expiry,
+                        current_price=event.underlying_price
                     )
 
-                    if self.notifier:
-                        await self.notifier.send_message(
-                            f"⚠️ <b>Trade Skipped - No Suitable Strike</b>\n\n"
-                            f"{event.underlying} {event.direction.value}\n"
-                            f"Current price: ${event.underlying_price:.2f}\n\n"
-                            f"Could not find strike with premium $0.25-$0.65\n"
-                            f"All strikes either too cheap or too expensive\n\n"
-                            f"<i>Trade skipped - waiting for better opportunity</i>"
+                    if optimal_strike is None:
+                        # No suitable strike found, cancel session and skip trade
+                        print(f"  ✗ No suitable strike found")
+                        print(f"  ACTION: NO TRADE (premium out of range)")
+
+                        session.state = SessionState.CANCELLED
+                        session.closed_at = datetime.now(timezone.utc)
+                        session.exit_reason = "No suitable strike (premium out of range)"
+
+                        self.logger.log_session_closed(
+                            session,
+                            reason="No suitable strike - premium out of range",
+                            final_pnl=0.0
                         )
 
-                    return
+                        if self.notifier:
+                            await self.notifier.send_message(
+                                f"⚠️ <b>Trade Skipped - No Suitable Strike</b>\n\n"
+                                f"{event.underlying} {event.direction.value}\n"
+                                f"Current price: ${event.underlying_price:.2f}\n\n"
+                                f"Could not find strike with premium $0.25-$0.65\n"
+                                f"All strikes either too cheap or too expensive\n\n"
+                                f"<i>Trade skipped - waiting for better opportunity</i>"
+                            )
 
-                if optimal_strike != session.strike:
-                    print(f"  ✓ Adjusted strike: ${session.strike:.0f} → ${optimal_strike:.0f}")
-                    session.strike = optimal_strike
-                    event.strike = optimal_strike
+                        return
+
+                    if optimal_strike != session.strike:
+                        original_strike = session.strike
+                        print(f"  ✓ Adjusted: ${original_strike:.0f} → ${optimal_strike:.0f} (${premium:.2f})")
+                        session.strike = optimal_strike
+                        event.strike = optimal_strike
+
+                        # Send Telegram notification about strike adjustment
+                        if self.notifier:
+                            await self.notifier.send_message(
+                                f"🎯 <b>Optimal Strike Found</b>\n\n"
+                                f"<b>Signal:</b> {event.underlying} {event.direction.value}\n"
+                                f"<b>Current Price:</b> ${event.underlying_price:.2f}\n\n"
+                                f"<b>Original:</b> ${original_strike:.0f} (TradingView)\n"
+                                f"<b>Optimal:</b> ${optimal_strike:.0f}\n"
+                                f"<b>Premium:</b> ${premium:.2f}\n\n"
+                                f"<i>Adjusted for better pricing</i>"
+                            )
+                    else:
+                        print(f"  ✓ Strike ${optimal_strike:.0f} already optimal (${premium:.2f})")
+                else:
+                    print(f"  ⚠️ Outside trading hours, skipping strike search")
 
             # Step 2.6: DIRECTION REVERSAL CHECK (TradingView only)
             # If NEW signal for opposite direction, close existing positions first
@@ -2014,7 +2026,7 @@ class TradingOrchestrator:
             except Exception as e:
                 print(f"  ⚠️ Error closing session {session.session_id}: {e}")
 
-    async def _find_optimal_strike(self, underlying: str, direction: Direction, expiry: str, current_price: float) -> Optional[float]:
+    async def _find_optimal_strike(self, underlying: str, direction: Direction, expiry: str, current_price: float) -> tuple[Optional[float], Optional[float]]:
         """
         Find optimal strike based on premium pricing.
 
@@ -2028,7 +2040,7 @@ class TradingOrchestrator:
             current_price: Current underlying price
 
         Returns:
-            Optimal strike price, or None if no suitable strike found
+            Tuple of (optimal_strike, premium), or (None, None) if no suitable strike found
         """
         from ib_insync import Option
         import math
@@ -2037,8 +2049,7 @@ class TradingOrchestrator:
         TARGET_MAX_PREMIUM = 0.65
         MAX_STRIKES_TO_CHECK = 20  # Search up to $20 away (20 strikes × $1)
 
-        print(f"  Searching for strike with premium ${TARGET_MIN_PREMIUM:.2f}-${TARGET_MAX_PREMIUM:.2f}...")
-        print(f"  Current price: ${current_price:.2f}")
+        print(f"  Searching ${TARGET_MIN_PREMIUM:.2f}-${TARGET_MAX_PREMIUM:.2f} range...")
 
         # Round current price to nearest $1 (SPY options trade in $1 increments)
         base_strike = round(current_price)
@@ -2092,24 +2103,18 @@ class TradingOrchestrator:
                 if premium is None:
                     continue
 
-                print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f}", end="")
-
                 # Check if in target range
                 if TARGET_MIN_PREMIUM <= premium <= TARGET_MAX_PREMIUM:
-                    print(f" ✓ TARGET RANGE")
-                    return strike
-                elif premium > TARGET_MAX_PREMIUM:
-                    print(f" (too expensive)")
-                else:
-                    print(f" (too cheap)")
+                    print(f"  ✓ Found ${strike:.0f}{direction.value[0]} @ ${premium:.2f}")
+                    return (strike, premium)
 
             except Exception as e:
-                print(f"    Error checking ${strike:.0f}: {e}")
+                # Silently skip invalid strikes
                 continue
 
         # No strike found in target range - return None to skip trade
-        print(f"  ⚠️ No strike found in target range $0.25-$0.65")
-        return None
+        print(f"  ✗ No strike in range (checked {MAX_STRIKES_TO_CHECK} strikes)")
+        return (None, None)
 
     async def _check_and_close_opposite_direction(self, underlying: str, new_direction: Direction):
         """

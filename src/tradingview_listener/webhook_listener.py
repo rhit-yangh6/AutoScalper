@@ -137,13 +137,10 @@ class TradingViewListener:
                     status=400
                 )
 
-            # Log received signal
+            # Log received signal (concise)
             print(f"\n{'='*60}")
             print(f"[TRADINGVIEW SIGNAL]")
-            print(f"Action: {event.event_type.value}")
-            print(f"Ticker: {event.underlying} {event.strike}{event.direction.value[0]} {event.expiry}")
-            print(f"Quantity: {event.quantity} contract(s)")
-            print(f"Note: Entry price and brackets will be calculated from live market data")
+            print(f"{event.event_type.value}: {event.underlying} {event.strike}{event.direction.value[0]} {event.expiry} x{event.quantity}")
             print(f"{'='*60}\n")
 
             # Send to orchestrator
