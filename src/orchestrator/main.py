@@ -2096,16 +2096,13 @@ class TradingOrchestrator:
 
                     contract = qualified[0]
 
-                    # Get market data (snapshot)
-                    ticker = self.executor.ib.reqMktData(contract, snapshot=True)
+                    # Get market data - use regular request (not snapshot) for better reliability
+                    ticker = self.executor.ib.reqMktData(contract, '', False, False)
 
-                    # Wait longer for snapshot data (delayed data takes time)
-                    await asyncio.sleep(2.0)
+                    # Wait for data to arrive
+                    await asyncio.sleep(1.5)
 
-                    # Force update to get latest data
-                    await self.executor.ib.sleepAsync(0)
-
-                    # Get premium (use mid price if available)
+                    # Get premium from ticker (try multiple fields)
                     premium = None
                     if ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
                         premium = (ticker.bid + ticker.ask) / 2
@@ -2113,8 +2110,15 @@ class TradingOrchestrator:
                         premium = ticker.last
                     elif ticker.close and not math.isnan(ticker.close):
                         premium = ticker.close
-                    elif ticker.marketPrice() and not math.isnan(ticker.marketPrice()):
-                        premium = ticker.marketPrice()
+
+                    # Try marketPrice as fallback
+                    if premium is None:
+                        try:
+                            mp = ticker.marketPrice()
+                            if mp and not math.isnan(mp):
+                                premium = mp
+                        except:
+                            pass
 
                     # Cancel market data (ignore cleanup errors)
                     try:
@@ -2126,7 +2130,9 @@ class TradingOrchestrator:
                     sys.stderr = original_stderr
 
                     if premium is None:
-                        print(f"    ${strike:.0f}{direction.value[0]}: [no price data]")
+                        # Debug: show what data we got
+                        debug_info = f"bid={ticker.bid}, ask={ticker.ask}, last={ticker.last}, close={ticker.close}"
+                        print(f"    ${strike:.0f}{direction.value[0]}: [no price data - {debug_info}]")
                         sys.stderr = io.StringIO()
                         continue
 
