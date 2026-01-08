@@ -2065,55 +2065,69 @@ class TradingOrchestrator:
         # Convert expiry to IBKR format (YYYYMMDD)
         expiry_ibkr = expiry.replace('-', '')
 
-        for strike in strikes_to_check:
-            try:
-                # Build option contract
-                option = Option(
-                    symbol=underlying,
-                    lastTradeDateOrContractMonth=expiry_ibkr,
-                    strike=strike,
-                    right='C' if direction == Direction.CALL else 'P',
-                    exchange='SMART'
-                )
+        # Temporarily suppress IBKR warnings about market data subscriptions
+        # (Snapshot data works fine, but IBKR prints warnings suggesting upgrades)
+        import sys
+        import io
+        original_stderr = sys.stderr
+        sys.stderr = io.StringIO()
 
-                # Qualify contract
-                qualified = await self.executor.ib.qualifyContractsAsync(option)
-                if not qualified:
+        try:
+            for strike in strikes_to_check:
+                try:
+                    # Build option contract
+                    option = Option(
+                        symbol=underlying,
+                        lastTradeDateOrContractMonth=expiry_ibkr,
+                        strike=strike,
+                        right='C' if direction == Direction.CALL else 'P',
+                        exchange='SMART'
+                    )
+
+                    # Qualify contract
+                    qualified = await self.executor.ib.qualifyContractsAsync(option)
+                    if not qualified:
+                        continue
+
+                    contract = qualified[0]
+
+                    # Get market data (snapshot)
+                    ticker = self.executor.ib.reqMktData(contract, snapshot=True)
+                    await asyncio.sleep(0.5)  # Wait for data
+
+                    # Get premium (use mid price if available)
+                    premium = None
+                    if ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+                        premium = (ticker.bid + ticker.ask) / 2
+                    elif ticker.last and not math.isnan(ticker.last):
+                        premium = ticker.last
+                    elif ticker.close and not math.isnan(ticker.close):
+                        premium = ticker.close
+
+                    # Cancel market data
+                    self.executor.ib.cancelMktData(contract)
+
+                    if premium is None:
+                        continue
+
+                    # Check if in target range
+                    if TARGET_MIN_PREMIUM <= premium <= TARGET_MAX_PREMIUM:
+                        # Restore stderr before printing success
+                        sys.stderr = original_stderr
+                        print(f"  ✓ Found ${strike:.0f}{direction.value[0]} @ ${premium:.2f}")
+                        return (strike, premium)
+
+                except Exception:
+                    # Silently skip invalid strikes
                     continue
 
-                contract = qualified[0]
-
-                # Get market data (snapshot)
-                ticker = self.executor.ib.reqMktData(contract, snapshot=True)
-                await asyncio.sleep(0.5)  # Wait for data
-
-                # Get premium (use mid price if available)
-                premium = None
-                if ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
-                    premium = (ticker.bid + ticker.ask) / 2
-                elif ticker.last and not math.isnan(ticker.last):
-                    premium = ticker.last
-                elif ticker.close and not math.isnan(ticker.close):
-                    premium = ticker.close
-
-                # Cancel market data
-                self.executor.ib.cancelMktData(contract)
-
-                if premium is None:
-                    continue
-
-                # Check if in target range
-                if TARGET_MIN_PREMIUM <= premium <= TARGET_MAX_PREMIUM:
-                    print(f"  ✓ Found ${strike:.0f}{direction.value[0]} @ ${premium:.2f}")
-                    return (strike, premium)
-
-            except Exception as e:
-                # Silently skip invalid strikes
-                continue
-
-        # No strike found in target range - return None to skip trade
-        print(f"  ✗ No strike in range (checked {MAX_STRIKES_TO_CHECK} strikes)")
-        return (None, None)
+            # No strike found in target range
+            sys.stderr = original_stderr
+            print(f"  ✗ No strike in range (checked {MAX_STRIKES_TO_CHECK} strikes)")
+            return (None, None)
+        finally:
+            # Restore stderr no matter what
+            sys.stderr = original_stderr
 
     async def _check_and_close_opposite_direction(self, underlying: str, new_direction: Direction):
         """
