@@ -409,11 +409,16 @@ class ExecutionEngine:
             from ..models import EventType
             await self.on_bracket_filled(session, EventType.TP, result)
 
-    async def _cancel_sibling_orders(self, order_ids: list[int]):
-        """Cancel sibling bracket orders when one fills (OCO behavior)."""
+    async def _cancel_sibling_orders(self, order_ids: list[int]) -> bool:
+        """
+        Cancel sibling bracket orders when one fills (OCO behavior).
+
+        Returns:
+            True if all cancellations succeeded, False otherwise
+        """
 
         if not order_ids:
-            return
+            return True
 
         cancelled_count = 0
         failed_count = 0
@@ -431,8 +436,19 @@ class ExecutionEngine:
 
                         if trade.isActive():
                             self.ib.cancelOrder(trade.order)
-                            cancelled_count += 1
-                            print(f"  ✓ Cancelled bracket order {order_id}")
+
+                            # Wait for cancellation to complete (up to 3 seconds)
+                            for _ in range(30):  # 30 attempts * 0.1s = 3 seconds max
+                                await asyncio.sleep(0.1)
+                                if trade.orderStatus.status == "Cancelled":
+                                    break
+
+                            if trade.orderStatus.status == "Cancelled":
+                                cancelled_count += 1
+                                print(f"  ✓ Cancelled bracket order {order_id}")
+                            else:
+                                failed_count += 1
+                                print(f"  ⚠️ Bracket order {order_id} cancellation timeout (status: {trade.orderStatus.status})")
                         else:
                             # Order not active - may be filling or filled
                             print(f"  ⚠️ Cannot cancel order {order_id} - Status: {status}")
@@ -457,6 +473,8 @@ class ExecutionEngine:
         if failed_count > 0:
             print(f"  ⚠️ WARNING: {failed_count}/{total} brackets could not be cancelled!")
             print(f"  ⚠️ Check for orphaned positions in IBKR")
+
+        return failed_count == 0
 
     async def execute_event(
         self,

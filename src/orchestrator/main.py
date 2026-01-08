@@ -816,6 +816,8 @@ class TradingOrchestrator:
                     # CRITICAL: Cancel bracket orders FIRST to prevent SHORT positions
                     # Find and cancel brackets before closing position
                     session_to_close = None
+                    bracket_cancel_failed = False
+
                     if hasattr(contract, 'strike'):
                         # Build session key matching IBKR format (use float for strike)
                         session_key = f"{contract.symbol} {float(contract.strike)} {contract.right} {contract.lastTradeDateOrContractMonth}"
@@ -828,13 +830,22 @@ class TradingOrchestrator:
                                     # Cancel brackets FIRST
                                     if session.stop_order_id or session.target_order_ids:
                                         print(f"    Cancelling brackets for {symbol}...")
-                                        await self._cancel_session_brackets(session)
+                                        success = await self._cancel_session_brackets(session)
                                         bracket_count = (1 if session.stop_order_id else 0) + len(session.target_order_ids or [])
-                                        text += f"  🛑 Cancelled {bracket_count} bracket order(s)\n"
 
-                                        # Wait for cancellations to propagate through IBKR
-                                        await asyncio.sleep(0.5)
+                                        if not success:
+                                            text += f"  ⚠️ Failed to cancel {bracket_count} bracket(s) - SKIPPING close\n"
+                                            bracket_cancel_failed = True
+                                        else:
+                                            text += f"  🛑 Cancelled {bracket_count} bracket order(s)\n"
+                                            # Extra buffer for IBKR to propagate cancellations
+                                            await asyncio.sleep(0.5)
                                     break
+
+                    # Skip this position if bracket cancellation failed
+                    if bracket_cancel_failed:
+                        failed_count += 1
+                        continue
 
                     # Determine order action (BUY to close SHORT, SELL to close LONG)
                     action = "BUY" if quantity < 0 else "SELL"
@@ -2172,7 +2183,12 @@ class TradingOrchestrator:
 
                 # Cancel brackets FIRST to prevent SHORT positions
                 if session.stop_order_id or session.target_order_ids:
-                    await self._cancel_session_brackets(session)
+                    success = await self._cancel_session_brackets(session)
+
+                    if not success:
+                        print(f"    ✗ Failed to cancel brackets - SKIPPING close")
+                        continue  # Skip this session
+
                     print(f"    ✓ Brackets cancelled")
 
                     # Wait for cancellations to propagate through IBKR
@@ -2263,8 +2279,13 @@ class TradingOrchestrator:
                 import traceback
                 traceback.print_exc()
 
-    async def _cancel_session_brackets(self, session: TradeSession):
-        """Cancel all bracket orders for a session."""
+    async def _cancel_session_brackets(self, session: TradeSession) -> bool:
+        """
+        Cancel all bracket orders for a session.
+
+        Returns:
+            True if all cancellations succeeded, False otherwise
+        """
         order_ids_to_cancel = []
 
         if session.stop_order_id:
@@ -2273,7 +2294,9 @@ class TradingOrchestrator:
             order_ids_to_cancel.extend(session.target_order_ids)
 
         if order_ids_to_cancel:
-            await self.executor._cancel_sibling_orders(order_ids_to_cancel)
+            return await self.executor._cancel_sibling_orders(order_ids_to_cancel)
+
+        return True  # No brackets to cancel
 
 
 async def main():
