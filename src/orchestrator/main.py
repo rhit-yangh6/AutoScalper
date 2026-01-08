@@ -2104,14 +2104,19 @@ class TradingOrchestrator:
                     elif ticker.close and not math.isnan(ticker.close):
                         premium = ticker.close
 
-                    # Cancel market data
-                    self.executor.ib.cancelMktData(contract)
+                    # Cancel market data (ignore cleanup errors)
+                    try:
+                        self.executor.ib.cancelMktData(contract)
+                    except:
+                        pass
 
                     if premium is None:
                         continue
 
                     # Check if in target range
                     if TARGET_MIN_PREMIUM <= premium <= TARGET_MAX_PREMIUM:
+                        # Wait for any pending IBKR cleanup
+                        await asyncio.sleep(0.1)
                         # Restore stderr before printing success
                         sys.stderr = original_stderr
                         print(f"  ✓ Found ${strike:.0f}{direction.value[0]} @ ${premium:.2f}")
@@ -2122,11 +2127,13 @@ class TradingOrchestrator:
                     continue
 
             # No strike found in target range
+            # Wait for any pending IBKR cleanup before restoring stderr
+            await asyncio.sleep(0.1)
             sys.stderr = original_stderr
             print(f"  ✗ No strike in range (checked {MAX_STRIKES_TO_CHECK} strikes)")
             return (None, None)
         finally:
-            # Restore stderr no matter what
+            # Ensure stderr is always restored
             sys.stderr = original_stderr
 
     async def _check_and_close_opposite_direction(self, underlying: str, new_direction: Direction):
