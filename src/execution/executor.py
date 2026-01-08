@@ -619,6 +619,29 @@ class ExecutionEngine:
                 elif market_last:
                     print(f"  📊 Market: Last ${market_last:.2f}")
 
+                # Check minimum premium requirement ($0.15)
+                # Prevents trading options that are too cheap (too far OTM or illiquid)
+                MIN_PREMIUM = 0.15
+                premium_to_check = market_ask if market_ask else market_last
+
+                if premium_to_check and premium_to_check < MIN_PREMIUM:
+                    print(f"  ❌ Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f} - REJECTING trade")
+                    print(f"     Options this cheap are typically too far OTM or illiquid")
+
+                    # Close session immediately
+                    session.state = SessionState.CLOSED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.updated_at = datetime.now(timezone.utc)
+                    session.exit_reason = "PREMIUM_TOO_LOW"
+
+                    return OrderResult(
+                        success=False,
+                        order_id=None,
+                        status=OrderStatus.REJECTED,
+                        filled_price=None,
+                        message=f"Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f}"
+                    )
+
                 # Determine entry price with 5-cent flexibility
                 alert_price = event.entry_price or (market_ask if market_ask else market_last)
 
