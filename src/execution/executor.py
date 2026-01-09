@@ -1962,8 +1962,22 @@ class ExecutionEngine:
         # Get contract info for market data
         contract = trade.contract
         order = trade.order
-        limit_price = order.lmtPrice if hasattr(order, 'lmtPrice') and order.lmtPrice else None
-        is_limit_order = limit_price is not None
+
+        # Check if this is a LIMIT order (not MARKET)
+        # CRITICAL: MarketOrder may have lmtPrice set to infinity/huge value by IBKR
+        import math
+        from ib_insync import LimitOrder
+
+        is_limit_order = isinstance(order, LimitOrder)
+        limit_price = None
+
+        if is_limit_order and hasattr(order, 'lmtPrice') and order.lmtPrice:
+            # Validate limit price is reasonable (not infinity)
+            if not math.isinf(order.lmtPrice) and not math.isnan(order.lmtPrice):
+                limit_price = order.lmtPrice
+            else:
+                print(f"  ⚠️ Invalid limit price detected: {order.lmtPrice}")
+                is_limit_order = False
 
         # Request market data for real-time updates
         ticker = None
@@ -2040,7 +2054,10 @@ class ExecutionEngine:
 
                     if bid and ask:
                         print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status})")
-                        print(f"     Market: Bid ${bid:.2f} | Ask ${ask:.2f} | Limit ${limit_price:.2f}")
+                        if is_limit_order and limit_price:
+                            print(f"     Market: Bid ${bid:.2f} | Ask ${ask:.2f} | Limit ${limit_price:.2f}")
+                        else:
+                            print(f"     Market: Bid ${bid:.2f} | Ask ${ask:.2f}")
                         print(f"     Ticker update: {ticker.time if hasattr(ticker, 'time') else 'live'}")
                     else:
                         print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status}, market data pending...)")
