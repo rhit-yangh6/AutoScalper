@@ -613,10 +613,31 @@ class ExecutionEngine:
 
             # Check minimum premium requirement ($0.15) - APPLIES TO ALL ORDERS
             # Prevents trading options that are too cheap (too far OTM or illiquid)
+            # Also prevents trading when we can't verify premium (no market data)
             MIN_PREMIUM = 0.15
             premium_to_check = market_ask if market_ask else market_last
 
-            if premium_to_check and premium_to_check < MIN_PREMIUM:
+            if not premium_to_check:
+                # No market data available - cannot verify premium
+                print(f"  ❌ No market data available - REJECTING trade")
+                print(f"     Cannot verify premium meets ${MIN_PREMIUM:.2f} minimum")
+                print(f"     This usually means markets are closed or data subscription issue")
+
+                # Close session immediately
+                session.state = SessionState.CLOSED
+                session.closed_at = datetime.now(timezone.utc)
+                session.updated_at = datetime.now(timezone.utc)
+                session.exit_reason = "NO_MARKET_DATA"
+
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    status=OrderStatus.REJECTED,
+                    filled_price=None,
+                    message=f"No market data available - cannot verify ${MIN_PREMIUM:.2f} minimum premium"
+                )
+
+            if premium_to_check < MIN_PREMIUM:
                 print(f"  ❌ Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f} - REJECTING trade")
                 print(f"     Options this cheap are typically too far OTM or illiquid")
 
