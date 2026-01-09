@@ -597,14 +597,35 @@ class ExecutionEngine:
             import math
 
             print(f"  Fetching current market data...")
-            ticker = self.ib.reqMktData(contract)
-            await asyncio.sleep(1)  # Wait for real-time data
+            ticker = self.ib.reqMktData(contract, snapshot=False)  # Request streaming data with OPRA
 
-            # Handle NaN and None values
-            market_bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-            market_ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-            market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+            # Wait up to 3 seconds for market data (OPRA subscription should be fast)
+            market_bid = None
+            market_ask = None
+            market_last = None
 
+            for attempt in range(6):  # 6 attempts × 0.5s = 3 seconds max
+                await asyncio.sleep(0.5)
+
+                # Check for valid data
+                market_bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
+                market_ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
+                market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
+
+                # Got valid price data
+                if market_bid or market_ask or market_last:
+                    break
+
+                if attempt == 5:
+                    print(f"  ⚠️ No market data after 3s - check OPRA subscription status")
+
+            # Cancel market data subscription to clean up
+            try:
+                self.ib.cancelMktData(contract)
+            except:
+                pass
+
+            # Log what we got
             if market_bid and market_ask:
                 last_str = f"${market_last:.2f}" if market_last else "N/A"
                 print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last {last_str}")
