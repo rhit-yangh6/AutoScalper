@@ -1268,11 +1268,10 @@ class TradingOrchestrator:
                 print(f"  Current price: ${event.underlying_price:.2f}")
                 print(f"  Direction: {session.direction.value}")
 
-                # Calculate starting strike ($2.50 offset from current price)
-                if session.direction == Direction.CALL:
-                    start_strike = round(event.underlying_price + 2.5)
-                else:
-                    start_strike = round(event.underlying_price - 2.5)
+                # Start search from current price (rounded to nearest $1)
+                # For CALL: searches UP (away from money)
+                # For PUT: searches DOWN (away from money)
+                start_strike = round(event.underlying_price)
 
                 # Search for optimal strike
                 optimal_strike = await self._search_optimal_strike(
