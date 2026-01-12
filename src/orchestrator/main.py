@@ -1261,26 +1261,49 @@ class TradingOrchestrator:
             qty_info = f"{session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"{session.total_quantity}"
             print(f"✓ Session {session.session_id[:8]} | {session.state.value} | {session.underlying} {session.strike}{session.direction.value[0]} | Qty: {qty_info}")
 
-            # Step 2.5: STRIKE ADJUSTMENT (TradingView NEW only)
-            # Use fixed $2.50 offset from current price
-            if event.event_type == EventType.NEW and event.underlying_price:
-                original_strike = session.strike
+            # Step 2.5: STRIKE SEARCH (TradingView NEW only)
+            # Search for optimal strike with premium in $0.25-$0.60 range
+            if event.event_type == EventType.NEW and event.underlying_price and not self.dry_run:
+                print(f"\n[2.5/5] Searching for optimal strike...")
+                print(f"  Current price: ${event.underlying_price:.2f}")
+                print(f"  Direction: {session.direction.value}")
 
-                # Calculate strike with $2.50 offset
+                # Calculate starting strike ($2.50 offset from current price)
                 if session.direction == Direction.CALL:
-                    # CALL: Add $2.50 and round to nearest $1
-                    adjusted_strike = round(event.underlying_price + 2.5)
+                    start_strike = round(event.underlying_price + 2.5)
                 else:
-                    # PUT: Subtract $2.50 and round to nearest $1
-                    adjusted_strike = round(event.underlying_price - 2.5)
+                    start_strike = round(event.underlying_price - 2.5)
 
-                if adjusted_strike != original_strike:
-                    print(f"\n[2.5/5] Adjusting strike...")
-                    print(f"  Current price: ${event.underlying_price:.2f}")
-                    print(f"  Adjusted: ${original_strike:.0f} → ${adjusted_strike:.0f} (${2.5:.2f} offset)")
+                # Search for optimal strike
+                optimal_strike = await self._search_optimal_strike(
+                    underlying=session.underlying,
+                    direction=session.direction,
+                    start_strike=start_strike,
+                    expiry=session.expiry
+                )
 
-                    session.strike = adjusted_strike
-                    event.strike = adjusted_strike
+                if optimal_strike:
+                    original_strike = session.strike
+                    session.strike = optimal_strike
+                    event.strike = optimal_strike
+                    print(f"  ✓ Optimal strike found: ${original_strike:.0f} → ${optimal_strike:.0f}")
+                else:
+                    # No suitable strike found (Telegram notification already sent by search method)
+                    print(f"  ❌ No suitable strike found (premium $0.25-$0.60)")
+                    print(f"     All strikes either too cheap or too expensive")
+
+                    # Cancel session
+                    session.state = SessionState.CANCELLED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.exit_reason = "NO_SUITABLE_STRIKE"
+
+                    self.logger.log_session_closed(
+                        session,
+                        reason="No suitable strike found (premium outside $0.25-$0.60 range)",
+                        final_pnl=0.0
+                    )
+
+                    return  # Stop processing
 
             # Step 3: Risk validation
             print("\n[3/5] Validating with risk gate...")
@@ -2139,6 +2162,168 @@ class TradingOrchestrator:
         finally:
             # Ensure stderr is always restored
             sys.stderr = original_stderr
+
+    async def _search_optimal_strike(
+        self,
+        underlying: str,
+        direction: Direction,
+        start_strike: float,
+        expiry: str
+    ) -> Optional[float]:
+        """
+        Search for optimal strike with premium in $0.25-$0.60 range.
+
+        Searches 7 strikes total, $1 apart, starting from start_strike.
+        - For CALL: searches UP (start, start+1, start+2, ..., start+6)
+        - For PUT: searches DOWN (start, start-1, start-2, ..., start-6)
+
+        Args:
+            underlying: Symbol (e.g., "SPY")
+            direction: CALL or PUT
+            start_strike: Starting strike to search from
+            expiry: Expiry date (YYYY-MM-DD)
+
+        Returns:
+            Optimal strike with premium in range, or None if not found
+        """
+        from ib_insync import Option
+        import math
+
+        MIN_PREMIUM = 0.25
+        MAX_PREMIUM = 0.60
+        NUM_STRIKES = 7
+
+        print(f"  Target premium: ${MIN_PREMIUM:.2f}-${MAX_PREMIUM:.2f}")
+        print(f"  Checking {NUM_STRIKES} strikes starting at ${start_strike:.0f}...")
+
+        # Send initial Telegram notification
+        if self.notifier:
+            await self.notifier.send_message(
+                f"<b>🔍 Searching for Optimal Strike</b>\n\n"
+                f"<b>Symbol:</b> {underlying} {direction.value}\n"
+                f"<b>Target Premium:</b> ${MIN_PREMIUM:.2f}-${MAX_PREMIUM:.2f}\n"
+                f"<b>Starting Strike:</b> ${start_strike:.0f}\n"
+                f"<b>Checking:</b> {NUM_STRIKES} strikes\n\n"
+                f"<i>Checking strikes now...</i>"
+            )
+
+        # Build list of strikes to check
+        if direction == Direction.CALL:
+            # CALL: search upward (higher strikes)
+            strikes = [start_strike + i for i in range(NUM_STRIKES)]
+        else:
+            # PUT: search downward (lower strikes)
+            strikes = [start_strike - i for i in range(NUM_STRIKES)]
+            strikes = [s for s in strikes if s > 0]  # No negative strikes
+
+        # Convert expiry to IBKR format
+        expiry_ibkr = expiry.replace('-', '')
+
+        # Track results for summary message
+        strike_results = []
+
+        for strike in strikes:
+            try:
+                # Build option contract
+                option = Option(
+                    symbol=underlying,
+                    lastTradeDateOrContractMonth=expiry_ibkr,
+                    strike=strike,
+                    right='C' if direction == Direction.CALL else 'P',
+                    exchange='SMART'
+                )
+
+                # Qualify contract
+                qualified = await self.executor.ib.qualifyContractsAsync(option)
+                if not qualified:
+                    print(f"    ${strike:.0f}{direction.value[0]}: [contract not found]")
+                    continue
+
+                contract = qualified[0]
+
+                # Get market data with OPRA
+                ticker = self.executor.ib.reqMktData(contract, snapshot=False)
+
+                # Wait for data (OPRA should be fast)
+                for attempt in range(4):  # 4 × 0.5s = 2 seconds max per strike
+                    await asyncio.sleep(0.5)
+
+                    # Check for valid bid/ask
+                    if ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+                        break
+
+                # Get premium (use ask for entry, or mid if both available)
+                premium = None
+                if ticker.ask and not math.isnan(ticker.ask):
+                    premium = ticker.ask
+                elif ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+                    premium = (ticker.bid + ticker.ask) / 2
+                elif ticker.last and not math.isnan(ticker.last):
+                    premium = ticker.last
+
+                # Cancel market data subscription
+                try:
+                    self.executor.ib.cancelMktData(contract)
+                except:
+                    pass
+
+                if premium is None:
+                    print(f"    ${strike:.0f}{direction.value[0]}: [no price data]")
+                    strike_results.append((strike, None, "no data"))
+                    continue
+
+                # Check if in target range
+                if MIN_PREMIUM <= premium <= MAX_PREMIUM:
+                    print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} ✓ SELECTED")
+                    strike_results.append((strike, premium, "selected"))
+
+                    # Send success notification
+                    if self.notifier:
+                        result_text = "\n".join([
+                            f"${s:.0f}{direction.value[0]}: "
+                            f"{'[no data]' if p is None else f'${p:.2f}' if status == 'selected' else f'${p:.2f} ({status})'}"
+                            for s, p, status in strike_results
+                        ])
+
+                        await self.notifier.send_message(
+                            f"<b>✅ Optimal Strike Selected</b>\n\n"
+                            f"<b>Strike:</b> ${strike:.0f}{direction.value[0]}\n"
+                            f"<b>Premium:</b> ${premium:.2f}\n\n"
+                            f"<b>Search Results:</b>\n"
+                            f"<code>{result_text}</code>"
+                        )
+
+                    return strike
+                elif premium > MAX_PREMIUM:
+                    print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} (too expensive)")
+                    strike_results.append((strike, premium, "too expensive"))
+                elif premium < MIN_PREMIUM:
+                    print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} (too cheap)")
+                    strike_results.append((strike, premium, "too cheap"))
+
+            except Exception as e:
+                print(f"    ${strike:.0f}{direction.value[0]}: [error: {str(e)[:50]}]")
+                strike_results.append((strike, None, "error"))
+                continue
+
+        # No suitable strike found - send summary
+        if self.notifier:
+            result_text = "\n".join([
+                f"${s:.0f}{direction.value[0]}: "
+                f"{'[no data]' if p is None else f'${p:.2f} ({status})'}"
+                for s, p, status in strike_results
+            ])
+
+            await self.notifier.send_message(
+                f"<b>❌ No Suitable Strike Found</b>\n\n"
+                f"<b>Symbol:</b> {underlying} {direction.value}\n"
+                f"<b>Target:</b> ${MIN_PREMIUM:.2f}-${MAX_PREMIUM:.2f}\n\n"
+                f"<b>Strikes Checked:</b>\n"
+                f"<code>{result_text}</code>\n\n"
+                f"<i>Trade rejected - no strike in range</i>"
+            )
+
+        return None
 
     async def _check_and_close_opposite_direction(self, underlying: str, new_direction: Direction):
         """
