@@ -1264,6 +1264,50 @@ class TradingOrchestrator:
             # Step 2.5: STRIKE SEARCH (TradingView NEW only)
             # Search for optimal strike with premium in $0.25-$0.60 range
             if event.event_type == EventType.NEW and event.underlying_price and not self.dry_run:
+                # Check if we're in trading hours before searching
+                from datetime import datetime, timezone
+                import pytz
+
+                now_utc = datetime.now(timezone.utc)
+                now_et = now_utc.astimezone(pytz.timezone('America/New_York'))
+
+                # Market hours: 9:30 AM - 4:00 PM ET, Monday-Friday
+                is_weekday = now_et.weekday() < 5  # 0=Monday, 4=Friday
+                market_open = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
+                market_closed = now_et.hour >= 16
+                in_trading_hours = is_weekday and market_open and not market_closed
+
+                if not in_trading_hours:
+                    day_name = now_et.strftime('%A')
+                    time_et = now_et.strftime('%I:%M %p ET')
+
+                    print(f"\n[2.5/5] Outside trading hours - rejecting trade")
+                    print(f"  Current time: {day_name} {time_et}")
+                    print(f"  Market hours: Mon-Fri 9:30 AM - 4:00 PM ET")
+
+                    # Cancel session
+                    session.state = SessionState.CANCELLED
+                    session.closed_at = datetime.now(timezone.utc)
+                    session.exit_reason = "OUTSIDE_TRADING_HOURS"
+
+                    self.logger.log_session_closed(
+                        session,
+                        reason=f"Outside trading hours ({day_name} {time_et})",
+                        final_pnl=0.0
+                    )
+
+                    # Send Telegram notification
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            f"<b>⏰ Trade Rejected - Outside Trading Hours</b>\n\n"
+                            f"<b>Symbol:</b> {session.underlying} {session.direction.value}\n"
+                            f"<b>Current Time:</b> {day_name} {time_et}\n\n"
+                            f"<b>Market Hours:</b> Mon-Fri 9:30 AM - 4:00 PM ET\n\n"
+                            f"<i>Cannot execute trades outside market hours</i>"
+                        )
+
+                    return  # Stop processing
+
                 print(f"\n[2.5/5] Searching for optimal strike...")
                 print(f"  Current price: ${event.underlying_price:.2f}")
                 print(f"  Direction: {session.direction.value}")
