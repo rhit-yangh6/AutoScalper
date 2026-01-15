@@ -1272,18 +1272,30 @@ class TradingOrchestrator:
                 now_et = now_utc.astimezone(pytz.timezone('America/New_York'))
 
                 # Market hours: 9:30 AM - 4:00 PM ET, Monday-Friday
+                # But reject trades in last 30 min (3:30 PM - 4:00 PM ET)
                 is_weekday = now_et.weekday() < 5  # 0=Monday, 4=Friday
                 market_open = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
                 market_closed = now_et.hour >= 16
-                in_trading_hours = is_weekday and market_open and not market_closed
+                in_last_30_min = now_et.hour == 15 and now_et.minute >= 30  # 3:30 PM - 3:59 PM ET
+
+                in_trading_hours = is_weekday and market_open and not market_closed and not in_last_30_min
 
                 if not in_trading_hours:
                     day_name = now_et.strftime('%A')
                     time_et = now_et.strftime('%I:%M %p ET')
 
-                    print(f"\n[2.5/5] Outside trading hours - rejecting trade")
-                    print(f"  Current time: {day_name} {time_et}")
-                    print(f"  Market hours: Mon-Fri 9:30 AM - 4:00 PM ET")
+                    # Determine specific reason
+                    if in_last_30_min:
+                        reason = "Last 30 minutes of trading (too close to close)"
+                        print(f"\n[2.5/5] Too close to market close - rejecting trade")
+                        print(f"  Current time: {day_name} {time_et}")
+                        print(f"  Trading window: Mon-Fri 9:30 AM - 3:30 PM ET")
+                        print(f"  No new trades in last 30 min (3:30-4:00 PM ET)")
+                    else:
+                        reason = "Outside trading hours"
+                        print(f"\n[2.5/5] Outside trading hours - rejecting trade")
+                        print(f"  Current time: {day_name} {time_et}")
+                        print(f"  Market hours: Mon-Fri 9:30 AM - 4:00 PM ET")
 
                     # Cancel session
                     session.state = SessionState.CANCELLED
@@ -1292,19 +1304,28 @@ class TradingOrchestrator:
 
                     self.logger.log_session_closed(
                         session,
-                        reason=f"Outside trading hours ({day_name} {time_et})",
+                        reason=f"{reason} ({day_name} {time_et})",
                         final_pnl=0.0
                     )
 
                     # Send Telegram notification
                     if self.notifier:
-                        await self.notifier.send_message(
-                            f"<b>⏰ Trade Rejected - Outside Trading Hours</b>\n\n"
-                            f"<b>Symbol:</b> {session.underlying} {session.direction.value}\n"
-                            f"<b>Current Time:</b> {day_name} {time_et}\n\n"
-                            f"<b>Market Hours:</b> Mon-Fri 9:30 AM - 4:00 PM ET\n\n"
-                            f"<i>Cannot execute trades outside market hours</i>"
-                        )
+                        if in_last_30_min:
+                            await self.notifier.send_message(
+                                f"<b>⏰ Trade Rejected - Too Close to Market Close</b>\n\n"
+                                f"<b>Symbol:</b> {session.underlying} {session.direction.value}\n"
+                                f"<b>Current Time:</b> {day_name} {time_et}\n\n"
+                                f"<b>Trading Window:</b> Mon-Fri 9:30 AM - 3:30 PM ET\n\n"
+                                f"<i>No new trades allowed in last 30 minutes (3:30-4:00 PM ET)</i>"
+                            )
+                        else:
+                            await self.notifier.send_message(
+                                f"<b>⏰ Trade Rejected - Outside Trading Hours</b>\n\n"
+                                f"<b>Symbol:</b> {session.underlying} {session.direction.value}\n"
+                                f"<b>Current Time:</b> {day_name} {time_et}\n\n"
+                                f"<b>Market Hours:</b> Mon-Fri 9:30 AM - 4:00 PM ET\n\n"
+                                f"<i>Cannot execute trades outside market hours</i>"
+                            )
 
                     return  # Stop processing
 
