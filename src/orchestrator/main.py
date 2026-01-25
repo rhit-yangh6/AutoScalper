@@ -9,6 +9,10 @@ import asyncio
 from datetime import datetime, time, timezone
 from typing import Optional
 
+# Fix for ib_insync event loop conflict
+import nest_asyncio
+nest_asyncio.apply()
+
 from dotenv import load_dotenv
 
 from ..risk_gate import RiskGate, RiskDecision
