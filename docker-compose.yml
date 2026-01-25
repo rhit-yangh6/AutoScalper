@@ -12,9 +12,12 @@ services:
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-changeme}
       - TIME_ZONE=America/Los_Angeles
       - READ_ONLY_API=no
-      - TWOFA_TIMEOUT_ACTION=restart  # Auto-restart on 2FA timeout
-      - AUTO_RESTART_TIME=2345  # Restart at 11:45 PM PT daily
+      # Reconnect mode: survive disconnects without re-auth
+      - AUTO_RESTART_TIME=  # Disable auto restart
       - RELOGIN_AFTER_2FA_TIMEOUT=yes
+      - TWOFA_TIMEOUT_ACTION=restart
+      # Keep gateway alive through disconnects
+      - EXISTINGSESSIONDETECTED=secondary  # Allow reconnect if session exists
     ports:
       - "127.0.0.1:4001:4003"  # Host 4001 → Container 4003 (live trading API)
       - "127.0.0.1:4002:4004"  # Host 4002 → Container 4004 (paper trading API)
