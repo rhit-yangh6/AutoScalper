@@ -517,3 +517,90 @@ class TradingOrchestrator:
             return "❌ <b>Docker Not Found</b>\n\nDocker or docker compose is not installed."
         except Exception as e:
             return f"❌ Error: {str(e)}"
+
+
+def load_config(config_path: str = "config/config.yaml") -> dict:
+    """Load configuration from YAML file with environment variable substitution."""
+    import os
+    import yaml
+    from pathlib import Path
+
+    # Load .env file
+    load_dotenv()
+
+    config_file = Path(config_path)
+    if not config_file.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Substitute environment variables (${VAR_NAME} syntax)
+    def substitute_env(obj):
+        if isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
+            var_name = obj[2:-1]
+            return os.getenv(var_name, obj)
+        elif isinstance(obj, dict):
+            return {k: substitute_env(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [substitute_env(item) for item in obj]
+        return obj
+
+    config = substitute_env(config)
+
+    # Also check for direct environment variable overrides
+    env_overrides = {
+        "dry_run": ("DRY_RUN", lambda x: x.lower() == "true"),
+        "risk.num_contracts": ("NUM_CONTRACTS", int),
+        "risk.margin_per_contract": ("MARGIN_PER_CONTRACT", float),
+        "risk.margin_buffer": ("MARGIN_BUFFER", float),
+        "risk.daily_max_loss": ("DAILY_MAX_LOSS", float),
+        "risk.max_loss_streak": ("MAX_LOSS_STREAK", int),
+        "ibkr.host": ("IBKR_HOST", str),
+        "ibkr.port": ("IBKR_PORT", int),
+        "ibkr.client_id": ("IBKR_CLIENT_ID", int),
+    }
+
+    for path, (env_var, converter) in env_overrides.items():
+        value = os.getenv(env_var)
+        if value is not None:
+            keys = path.split(".")
+            obj = config
+            for key in keys[:-1]:
+                obj = obj.setdefault(key, {})
+            obj[keys[-1]] = converter(value)
+
+    return config
+
+
+if __name__ == "__main__":
+    import sys
+
+    # Default config path
+    config_path = "config/config.yaml"
+
+    # Allow config path override via command line
+    if len(sys.argv) > 1:
+        config_path = sys.argv[1]
+
+    try:
+        print("Loading configuration...")
+        config = load_config(config_path)
+
+        print("Creating orchestrator...")
+        orchestrator = TradingOrchestrator(config)
+
+        print("Starting...")
+        asyncio.run(orchestrator.start())
+
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}")
+        print("Please copy config/config.example.yaml to config/config.yaml")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nShutdown requested.")
+    except Exception as e:
+        import traceback
+        print(f"FATAL ERROR: {e}")
+        traceback.print_exc()
+        sys.exit(1)
