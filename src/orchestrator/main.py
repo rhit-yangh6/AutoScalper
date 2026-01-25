@@ -519,73 +519,62 @@ class TradingOrchestrator:
             return f"❌ Error: {str(e)}"
 
 
-def load_config(config_path: str = "config/config.yaml") -> dict:
-    """Load configuration from YAML file with environment variable substitution."""
+def load_config() -> dict:
+    """Load configuration from .env file."""
     import os
-    import yaml
-    from pathlib import Path
 
     # Load .env file
     load_dotenv()
 
-    config_file = Path(config_path)
-    if not config_file.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+    def env(key: str, default=None, cast=str):
+        """Get env var with optional type casting."""
+        value = os.getenv(key, default)
+        if value is None:
+            return None
+        if cast == bool:
+            return str(value).lower() in ("true", "1", "yes")
+        return cast(value)
 
-    with open(config_file, 'r') as f:
-        config = yaml.safe_load(f)
+    config = {
+        "dry_run": env("DRY_RUN", "true", bool),
+        "log_dir": env("LOG_DIR", "logs"),
 
-    # Substitute environment variables (${VAR_NAME} syntax)
-    def substitute_env(obj):
-        if isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
-            var_name = obj[2:-1]
-            return os.getenv(var_name, obj)
-        elif isinstance(obj, dict):
-            return {k: substitute_env(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [substitute_env(item) for item in obj]
-        return obj
+        "ibkr": {
+            "host": env("IBKR_HOST", "127.0.0.1"),
+            "port": env("IBKR_PORT", 4002, int),
+            "client_id": env("IBKR_CLIENT_ID", 1, int),
+        },
 
-    config = substitute_env(config)
+        "tradingview": {
+            "webhook_port": env("TRADINGVIEW_WEBHOOK_PORT", 8080, int),
+            "webhook_secret": env("TRADINGVIEW_WEBHOOK_SECRET", ""),
+        },
 
-    # Also check for direct environment variable overrides
-    env_overrides = {
-        "dry_run": ("DRY_RUN", lambda x: x.lower() == "true"),
-        "risk.num_contracts": ("NUM_CONTRACTS", int),
-        "risk.margin_per_contract": ("MARGIN_PER_CONTRACT", float),
-        "risk.margin_buffer": ("MARGIN_BUFFER", float),
-        "risk.daily_max_loss": ("DAILY_MAX_LOSS", float),
-        "risk.max_loss_streak": ("MAX_LOSS_STREAK", int),
-        "ibkr.host": ("IBKR_HOST", str),
-        "ibkr.port": ("IBKR_PORT", int),
-        "ibkr.client_id": ("IBKR_CLIENT_ID", int),
+        "risk": {
+            "account_balance": env("ACCOUNT_BALANCE", 10000, float),
+            "num_contracts": env("NUM_CONTRACTS", 1, int),
+            "margin_per_contract": env("MARGIN_PER_CONTRACT", 2000, float),
+            "margin_buffer": env("MARGIN_BUFFER", 0.80, float),
+            "daily_max_loss": env("DAILY_MAX_LOSS", 500, float),
+            "max_loss_streak": env("MAX_LOSS_STREAK", 3, int),
+            "maintenance_start": env("MAINTENANCE_START", "23:00"),
+            "maintenance_end": env("MAINTENANCE_END", "01:00"),
+        },
+
+        "telegram": {
+            "enabled": env("TELEGRAM_ENABLED", "false", bool),
+            "bot_token": env("TELEGRAM_BOT_TOKEN", ""),
+            "chat_id": env("TELEGRAM_CHAT_ID", ""),
+        },
     }
-
-    for path, (env_var, converter) in env_overrides.items():
-        value = os.getenv(env_var)
-        if value is not None:
-            keys = path.split(".")
-            obj = config
-            for key in keys[:-1]:
-                obj = obj.setdefault(key, {})
-            obj[keys[-1]] = converter(value)
 
     return config
 
 
 if __name__ == "__main__":
-    import sys
-
-    # Default config path
-    config_path = "config/config.yaml"
-
-    # Allow config path override via command line
-    if len(sys.argv) > 1:
-        config_path = sys.argv[1]
-
     try:
-        print("Loading configuration...")
-        config = load_config(config_path)
+        print("Loading configuration from .env...")
+        config = load_config()
 
         print("Creating orchestrator...")
         orchestrator = TradingOrchestrator(config)
@@ -593,14 +582,11 @@ if __name__ == "__main__":
         print("Starting...")
         asyncio.run(orchestrator.start())
 
-    except FileNotFoundError as e:
-        print(f"ERROR: {e}")
-        print("Please copy config/config.example.yaml to config/config.yaml")
-        sys.exit(1)
     except KeyboardInterrupt:
         print("\nShutdown requested.")
     except Exception as e:
         import traceback
         print(f"FATAL ERROR: {e}")
         traceback.print_exc()
+        import sys
         sys.exit(1)
