@@ -73,6 +73,7 @@ class ExecutionEngine:
         self.session_manager = session_manager
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 999999
+        self._account_summary_subscribed = False
 
     async def connect(self) -> bool:
         """Connect to IBKR TWS/Gateway."""
@@ -106,9 +107,11 @@ class ExecutionEngine:
     async def _display_account_balance(self):
         """Display current account balance."""
         try:
-            # Request account summary and wait for data
-            self.ib.reqAccountSummary()
-            await asyncio.sleep(1)  # Wait for data to arrive
+            # Subscribe to account summary once (stays subscribed)
+            if not self._account_summary_subscribed:
+                self.ib.reqAccountSummary()
+                self._account_summary_subscribed = True
+                await asyncio.sleep(1)  # Wait for initial data
 
             account_values = self.ib.accountSummary()
             for av in account_values:
@@ -121,6 +124,7 @@ class ExecutionEngine:
     def _on_disconnected(self):
         """Callback when IBKR connection is lost."""
         self.connected = False
+        self._account_summary_subscribed = False  # Reset so we re-subscribe on reconnect
         print("IBKR connection lost! Auto-reconnection will attempt...")
 
     async def reconnect(self) -> bool:
@@ -150,6 +154,7 @@ class ExecutionEngine:
         if self.connected:
             self.ib.disconnect()
             self.connected = False
+            self._account_summary_subscribed = False
             print("Disconnected from IBKR")
 
     def activate_kill_switch(self, reason: str) -> None:
@@ -502,10 +507,13 @@ class ExecutionEngine:
     async def get_account_balance(self) -> Optional[float]:
         """Get current account balance."""
         try:
-            # Request fresh account summary
-            self.ib.reqAccountSummary()
-            await asyncio.sleep(0.5)  # Wait for data
+            # Subscribe once if not already subscribed
+            if not self._account_summary_subscribed:
+                self.ib.reqAccountSummary()
+                self._account_summary_subscribed = True
+                await asyncio.sleep(0.5)  # Wait for initial data
 
+            # Read from cached/live data (subscription keeps it updated)
             account_values = self.ib.accountSummary()
             for av in account_values:
                 if av.tag == "NetLiquidation":
