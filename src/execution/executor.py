@@ -92,6 +92,9 @@ class ExecutionEngine:
             self.ib.reqMarketDataType(3)
             print("Using delayed market data")
 
+            # Get front-month contract
+            await self._get_front_month_contract("MNQ")
+
             await self._display_account_balance()
 
             return True
@@ -210,12 +213,44 @@ class ExecutionEngine:
             )
 
     def _build_contract(self, symbol: str = "MNQ") -> Future:
-        """Build MNQ futures contract (continuous)."""
+        """Build MNQ futures contract (front-month)."""
+        # Use cached front-month contract if available
+        if hasattr(self, '_front_month_contract') and self._front_month_contract:
+            return self._front_month_contract
+
         return Future(
             symbol=symbol,
             exchange="CME",
             currency="USD"
         )
+
+    async def _get_front_month_contract(self, symbol: str = "MNQ") -> Optional[Future]:
+        """Get the front-month (nearest expiry) futures contract."""
+        try:
+            # Request all MNQ contracts
+            generic_contract = Future(symbol=symbol, exchange="CME", currency="USD")
+            contracts = await self.ib.reqContractDetailsAsync(generic_contract)
+
+            if not contracts:
+                print(f"No contracts found for {symbol}")
+                return None
+
+            # Sort by expiry and get the nearest one
+            sorted_contracts = sorted(
+                contracts,
+                key=lambda c: c.contract.lastTradeDateOrContractMonth
+            )
+
+            front_month = sorted_contracts[0].contract
+            print(f"Front-month contract: {front_month.localSymbol} (expires {front_month.lastTradeDateOrContractMonth})")
+
+            # Cache it
+            self._front_month_contract = front_month
+            return front_month
+
+        except Exception as e:
+            print(f"Error getting front-month contract: {e}")
+            return None
 
     def _get_entry_exit_actions(self, position_side: PositionSide) -> tuple[str, str]:
         """Get entry and exit order actions based on position side."""
@@ -234,17 +269,18 @@ class ExecutionEngine:
         For SHORT: SELL
         """
         try:
-            contract = self._build_contract(event.symbol)
-            qualified = await self.ib.qualifyContractsAsync(contract)
+            # Use cached front-month contract if available
+            if hasattr(self, '_front_month_contract') and self._front_month_contract:
+                contract = self._front_month_contract
+            else:
+                contract = await self._get_front_month_contract(event.symbol)
+                if not contract:
+                    return OrderResult(
+                        success=False,
+                        status=OrderStatus.REJECTED,
+                        message=f"Contract not found: {event.symbol}",
+                    )
 
-            if not qualified:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message=f"Contract not found: {event.symbol}",
-                )
-
-            contract = qualified[0]
             print(f"  Contract: {contract.localSymbol}")
 
             entry_action, _ = self._get_entry_exit_actions(event.position_side)
@@ -310,17 +346,18 @@ class ExecutionEngine:
                     message=f"Cannot ADD {quantity} contracts",
                 )
 
-            contract = self._build_contract(session.symbol)
-            qualified = await self.ib.qualifyContractsAsync(contract)
+            # Use cached front-month contract if available
+            if hasattr(self, '_front_month_contract') and self._front_month_contract:
+                contract = self._front_month_contract
+            else:
+                contract = await self._get_front_month_contract(session.symbol)
+                if not contract:
+                    return OrderResult(
+                        success=False,
+                        status=OrderStatus.REJECTED,
+                        message=f"Contract not found: {session.symbol}",
+                    )
 
-            if not qualified:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message=f"Contract not found: {session.symbol}",
-                )
-
-            contract = qualified[0]
             entry_action, _ = self._get_entry_exit_actions(session.position_side)
 
             order = MarketOrder(entry_action, quantity)
@@ -384,17 +421,18 @@ class ExecutionEngine:
                     message="No position to exit",
                 )
 
-            contract = self._build_contract(session.symbol)
-            qualified = await self.ib.qualifyContractsAsync(contract)
+            # Use cached front-month contract if available
+            if hasattr(self, '_front_month_contract') and self._front_month_contract:
+                contract = self._front_month_contract
+            else:
+                contract = await self._get_front_month_contract(session.symbol)
+                if not contract:
+                    return OrderResult(
+                        success=False,
+                        status=OrderStatus.REJECTED,
+                        message=f"Contract not found: {session.symbol}",
+                    )
 
-            if not qualified:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message=f"Contract not found: {session.symbol}",
-                )
-
-            contract = qualified[0]
             _, exit_action = self._get_entry_exit_actions(session.position_side)
 
             order = MarketOrder(exit_action, total_qty)
@@ -484,15 +522,12 @@ class ExecutionEngine:
         Returns the initial margin required per contract.
         """
         try:
-            contract = self._build_contract(symbol)
-            qualified = await self.ib.qualifyContractsAsync(contract)
+            # Get front-month contract
+            contract = await self._get_front_month_contract(symbol)
 
-            if not qualified:
-                print(f"Could not qualify contract for margin check: {symbol}")
+            if not contract:
+                print(f"Could not get front-month contract for margin check: {symbol}")
                 return None
-
-            contract = qualified[0]
-            print(f"  Contract qualified: {contract.localSymbol}")
 
             # Simulate a 1-contract BUY order to get margin requirement
             order = MarketOrder("BUY", 1)
