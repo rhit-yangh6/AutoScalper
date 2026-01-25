@@ -473,12 +473,42 @@ class TradingOrchestrator:
 
     async def _connection_monitor_task(self):
         """Monitor IBKR connection and reconnect if needed."""
+        disconnect_notified = False
+
         while self.running:
             await asyncio.sleep(30)
 
             if not self.executor.connected:
+                # Send disconnect notification only once
+                if not disconnect_notified and self.notifier:
+                    disconnect_notified = True
+                    await self.notifier.send_message(
+                        "⚠️ <b>IBKR Disconnected</b>\n\n"
+                        "Connection lost. Attempting auto-reconnect..."
+                    )
+
                 print("⚠️ IBKR disconnected. Attempting reconnect...")
-                await self.executor.reconnect()
+                success = await self.executor.reconnect()
+
+                # Send reconnect notification on success
+                if success and disconnect_notified:
+                    disconnect_notified = False
+                    duration_msg = ""
+                    if self.executor._disconnected_at:
+                        from datetime import datetime, timezone
+                        duration = datetime.now(timezone.utc) - self.executor._disconnected_at
+                        minutes = int(duration.total_seconds() / 60)
+                        if minutes > 0:
+                            duration_msg = f"\nDowntime: {minutes} minute(s)"
+
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            f"✅ <b>IBKR Reconnected</b>\n\n"
+                            f"Connection restored.{duration_msg}"
+                        )
+            else:
+                # Reset notification flag when connected
+                disconnect_notified = False
 
     async def _telegram_polling_task(self):
         """Poll for Telegram commands."""
@@ -633,8 +663,6 @@ def load_config() -> dict:
             "margin_buffer": env("MARGIN_BUFFER", 0.80, float),
             "daily_max_loss": env("DAILY_MAX_LOSS", 500, float),
             "max_loss_streak": env("MAX_LOSS_STREAK", 3, int),
-            "maintenance_start": env("MAINTENANCE_START", "23:00"),
-            "maintenance_end": env("MAINTENANCE_END", "01:00"),
         },
 
         "telegram": {

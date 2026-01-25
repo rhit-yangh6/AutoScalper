@@ -5,7 +5,7 @@ Final deterministic approval gate before execution.
 Implements all risk checks for futures trading.
 """
 
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel
@@ -40,7 +40,6 @@ class RiskGate:
     Implements risk checks for MNQ futures:
     - Daily max loss
     - Loss streak limit
-    - IBKR maintenance window
 
     CRITICAL: Any check failure = NO TRADE
     """
@@ -55,8 +54,6 @@ class RiskGate:
         - max_loss_streak: int
         - num_contracts: int (0 = auto-calculate from balance)
         - margin_per_contract: float (margin required per contract)
-        - maintenance_start: str (HH:MM UTC)
-        - maintenance_end: str (HH:MM UTC)
         """
         self.config = config
         self.account_balance = config.get("account_balance", 10000.0)
@@ -114,11 +111,7 @@ class RiskGate:
         if not self._check_loss_streak():
             failed_checks.append("Loss streak limit exceeded")
 
-        # 3. IBKR maintenance window check
-        if not self._check_trading_hours():
-            failed_checks.append("IBKR maintenance window - trading disabled")
-
-        # 4. High risk check
+        # 3. High risk check
         if event.risk_level in [RiskLevel.HIGH, RiskLevel.EXTREME]:
             if not self._check_high_risk_allowed():
                 failed_checks.append("High risk trades blocked in current state")
@@ -149,35 +142,6 @@ class RiskGate:
     def _check_loss_streak(self) -> bool:
         """Check if loss streak limit has been exceeded."""
         return self.loss_streak < self.config.get("max_loss_streak", 3)
-
-    def _check_trading_hours(self) -> bool:
-        """
-        Check if current time is outside IBKR maintenance window.
-
-        IBKR has a daily maintenance/restart period where trading is disabled.
-        Default: 23:00-01:00 UTC (2-hour window).
-        """
-        now = datetime.now(timezone.utc)
-        current_time = now.time()
-
-        # Get maintenance window from config (default 23:00-01:00 UTC)
-        maint_start_str = self.config.get("maintenance_start", "23:00")
-        maint_end_str = self.config.get("maintenance_end", "01:00")
-
-        maint_start = time.fromisoformat(maint_start_str)
-        maint_end = time.fromisoformat(maint_end_str)
-
-        # Handle overnight window (e.g., 23:00 to 01:00)
-        if maint_start > maint_end:
-            # Overnight: blocked if after start OR before end
-            if current_time >= maint_start or current_time < maint_end:
-                return False
-        else:
-            # Same day: blocked if between start and end
-            if maint_start <= current_time < maint_end:
-                return False
-
-        return True
 
     def _check_high_risk_allowed(self) -> bool:
         """

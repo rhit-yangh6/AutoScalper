@@ -74,6 +74,7 @@ class ExecutionEngine:
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 999999
         self._account_summary_subscribed = False
+        self._disconnected_at: Optional[datetime] = None  # Track disconnect time
 
     async def connect(self) -> bool:
         """Connect to IBKR TWS/Gateway."""
@@ -83,6 +84,7 @@ class ExecutionEngine:
             )
             self.connected = True
             self.reconnect_attempts = 0
+            self._disconnected_at = None  # Clear disconnect time on successful connect
 
             self.ib.disconnectedEvent += self._on_disconnected
 
@@ -125,6 +127,8 @@ class ExecutionEngine:
         """Callback when IBKR connection is lost."""
         self.connected = False
         self._account_summary_subscribed = False  # Reset so we re-subscribe on reconnect
+        if not self._disconnected_at:
+            self._disconnected_at = datetime.now(timezone.utc)
         print("IBKR connection lost! Auto-reconnection will attempt...")
 
     async def reconnect(self) -> bool:
