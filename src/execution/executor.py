@@ -1,11 +1,23 @@
+"""
+MNQ Futures Execution Engine
+
+Handles order execution via Interactive Brokers for MNQ micro futures.
+Supports both LONG and SHORT positions. No bracket orders - exits via TradingView signals.
+"""
+
 import asyncio
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel
-from ib_insync import IB, Option, LimitOrder, Order, Trade
+from ib_insync import IB, Future, MarketOrder, Trade
 
-from ..models import Event, TradeSession, EventType, Direction, SessionState
+from ..models import Event, TradeSession, EventType, PositionSide, SessionState
+
+
+# MNQ contract specifications
+MNQ_TICK_SIZE = 0.25
+MNQ_POINT_VALUE = 2.0  # $2 per point for MNQ
 
 
 class OrderStatus(str, Enum):
@@ -33,29 +45,26 @@ class OrderResult(BaseModel):
 
 class ExecutionEngine:
     """
-    Handles order execution via Interactive Brokers.
+    Handles MNQ futures order execution via Interactive Brokers.
 
-    Implements strict execution rules from proposal:
-    - Limit orders only
-    - Bracket/OCO orders required
-    - Idempotent order submission
-    - Kill switch enforced
+    Simple execution model:
+    - MARKET orders for entry (NEW signal)
+    - MARKET orders for exit (EXIT signal from TradingView)
+    - No bracket orders - positions are naked
     """
 
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 7497,  # 7497 = paper, 7496 = live
+        port: int = 4002,
         client_id: int = 1,
-        session_manager=None,  # For bracket order monitoring
-        use_market_orders: bool = True,  # True = market orders, False = limit orders with 5¢ flexibility
-        config: dict = None,  # Config for bracket calculations
-        notifier=None,  # Telegram notifier for real-time updates
+        session_manager=None,
+        config: dict = None,
+        notifier=None,
     ):
         self.host = host
         self.port = port
         self.client_id = client_id
-        self.use_market_orders = use_market_orders
         self.config = config or {}
         self.notifier = notifier
         self.ib = IB()
@@ -63,10 +72,7 @@ class ExecutionEngine:
         self.kill_switch_active = False
         self.session_manager = session_manager
         self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 999999  # Effectively infinite - let Docker handle restarts
-
-        # Track submitted orders for idempotency
-        self.submitted_orders: dict[str, Trade] = {}
+        self.max_reconnect_attempts = 999999
 
     async def connect(self) -> bool:
         """Connect to IBKR TWS/Gateway."""
@@ -77,32 +83,15 @@ class ExecutionEngine:
             self.connected = True
             self.reconnect_attempts = 0
 
-            # Register order monitoring callback
-            self.ib.orderStatusEvent += self._on_order_status_change
-
-            # Register disconnection callback
             self.ib.disconnectedEvent += self._on_disconnected
 
             print(f"Connected to IBKR at {self.host}:{self.port}")
-            print("Order monitoring active (bracket fills will be detected)")
             print("Auto-reconnection enabled")
 
-            # Configure market data and order strategy
-            if self.use_market_orders:
-                # IBKR Paper account or no real-time data: Use delayed data + market orders
-                self.ib.reqMarketDataType(3)  # 3 = delayed data (free)
-                print("📊 Order Strategy: MARKET orders (delayed data)")
-                print("   ⓘ Using delayed/frozen data - no live market prices during order")
-            else:
-                # IBKR Live account with real-time data: Use real-time data + limit orders
-                self.ib.reqMarketDataType(1)  # 1 = real-time (subscription required)
-                print("📊 Order Strategy: LIMIT orders with 5¢ flexibility (real-time data)")
-                print("   ⓘ Requires IBKR market data subscription for live prices")
-                print("   ⓘ If you see 'Market data pending', check:")
-                print("      - Markets are open (9:30 AM - 4:00 PM ET)")
-                print("      - IBKR subscription: US Securities Snapshot or OPRA")
+            # Use delayed data (free) for paper trading
+            self.ib.reqMarketDataType(3)
+            print("Using delayed market data")
 
-            # Get and display account balance
             await self._display_account_balance()
 
             return True
@@ -111,124 +100,43 @@ class ExecutionEngine:
             self.connected = False
             return False
 
+    async def _display_account_balance(self):
+        """Display current account balance."""
+        try:
+            account_values = self.ib.accountSummary()
+            for av in account_values:
+                if av.tag == "NetLiquidation":
+                    print(f"Account Balance: ${float(av.value):,.2f}")
+                    break
+        except Exception as e:
+            print(f"Could not get account balance: {e}")
+
     def _on_disconnected(self):
         """Callback when IBKR connection is lost."""
         self.connected = False
-        print("⚠️ IBKR connection lost! Auto-reconnection will attempt...")
-
-        # Notify via callback if available
-        if hasattr(self, 'on_disconnected'):
-            asyncio.create_task(self.on_disconnected())
+        print("IBKR connection lost! Auto-reconnection will attempt...")
 
     async def reconnect(self) -> bool:
         """Attempt to reconnect to IBKR."""
         if self.reconnect_attempts >= self.max_reconnect_attempts:
-            print(f"❌ Max reconnection attempts ({self.max_reconnect_attempts}) reached. Manual intervention required.")
+            print(f"Max reconnection attempts reached.")
             return False
 
         self.reconnect_attempts += 1
-        print(f"🔄 Reconnection attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}...")
+        print(f"Reconnection attempt {self.reconnect_attempts}...")
 
-        # Wait before attempting (exponential backoff, max 60s)
-        wait_time = min(2 ** min(self.reconnect_attempts, 6), 60)  # Cap at 2^6 = 64s
+        wait_time = min(2 ** min(self.reconnect_attempts, 6), 60)
         await asyncio.sleep(wait_time)
 
         try:
             success = await self.connect()
             if success:
-                print(f"✓ Reconnected to IBKR successfully!")
-
-                # CRITICAL: Rebuild internal state after reconnection
-                await self._rebuild_state_after_reconnect()
-
-                # Notify via callback if available
-                if hasattr(self, 'on_reconnected'):
-                    await self.on_reconnected()
-
+                print(f"Reconnected to IBKR successfully!")
                 return True
-            else:
-                return False
+            return False
         except Exception as e:
             print(f"Reconnection attempt failed: {e}")
             return False
-
-    async def _rebuild_state_after_reconnect(self):
-        """
-        Rebuild internal state after reconnection to IBKR.
-
-        This is CRITICAL to ensure trading bot has accurate state after gateway restarts.
-
-        Steps:
-        1. Re-request account summary
-        2. Re-request positions
-        3. Re-request open orders
-        4. Reconcile sessions with actual positions
-        5. Re-subscribe to any market data feeds
-        """
-        print("🔧 Rebuilding internal state after reconnection...")
-
-        try:
-            # Wait for IBKR to populate data
-            await asyncio.sleep(2)
-
-            # 1. Re-request account balance
-            try:
-                balance = await self.get_account_balance()
-                if balance:
-                    print(f"  ✓ Account balance: ${balance:,.2f}")
-                else:
-                    print(f"  ⚠️ Could not retrieve account balance")
-            except Exception as e:
-                print(f"  ⚠️ Error fetching account balance: {e}")
-
-            # 2. Re-request positions
-            try:
-                positions = await self.get_positions()
-                print(f"  ✓ Found {len(positions)} position(s)")
-
-                # Log positions for debugging
-                for pos in positions:
-                    contract = pos.contract
-                    symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
-                    print(f"    - {symbol}: {pos.position} @ ${pos.avgCost:.2f}")
-            except Exception as e:
-                print(f"  ⚠️ Error fetching positions: {e}")
-
-            # 3. Re-request open orders
-            try:
-                open_orders = await self.get_open_orders()
-                print(f"  ✓ Found {len(open_orders)} open order(s)")
-
-                # Re-register order callbacks (orderStatusEvent may have been lost)
-                # IBKR auto-resubscribes to order updates, but we ensure callbacks are active
-                if open_orders:
-                    print(f"    Re-registering {len(open_orders)} order status callbacks...")
-            except Exception as e:
-                print(f"  ⚠️ Error fetching open orders: {e}")
-
-            # 4. Reconcile sessions with positions (if session_manager available)
-            if self.session_manager:
-                try:
-                    open_sessions = [s for s in self.session_manager.sessions.values()
-                                   if s.state == SessionState.OPEN]
-                    print(f"  ✓ Found {len(open_sessions)} open session(s)")
-
-                    # Trigger reconciliation (will be handled by orchestrator's reconciliation task)
-                except Exception as e:
-                    print(f"  ⚠️ Error reconciling sessions: {e}")
-
-            print("✓ State rebuild complete")
-
-        except Exception as e:
-            print(f"⚠️ Error during state rebuild: {e}")
-            # Don't fail reconnection if state rebuild fails - we're still connected
-
-    async def ensure_connected(self) -> bool:
-        """Ensure connection is active, reconnect if necessary."""
-        if not self.connected:
-            print("⚠️ Not connected to IBKR. Attempting to reconnect...")
-            return await self.reconnect()
-        return True
 
     async def disconnect(self) -> None:
         """Disconnect from IBKR."""
@@ -238,243 +146,30 @@ class ExecutionEngine:
             print("Disconnected from IBKR")
 
     def activate_kill_switch(self, reason: str) -> None:
-        """
-        Activate kill switch - blocks all new orders.
-
-        This is a fail-safe that can be triggered by:
-        - Critical errors
-        - Risk violations
-        - Manual intervention
-        """
+        """Activate kill switch - blocks all new orders."""
         self.kill_switch_active = True
         print(f"KILL SWITCH ACTIVATED: {reason}")
 
     def deactivate_kill_switch(self) -> None:
-        """Deactivate kill switch (use with caution)."""
+        """Deactivate kill switch."""
         self.kill_switch_active = False
         print("Kill switch deactivated")
 
-    def _on_order_status_change(self, trade):
+    def _calculate_session_pnl(self, session: TradeSession, exit_price: float) -> float:
         """
-        Callback when ANY order status changes.
+        Calculate realized P&L for a futures session.
 
-        Detects bracket order fills (stop loss / take profit) and
-        updates session state, calculates P&L, and sends notifications.
-
-        Note: Brackets are standalone orders (not parent-child), so we check
-        order IDs against session.stop_order_id and session.target_order_ids.
+        For MNQ: P&L = (Exit - Entry) * Quantity * Point Value * Direction
+        Point Value = $2 per point for MNQ
         """
-        order_id = trade.order.orderId
-        status = trade.orderStatus.status
-
-        # Only care about filled orders
-        if status != "Filled":
-            return
-
-        # Find session by order ID (checks if this order is a bracket)
-        if not self.session_manager:
-            return
-
-        session = self._find_session_by_order_id(order_id)
-
-        if not session:
-            # Not a bracket order we're tracking
-            return
-
-        # Ensure session is still open
-        from ..models import SessionState
-        if session.state != SessionState.OPEN:
-            return
-
-        # Determine if this is stop or target
-        if order_id == session.stop_order_id:
-            # Stop loss filled
-            print(f"🔔 Bracket order filled: STOP LOSS (Order #{order_id})")
-            asyncio.create_task(self._handle_stop_filled(session, trade))
-        elif order_id in session.target_order_ids:
-            # Take profit filled
-            print(f"🔔 Bracket order filled: TAKE PROFIT (Order #{order_id})")
-            asyncio.create_task(self._handle_target_filled(session, trade))
-
-    def _find_session_by_order_id(self, order_id: int):
-        """Find session by stop or target order ID."""
-
-        if not self.session_manager:
-            return None
-
-        for session in self.session_manager.sessions.values():
-            if session.stop_order_id == order_id:
-                return session
-            if order_id in session.target_order_ids:
-                return session
-
-        return None
-
-    def _calculate_session_pnl(
-        self,
-        session,
-        exit_price: float
-    ) -> float:
-        """
-        Calculate realized P&L for a session.
-
-        P&L = (Exit Price - Avg Entry Price) × Total Quantity × 100
-
-        Options have 100 multiplier (each contract = 100 shares).
-        """
-
         if session.total_quantity == 0:
             return 0.0
 
+        direction = 1 if session.position_side == PositionSide.LONG else -1
         price_diff = exit_price - session.avg_entry_price
-        contract_multiplier = 100
-        pnl = price_diff * session.total_quantity * contract_multiplier
+        pnl = price_diff * session.total_quantity * MNQ_POINT_VALUE * direction
 
         return round(pnl, 2)
-
-    async def _handle_stop_filled(self, session, trade):
-        """Handle stop loss bracket order fill."""
-
-        fill_price = trade.orderStatus.avgFillPrice
-        pnl = self._calculate_session_pnl(session, fill_price)
-
-        # Update session
-        from ..models import SessionState
-        now = datetime.now(timezone.utc)
-        session.state = SessionState.CLOSED
-        session.closed_at = now
-        session.updated_at = now  # Update timestamp
-        session.exit_reason = "STOP_HIT"
-        session.exit_order_id = trade.order.orderId
-        session.exit_price = fill_price
-        session.realized_pnl = pnl
-
-        # Cancel remaining target orders
-        await self._cancel_sibling_orders(session.target_order_ids)
-
-        # Log to console
-        symbol = f"{session.underlying} {session.strike}{session.direction.value[0] if session.direction else '?'}"
-        print(f"🛑 STOP HIT: {symbol} @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
-
-        # Create OrderResult for notification
-        result = OrderResult(
-            success=True,
-            order_id=trade.order.orderId,
-            status=OrderStatus.FILLED,
-            filled_price=fill_price,
-            message=f"Stop loss triggered at ${fill_price:.2f} | P&L: ${pnl:+,.2f}"
-        )
-
-        # Send Telegram notification (via orchestrator callback)
-        if hasattr(self, 'on_bracket_filled'):
-            from ..models import EventType
-            await self.on_bracket_filled(session, EventType.SL, result)
-
-    async def _handle_target_filled(self, session, trade):
-        """Handle take profit bracket order fill."""
-
-        fill_price = trade.orderStatus.avgFillPrice
-        pnl = self._calculate_session_pnl(session, fill_price)
-
-        # Update session
-        from ..models import SessionState
-        now = datetime.now(timezone.utc)
-        session.state = SessionState.CLOSED
-        session.closed_at = now
-        session.updated_at = now  # Update timestamp
-        session.exit_reason = "TARGET_HIT"
-        session.exit_order_id = trade.order.orderId
-        session.exit_price = fill_price
-        session.realized_pnl = pnl
-
-        # Cancel stop loss order
-        if session.stop_order_id:
-            await self._cancel_sibling_orders([session.stop_order_id])
-
-        # Log to console
-        symbol = f"{session.underlying} {session.strike}{session.direction.value[0] if session.direction else '?'}"
-        print(f"🎯 TARGET HIT: {symbol} @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
-
-        # Create OrderResult for notification
-        result = OrderResult(
-            success=True,
-            order_id=trade.order.orderId,
-            status=OrderStatus.FILLED,
-            filled_price=fill_price,
-            message=f"Take profit hit at ${fill_price:.2f} | P&L: ${pnl:+,.2f}"
-        )
-
-        # Send Telegram notification (via orchestrator callback)
-        if hasattr(self, 'on_bracket_filled'):
-            from ..models import EventType
-            await self.on_bracket_filled(session, EventType.TP, result)
-
-    async def _cancel_sibling_orders(self, order_ids: list[int]) -> bool:
-        """
-        Cancel sibling bracket orders when one fills (OCO behavior).
-
-        Returns:
-            True if all cancellations succeeded, False otherwise
-        """
-
-        if not order_ids:
-            return True
-
-        cancelled_count = 0
-        failed_count = 0
-
-        for order_id in order_ids:
-            try:
-                # Find the trade by order ID
-                trades = self.ib.trades()
-                trade_found = False
-
-                for trade in trades:
-                    if trade.order.orderId == order_id:
-                        trade_found = True
-                        status = trade.orderStatus.status
-
-                        if trade.isActive():
-                            self.ib.cancelOrder(trade.order)
-
-                            # Wait for cancellation to complete (up to 3 seconds)
-                            for _ in range(30):  # 30 attempts * 0.1s = 3 seconds max
-                                await asyncio.sleep(0.1)
-                                if trade.orderStatus.status == "Cancelled":
-                                    break
-
-                            if trade.orderStatus.status == "Cancelled":
-                                cancelled_count += 1
-                                print(f"  ✓ Cancelled bracket order {order_id}")
-                            else:
-                                failed_count += 1
-                                print(f"  ⚠️ Bracket order {order_id} cancellation timeout (status: {trade.orderStatus.status})")
-                        else:
-                            # Order not active - may be filling or filled
-                            print(f"  ⚠️ Cannot cancel order {order_id} - Status: {status}")
-                            if status in ["Filled", "PartiallyFilled"]:
-                                print(f"     🚨 CRITICAL: Bracket filled after session closed!")
-                                print(f"     🚨 This may create a SHORT position if entry was already closed!")
-                                failed_count += 1
-                        break
-
-                if not trade_found:
-                    print(f"  ⚠️ Order {order_id} not found in active trades (may have already filled)")
-                    failed_count += 1
-
-            except Exception as e:
-                print(f"  ⚠️ Failed to cancel order {order_id}: {e}")
-                failed_count += 1
-
-        # Log summary
-        total = len(order_ids)
-        if cancelled_count > 0:
-            print(f"  Bracket cancellation: {cancelled_count}/{total} cancelled")
-        if failed_count > 0:
-            print(f"  ⚠️ WARNING: {failed_count}/{total} brackets could not be cancelled!")
-            print(f"  ⚠️ Check for orphaned positions in IBKR")
-
-        return failed_count == 0
 
     async def execute_event(
         self,
@@ -482,18 +177,7 @@ class ExecutionEngine:
         session: TradeSession,
         quantity: int,
     ) -> OrderResult:
-        """
-        Execute an event based on its type.
-
-        Args:
-            event: The event to execute
-            session: Associated trade session
-            quantity: Number of contracts (from risk gate)
-
-        Returns:
-            OrderResult with execution status
-        """
-        # Kill switch check
+        """Execute an event based on its type."""
         if self.kill_switch_active:
             return OrderResult(
                 success=False,
@@ -501,7 +185,6 @@ class ExecutionEngine:
                 message="Kill switch is active",
             )
 
-        # Connection check
         if not self.connected:
             return OrderResult(
                 success=False,
@@ -509,17 +192,12 @@ class ExecutionEngine:
                 message="Not connected to IBKR",
             )
 
-        # Route to appropriate handler
         if event.event_type == EventType.NEW:
             return await self._execute_entry(event, session, quantity)
         elif event.event_type == EventType.ADD:
             return await self._execute_add(event, session, quantity)
-        elif event.event_type in [EventType.EXIT, EventType.SL, EventType.TP]:
+        elif event.event_type in [EventType.EXIT, EventType.CLOSE_ALL]:
             return await self._execute_exit(event, session)
-        elif event.event_type == EventType.TRIM:
-            return await self._execute_trim(event, session)
-        elif event.event_type == EventType.MOVE_STOP:
-            return await self._execute_move_stop(event, session)
         else:
             return OrderResult(
                 success=False,
@@ -527,219 +205,59 @@ class ExecutionEngine:
                 message=f"Event type {event.event_type} not executable",
             )
 
+    def _build_contract(self, symbol: str = "MNQ") -> Future:
+        """Build MNQ futures contract (continuous)."""
+        return Future(
+            symbol=symbol,
+            exchange="CME",
+            currency="USD"
+        )
+
+    def _get_entry_exit_actions(self, position_side: PositionSide) -> tuple[str, str]:
+        """Get entry and exit order actions based on position side."""
+        if position_side == PositionSide.LONG:
+            return "BUY", "SELL"
+        else:  # SHORT
+            return "SELL", "BUY"
+
     async def _execute_entry(
         self, event: Event, session: TradeSession, quantity: int
     ) -> OrderResult:
         """
-        Execute NEW entry with bracket orders based on ACTUAL fill price.
+        Execute NEW entry - naked position, no brackets.
 
-        Key improvements:
-        1. Converts underlying targets to premium targets if needed
-        2. Submits entry order ALONE (no brackets yet)
-        3. Waits for fill, captures actual fill price
-        4. Creates bracket orders using actual fill price
-        5. Stores bracket percentages for future ADD operations
+        For LONG: BUY
+        For SHORT: SELL
         """
         try:
-            # Build option contract
-            contract = self._build_contract(event)
-
-            # CRITICAL: Qualify contract with IBKR to ensure it exists
+            contract = self._build_contract(event.symbol)
             qualified = await self.ib.qualifyContractsAsync(contract)
 
-            # If contract not found, try today's expiry (0DTE)
             if not qualified:
-                print(f"  ⚠️  Contract not found for expiry {contract.lastTradeDateOrContractMonth}")
-                print(f"  Trying 0DTE (same-day expiry)...")
+                return OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    message=f"Contract not found: {event.symbol}",
+                )
 
-                today = datetime.now().strftime('%Y%m%d')
-                contract.lastTradeDateOrContractMonth = today
-
-                qualified = await self.ib.qualifyContractsAsync(contract)
-
-                if not qualified:
-                    return OrderResult(
-                        success=False,
-                        status=OrderStatus.REJECTED,
-                        message=f"Contract not found: {contract.symbol} {contract.strike}{contract.right} (tried expiries: {event.expiry}, {today})",
-                    )
-
-            # Use the qualified contract
             contract = qualified[0]
-            print(f"  ✓ Qualified contract: {contract.localSymbol}")
+            print(f"  Contract: {contract.localSymbol}")
 
-            # Convert underlying targets to premium if needed (Issue 5)
-            target_price = event.targets[0] if event.targets else None
-            if event.target_type == "UNDERLYING" and target_price:
-                print(f"  ⓘ Converting underlying target ${target_price:.2f} to premium estimate...")
+            entry_action, _ = self._get_entry_exit_actions(event.position_side)
 
-                # Get current underlying price
-                current_underlying_price = await self._get_underlying_price(event.underlying)
+            # MARKET order for immediate fill
+            order = MarketOrder(entry_action, quantity)
+            trade = self.ib.placeOrder(contract, order)
 
-                if current_underlying_price:
-                    # Convert to premium estimate
-                    premium_target = await self._convert_underlying_target_to_premium(
-                        contract, target_price, current_underlying_price
-                    )
+            print(f"  {entry_action} MARKET x{quantity} submitted")
 
-                    if premium_target:
-                        target_price = premium_target
-                        print(f"  ✓ Using converted premium target: ${target_price:.2f}")
-                    else:
-                        print(f"  ⚠️ Conversion failed, falling back to auto-calculated target")
-                        target_price = None  # Let bracket calculation use R/R ratio
-                else:
-                    print(f"  ⚠️ Could not fetch underlying price, falling back to auto-calculated target")
-                    target_price = None  # Let bracket calculation use R/R ratio
-
-            # Step 1: Fetch market data and validate premium
-            from ib_insync import MarketOrder, LimitOrder
-            import math
-
-            print(f"  Fetching current market data...")
-            ticker = self.ib.reqMktData(contract, snapshot=False)  # Request streaming data with OPRA
-
-            # Wait up to 3 seconds for market data (OPRA subscription should be fast)
-            market_bid = None
-            market_ask = None
-            market_last = None
-
-            for attempt in range(6):  # 6 attempts × 0.5s = 3 seconds max
-                await asyncio.sleep(0.5)
-
-                # Check for valid data
-                market_bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-                market_ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-                market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
-
-                # Got valid price data
-                if market_bid or market_ask or market_last:
-                    break
-
-                if attempt == 5:
-                    print(f"  ⚠️ No market data after 3s - check OPRA subscription status")
-
-            # Cancel market data subscription to clean up
-            try:
-                self.ib.cancelMktData(contract)
-            except:
-                pass
-
-            # Log what we got
-            if market_bid and market_ask:
-                last_str = f"${market_last:.2f}" if market_last else "N/A"
-                print(f"  📊 Market: Bid ${market_bid:.2f} | Ask ${market_ask:.2f} | Last {last_str}")
-            elif market_last:
-                print(f"  📊 Market: Last ${market_last:.2f}")
-
-            # Check minimum premium requirement ($0.15) - APPLIES TO ALL ORDERS
-            # Prevents trading options that are too cheap (too far OTM or illiquid)
-            # Also prevents trading when we can't verify premium (no market data)
-            MIN_PREMIUM = 0.15
-            premium_to_check = market_ask if market_ask else market_last
-
-            if not premium_to_check:
-                # No market data available - cannot verify premium
-                print(f"  ❌ No market data available - REJECTING trade")
-                print(f"     Cannot verify premium meets ${MIN_PREMIUM:.2f} minimum")
-                print(f"     This usually means markets are closed or data subscription issue")
-
-                # Close session immediately
-                session.state = SessionState.CLOSED
-                session.closed_at = datetime.now(timezone.utc)
-                session.updated_at = datetime.now(timezone.utc)
-                session.exit_reason = "NO_MARKET_DATA"
-
-                return OrderResult(
-                    success=False,
-                    order_id=None,
-                    status=OrderStatus.REJECTED,
-                    filled_price=None,
-                    message=f"No market data available - cannot verify ${MIN_PREMIUM:.2f} minimum premium"
-                )
-
-            if premium_to_check < MIN_PREMIUM:
-                print(f"  ❌ Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f} - REJECTING trade")
-                print(f"     Options this cheap are typically too far OTM or illiquid")
-
-                # Close session immediately
-                session.state = SessionState.CLOSED
-                session.closed_at = datetime.now(timezone.utc)
-                session.updated_at = datetime.now(timezone.utc)
-                session.exit_reason = "PREMIUM_TOO_LOW"
-
-                return OrderResult(
-                    success=False,
-                    order_id=None,
-                    status=OrderStatus.REJECTED,
-                    filled_price=None,
-                    message=f"Premium ${premium_to_check:.2f} below minimum ${MIN_PREMIUM:.2f}"
-                )
-
-            # Step 2: Submit entry order (Market or Limit based on configuration)
-            if self.use_market_orders:
-                # Use MARKET order (IBKR paper or no real-time data subscription)
-                parent_order = MarketOrder("BUY", quantity)
-                parent_trade = self.ib.placeOrder(contract, parent_order)
-                print(f"  ⓘ MARKET order submitted for {quantity} contracts")
-            else:
-                # Use LIMIT order with 5¢ flexibility (real-time data available)
-                # Determine entry price with 5-cent flexibility
-                alert_price = event.entry_price or (market_ask if market_ask else market_last)
-
-                if not alert_price:
-                    print(f"  ⚠️ No market data available, falling back to MARKET order")
-                    parent_order = MarketOrder("BUY", quantity)
-                    parent_trade = self.ib.placeOrder(contract, parent_order)
-                    print(f"  ⓘ MARKET order submitted (no market data)")
-                else:
-                    entry_price = alert_price
-                    max_entry_price = alert_price + 0.05  # 5¢ flexibility
-
-                    if market_ask:
-                        if market_ask > entry_price and market_ask <= max_entry_price:
-                            # Market moved up but within tolerance
-                            old_price = entry_price
-                            entry_price = market_ask
-                            print(f"  ⓘ Adjusting entry: ${old_price:.2f} → ${entry_price:.2f} (market moved, within 5¢)")
-                        elif market_ask > max_entry_price:
-                            # Market moved too far, use max allowed
-                            deviation = market_ask - alert_price
-                            print(f"  ⚠️ Market ask ${market_ask:.2f} is ${deviation:.2f} above alert ${alert_price:.2f}")
-                            print(f"  ⚠️ Using max allowed: ${max_entry_price:.2f} (alert + 5¢)")
-                            entry_price = max_entry_price
-                        elif market_ask < entry_price:
-                            # Better entry available
-                            old_price = entry_price
-                            entry_price = market_ask
-                            print(f"  ✓ Better entry: ${old_price:.2f} → ${entry_price:.2f} (below alert)")
-
-                    parent_order = LimitOrder("BUY", quantity, entry_price)
-                    parent_order.tif = "DAY"
-                    parent_trade = self.ib.placeOrder(contract, parent_order)
-                    print(f"  ⓘ LIMIT order submitted @ ${entry_price:.2f}")
-
-            # Step 3: Wait for parent fill with real-time Telegram updates
-            filled = await self._wait_for_fill(
-                parent_trade,
-                timeout=30,
-                notifier=self.notifier,
-                session=session,
-                order_type="ENTRY"
-            )
+            filled = await self._wait_for_fill(trade, timeout=30)
 
             if not filled:
-                self.ib.cancelOrder(parent_trade.order)
-
-                # CRITICAL: Close session when entry times out
-                # Prevents stale PENDING sessions blocking future trades
+                self.ib.cancelOrder(trade.order)
                 session.state = SessionState.CLOSED
                 session.closed_at = datetime.now(timezone.utc)
-                session.updated_at = datetime.now(timezone.utc)
                 session.exit_reason = "ENTRY_TIMEOUT"
-                session.total_quantity = 0
-
-                print(f"  ✗ Entry timeout - session closed: {session.session_id[:8]}...")
 
                 return OrderResult(
                     success=False,
@@ -747,136 +265,24 @@ class ExecutionEngine:
                     message="Entry order timed out",
                 )
 
-            # Step 4: Capture ACTUAL fill price
-            actual_fill_price = parent_trade.orderStatus.avgFillPrice
-            print(f"  ✓ Entry filled at ${actual_fill_price:.2f}")
+            fill_price = trade.orderStatus.avgFillPrice
+            print(f"  Filled @ ${fill_price:.2f}")
 
-            # Step 5: Update session BEFORE creating brackets
+            # Update session
             now = datetime.now(timezone.utc)
             session.state = SessionState.OPEN
             session.opened_at = now
-            session.updated_at = now  # CRITICAL: Update timestamp for reconciliation
-            session.entry_order_id = parent_trade.order.orderId
+            session.updated_at = now
+            session.entry_order_id = trade.order.orderId
             session.total_quantity = quantity
-            session.avg_entry_price = actual_fill_price
-
-            print(f"  ✓ Session updated: {session.session_id[:8]}... | qty={quantity} @ ${actual_fill_price:.2f}")
-
-            # Step 6: Calculate bracket prices using ACTUAL fill price
-            # CRITICAL: Always use actual fill price, not limit price
-            # This ensures risk management is based on real execution, not intended price
-            stop_price, final_target_price = self._calculate_bracket_prices(
-                actual_fill_price,
-                event.stop_loss,
-                target_price,
-            )
-
-            # Step 7: Create bracket orders using actual fill price
-            bracket_result = await self._create_bracket_orders(
-                contract=contract,
-                quantity=quantity,
-                stop_price=stop_price,
-                target_price=final_target_price,
-                session=session,
-            )
-
-            # Step 8: Store bracket order IDs
-            if bracket_result:
-                session.stop_order_id = bracket_result.get('stop_order_id')
-                session.target_order_ids = bracket_result.get('target_order_ids', [])
-            else:
-                # CRITICAL: Bracket creation failed, position is unprotected!
-                print(f"  🚨 CRITICAL: Bracket creation FAILED after entry fill!")
-                print(f"  🚨 Position is UNPROTECTED - initiating emergency exit")
-
-                # Log critical error
-                import traceback
-                traceback.print_exc()
-
-                # Attempt emergency market exit
-                try:
-                    from ib_insync import MarketOrder
-                    emergency_order = MarketOrder("SELL", quantity)
-                    emergency_trade = self.ib.placeOrder(contract, emergency_order)
-
-                    # Wait for emergency exit (short timeout)
-                    await asyncio.sleep(1)
-                    filled = await self._wait_for_fill(emergency_trade, timeout=10)
-
-                    if filled:
-                        exit_price = emergency_trade.orderStatus.avgFillPrice
-                        pnl = (exit_price - actual_fill_price) * quantity * 100
-
-                        print(f"  ✓ Emergency exit filled @ ${exit_price:.2f} | P&L: ${pnl:+,.2f}")
-
-                        # Close session
-                        session.state = SessionState.CLOSED
-                        session.closed_at = datetime.now(timezone.utc)
-                        session.exit_reason = "BRACKET_FAILURE_EMERGENCY_EXIT"
-                        session.exit_price = exit_price
-                        session.total_quantity = 0
-                        session.realized_pnl = pnl
-
-                        return OrderResult(
-                            success=False,
-                            order_id=parent_trade.order.orderId,
-                            status=OrderStatus.FILLED,
-                            filled_price=actual_fill_price,
-                            message=f"CRITICAL: Bracket failure. Emergency exit @ ${exit_price:.2f} | P&L: ${pnl:+,.2f}",
-                        )
-                    else:
-                        print(f"  🚨 CRITICAL: Emergency exit FAILED - MANUAL INTERVENTION REQUIRED")
-                        # Position still open but unprotected - user must manually close
-                        session.state = SessionState.OPEN
-                        return OrderResult(
-                            success=False,
-                            order_id=parent_trade.order.orderId,
-                            status=OrderStatus.FILLED,
-                            filled_price=actual_fill_price,
-                            message=f"CRITICAL: Bracket failure. Emergency exit FAILED. CLOSE POSITION MANUALLY!",
-                        )
-
-                except Exception as emergency_error:
-                    print(f"  🚨 CRITICAL: Emergency exit exception: {emergency_error}")
-                    traceback.print_exc()
-                    # Position still open but unprotected - user must manually close
-                    session.state = SessionState.OPEN
-                    return OrderResult(
-                        success=False,
-                        order_id=parent_trade.order.orderId,
-                        status=OrderStatus.FILLED,
-                        filled_price=actual_fill_price,
-                        message=f"CRITICAL: Bracket failure. Emergency exit EXCEPTION. CLOSE POSITION MANUALLY!",
-                    )
-
-            # Step 9: Store bracket percentages for future ADD operations (Issue 4)
-            # CRITICAL: Use actual_fill_price for percentage calculations
-            # (same price used to calculate the brackets)
-            if actual_fill_price <= 0:
-                print(f"  ⚠️ WARNING: Invalid fill price {actual_fill_price}, cannot calculate bracket percentages")
-                print(f"  ⚠️ ADD operations will not be able to update brackets")
-                session.stop_loss_percent = None
-                session.target_percent = None
-            else:
-                # Safe to calculate percentages based on actual fill price
-                session.stop_loss_percent = self._calculate_bracket_percent(stop_price, actual_fill_price, "stop_loss_percent") if stop_price else None
-                session.target_percent = self._calculate_bracket_percent(final_target_price, actual_fill_price, "target_percent") if final_target_price else None
-
-            # Build success message
-            msg = f"Entry filled at ${actual_fill_price:.2f}"
-            if stop_price or final_target_price:
-                msg += " | Brackets:"
-                if stop_price:
-                    msg += f" Stop=${stop_price:.2f} ({session.stop_loss_percent:+.1f}%)"
-                if final_target_price:
-                    msg += f" Target=${final_target_price:.2f} ({session.target_percent:+.1f}%)"
+            session.avg_entry_price = fill_price
 
             return OrderResult(
                 success=True,
-                order_id=parent_trade.order.orderId,
+                order_id=trade.order.orderId,
                 status=OrderStatus.FILLED,
-                filled_price=actual_fill_price,
-                message=msg,
+                filled_price=fill_price,
+                message=f"Entry filled @ ${fill_price:.2f}",
             )
 
         except Exception as e:
@@ -891,88 +297,34 @@ class ExecutionEngine:
     async def _execute_add(
         self, event: Event, session: TradeSession, quantity: int
     ) -> OrderResult:
-        """
-        Execute ADD (scale in) order with bracket updates.
-
-        Process:
-        1. Submit ADD order and wait for fill
-        2. Calculate new weighted average entry price
-        3. Update session quantities
-        4. Recalculate and update brackets based on new average
-        """
+        """Execute ADD (scale in) order."""
         try:
-            # Validate quantity is positive
             if quantity <= 0:
                 return OrderResult(
                     success=False,
                     status=OrderStatus.REJECTED,
-                    message=f"Cannot ADD {quantity} contracts - must be positive number",
+                    message=f"Cannot ADD {quantity} contracts",
                 )
 
-            contract = self._build_contract_from_session(session)
-
-            # Qualify contract with IBKR
+            contract = self._build_contract(session.symbol)
             qualified = await self.ib.qualifyContractsAsync(contract)
+
             if not qualified:
                 return OrderResult(
                     success=False,
                     status=OrderStatus.REJECTED,
-                    message=f"Contract not found: {contract.symbol} {contract.strike}{contract.right}",
+                    message=f"Contract not found: {session.symbol}",
                 )
+
             contract = qualified[0]
-            print(f"  ✓ Qualified contract: {contract.localSymbol}")
+            entry_action, _ = self._get_entry_exit_actions(session.position_side)
 
-            # Submit ADD order (Market or Limit based on data availability)
-            from ib_insync import MarketOrder, LimitOrder
+            order = MarketOrder(entry_action, quantity)
+            trade = self.ib.placeOrder(contract, order)
 
-            if self.use_market_orders:
-                # Use MARKET order (IBKR paper or no real-time data)
-                order = MarketOrder("BUY", quantity)
-                trade = self.ib.placeOrder(contract, order)
-                print(f"  ⓘ ADD MARKET order submitted: {quantity} contracts")
-            else:
-                # Use LIMIT order with 5¢ flexibility (real-time data available)
-                print(f"  Fetching current market data...")
-                ticker = self.ib.reqMktData(contract)
-                await asyncio.sleep(1)
+            print(f"  ADD {entry_action} MARKET x{quantity} submitted")
 
-                import math
-                market_ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-                market_last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
-
-                add_price = event.entry_price or market_ask or market_last
-
-                if not add_price:
-                    print(f"  ⚠️ No market data, falling back to MARKET order")
-                    order = MarketOrder("BUY", quantity)
-                    trade = self.ib.placeOrder(contract, order)
-                    print(f"  ⓘ ADD MARKET order submitted (no data)")
-                else:
-                    # Allow 5¢ flexibility
-                    if market_ask and market_ask > add_price:
-                        if market_ask <= add_price + 0.05:
-                            print(f"  ⓘ Adjusting ADD: ${add_price:.2f} → ${market_ask:.2f} (within 5¢)")
-                            add_price = market_ask
-                        else:
-                            print(f"  ⚠️ Using max allowed: ${add_price + 0.05:.2f}")
-                            add_price = add_price + 0.05
-                    elif market_ask and market_ask < add_price:
-                        print(f"  ✓ Better ADD entry: ${add_price:.2f} → ${market_ask:.2f}")
-                        add_price = market_ask
-
-                    order = LimitOrder("BUY", quantity, add_price)
-                    order.tif = "DAY"
-                    trade = self.ib.placeOrder(contract, order)
-                    print(f"  ⓘ ADD LIMIT order submitted @ ${add_price:.2f}")
-
-            # Wait for fill with real-time Telegram updates
-            filled = await self._wait_for_fill(
-                trade,
-                timeout=30,
-                notifier=self.notifier,
-                session=session,
-                order_type="ADD"
-            )
+            filled = await self._wait_for_fill(trade, timeout=30)
 
             if not filled:
                 self.ib.cancelOrder(trade.order)
@@ -982,44 +334,27 @@ class ExecutionEngine:
                     message="Add order timed out",
                 )
 
-            # Get actual fill price
-            actual_add_price = trade.orderStatus.avgFillPrice
+            add_price = trade.orderStatus.avgFillPrice
 
-            # Calculate new average entry price (weighted average)
-            old_quantity = session.total_quantity
-            old_avg_price = session.avg_entry_price
-            new_quantity = old_quantity + quantity
+            # Calculate new weighted average
+            old_qty = session.total_quantity
+            old_avg = session.avg_entry_price
+            new_qty = old_qty + quantity
+            new_avg = ((old_avg * old_qty) + (add_price * quantity)) / new_qty
 
-            # Validate before division
-            if new_quantity <= 0:
-                print(f"  🚨 ERROR: Invalid new_quantity {new_quantity} in ADD calculation")
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message=f"Invalid quantity calculation: old={old_quantity}, add={quantity}",
-                )
+            print(f"  ADD filled @ ${add_price:.2f}")
+            print(f"  New position: {new_qty} @ ${new_avg:.2f}")
 
-            new_avg_price = ((old_avg_price * old_quantity) + (actual_add_price * quantity)) / new_quantity
-
-            print(f"  ✓ ADD filled: {quantity} @ ${actual_add_price:.2f}")
-            print(f"  Position: {old_quantity} @ ${old_avg_price:.2f} + {quantity} @ ${actual_add_price:.2f}")
-            print(f"  New Average: {new_quantity} @ ${new_avg_price:.2f}")
-
-            # Update session
-            session.total_quantity = new_quantity
-            session.avg_entry_price = new_avg_price
-            session.num_adds += 1
-            session.updated_at = datetime.now(timezone.utc)  # Update timestamp
-
-            # Update brackets based on new average (Issue 4)
-            await self._update_brackets_for_add(session, contract)
+            session.total_quantity = new_qty
+            session.avg_entry_price = new_avg
+            session.updated_at = datetime.now(timezone.utc)
 
             return OrderResult(
                 success=True,
                 order_id=trade.order.orderId,
                 status=OrderStatus.FILLED,
-                filled_price=actual_add_price,
-                message=f"Added {quantity} @ ${actual_add_price:.2f} | New Avg: ${new_avg_price:.2f} ({new_quantity} total)",
+                filled_price=add_price,
+                message=f"Added {quantity} @ ${add_price:.2f} | Total: {new_qty} @ ${new_avg:.2f}",
             )
 
         except Exception as e:
@@ -1036,94 +371,55 @@ class ExecutionEngine:
     ) -> OrderResult:
         """Execute full exit."""
         try:
-            # Get current position size from session
-            total_quantity = session.total_quantity
+            total_qty = session.total_quantity
 
-            print(f"  📊 EXIT check: Session {session.session_id[:8]}... has qty={total_quantity}")
-            print(f"     Session state: {session.state}, avg_entry={session.avg_entry_price}")
-
-            # CRITICAL: If session says 0 but we think there's a position,
-            # check IBKR directly (state sync bug protection)
-            if total_quantity == 0:
-                print(f"  ⚠️ Session shows 0 quantity, checking IBKR positions...")
-
-                # Build contract and check IBKR
-                contract = self._build_contract_from_session(session)
-                qualified = await self.ib.qualifyContractsAsync(contract)
-
-                if qualified:
-                    contract = qualified[0]
-                    positions = self.ib.positions()
-
-                    # Find matching position
-                    for pos in positions:
-                        if (hasattr(pos.contract, 'conId') and
-                            hasattr(contract, 'conId') and
-                            pos.contract.conId == contract.conId):
-                            ibkr_quantity = int(pos.position)
-                            if ibkr_quantity > 0:
-                                print(f"  🔧 State sync fix: IBKR has {ibkr_quantity} contracts, session shows 0")
-                                print(f"  🔧 Using IBKR quantity for EXIT")
-                                total_quantity = ibkr_quantity
-                                # Update session to fix state
-                                session.total_quantity = ibkr_quantity
-                                break
-
-            # Final check after IBKR fallback
-            if total_quantity == 0:
+            if total_qty == 0:
                 return OrderResult(
                     success=False,
                     status=OrderStatus.REJECTED,
-                    message="No position to exit (confirmed with IBKR)",
+                    message="No position to exit",
                 )
 
-            contract = self._build_contract_from_session(session)
-
-            # Qualify contract with IBKR
+            contract = self._build_contract(session.symbol)
             qualified = await self.ib.qualifyContractsAsync(contract)
+
             if not qualified:
                 return OrderResult(
                     success=False,
                     status=OrderStatus.REJECTED,
-                    message=f"Contract not found: {contract.symbol} {contract.strike}{contract.right}",
+                    message=f"Contract not found: {session.symbol}",
                 )
+
             contract = qualified[0]
-            print(f"  ✓ Qualified contract: {contract.localSymbol}")
+            _, exit_action = self._get_entry_exit_actions(session.position_side)
 
-            # CRITICAL: Cancel all existing orders for this contract (bracket orders)
-            # This prevents race conditions between EXIT and existing stop/target orders
-            cancelled_orders = await self._cancel_orders_for_contract(contract)
-            if cancelled_orders > 0:
-                print(f"  ✓ Cancelled {cancelled_orders} existing order(s) (bracket stop/target)")
-
-            # Use MARKET order for fast exit (speed more important than price)
-            from ib_insync import MarketOrder
-            order = MarketOrder("SELL", total_quantity)
+            order = MarketOrder(exit_action, total_qty)
             trade = self.ib.placeOrder(contract, order)
 
-            print(f"  ⓘ EXIT MARKET order submitted for {total_quantity} contracts")
+            print(f"  EXIT {exit_action} MARKET x{total_qty} submitted")
 
-            # Market orders usually fill instantly, but monitor anyway
-            filled = await self._wait_for_fill(
-                trade,
-                timeout=30,
-                notifier=self.notifier,
-                session=session,
-                order_type="EXIT"
-            )
+            filled = await self._wait_for_fill(trade, timeout=30)
 
             if filled:
+                fill_price = trade.orderStatus.avgFillPrice
+                pnl = self._calculate_session_pnl(session, fill_price)
+
                 now = datetime.now(timezone.utc)
                 session.state = SessionState.CLOSED
                 session.closed_at = now
-                session.updated_at = now  # Update timestamp
+                session.updated_at = now
+                session.exit_reason = "SIGNAL_EXIT"
+                session.exit_price = fill_price
+                session.realized_pnl = pnl
+
+                print(f"  Exit filled @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
 
                 return OrderResult(
                     success=True,
                     order_id=trade.order.orderId,
                     status=OrderStatus.FILLED,
-                    filled_price=trade.orderStatus.avgFillPrice,
-                    message="Exit filled successfully",
+                    filled_price=fill_price,
+                    message=f"Exit @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}",
                 )
             else:
                 self.ib.cancelOrder(trade.order)
@@ -1140,1390 +436,138 @@ class ExecutionEngine:
                 message=f"Exit execution error: {e}",
             )
 
-    async def _execute_trim(
-        self, event: Event, session: TradeSession
-    ) -> OrderResult:
-        """
-        Execute partial exit (TRIM).
-
-        Handles:
-        - Specific quantity: "trim 5 contracts"
-        - Percentage: "took off half" (50%)
-        - Auto-closes session if trim reduces position to 0
-        - Updates brackets for remaining position
-        """
-        try:
-            # Get current position size
-            current_quantity = session.total_quantity
-            if current_quantity == 0:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message="No position to trim",
-                )
-
-            # Calculate trim quantity
-            trim_qty = self._calculate_trim_quantity(event, session)
-
-            if trim_qty <= 0 or trim_qty > current_quantity:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message=f"Invalid trim quantity: {trim_qty} (position: {current_quantity})",
-                )
-
-            # Build contract
-            contract = self._build_contract_from_session(session)
-            qualified = await self.ib.qualifyContractsAsync(contract)
-
-            if not qualified:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message=f"Contract not found: {contract.symbol} {contract.strike}{contract.right}",
-                )
-
-            contract = qualified[0]
-            print(f"  ✓ Qualified contract: {contract.localSymbol}")
-
-            # CRITICAL: Cancel brackets FIRST to prevent SHORT positions
-            # If trimming to 0, brackets must be cancelled before submitting TRIM
-            # If partial trim, old brackets will be replaced with new ones after fill
-            if session.stop_order_id or session.target_order_ids:
-                order_ids = []
-                if session.stop_order_id:
-                    order_ids.append(session.stop_order_id)
-                if session.target_order_ids:
-                    order_ids.extend(session.target_order_ids)
-
-                print(f"  ⓘ Cancelling {len(order_ids)} bracket order(s) before TRIM...")
-                await self._cancel_sibling_orders(order_ids)
-                print(f"  ✓ Brackets cancelled")
-
-            # Use MARKET order for fast exit (speed more important than price)
-            from ib_insync import MarketOrder
-            order = MarketOrder("SELL", trim_qty)
-            trade = self.ib.placeOrder(contract, order)
-
-            print(f"  ⓘ TRIM MARKET order submitted: {trim_qty} contracts")
-
-            # Wait for fill with real-time Telegram updates
-            filled = await self._wait_for_fill(
-                trade,
-                timeout=30,
-                notifier=self.notifier,
-                session=session,
-                order_type="TRIM"
-            )
-
-            if not filled:
-                self.ib.cancelOrder(trade.order)
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.CANCELLED,
-                    message="Trim order timed out",
-                )
-
-            fill_price = trade.orderStatus.avgFillPrice
-
-            # Calculate P&L for trimmed portion
-            trim_pnl = (fill_price - session.avg_entry_price) * trim_qty * 100
-
-            # Update session
-            session.total_quantity -= trim_qty
-            session.realized_pnl += trim_pnl
-            session.updated_at = datetime.now(timezone.utc)  # Update timestamp
-
-            # Check if position is fully closed
-            if session.total_quantity == 0:
-                print(f"  ⓘ TRIM reduced position to 0, auto-closing session")
-
-                now = datetime.now(timezone.utc)
-                session.state = SessionState.CLOSED
-                session.closed_at = now
-                session.updated_at = now  # Update timestamp
-                session.exit_reason = "TRIM_TO_ZERO"
-                session.exit_price = fill_price
-
-                # Note: Brackets already cancelled before TRIM order (see above)
-
-                return OrderResult(
-                    success=True,
-                    order_id=trade.order.orderId,
-                    status=OrderStatus.FILLED,
-                    filled_price=fill_price,
-                    message=f"Trimmed {trim_qty} @ ${fill_price:.2f} | P&L: ${trim_pnl:+,.2f} | Session CLOSED",
-                )
-            else:
-                # Position still open, update brackets
-                print(f"  ⓘ Position trimmed: {current_quantity} → {session.total_quantity}")
-
-                # Update brackets for reduced position
-                await self._update_brackets_for_trim(session, contract)
-
-                return OrderResult(
-                    success=True,
-                    order_id=trade.order.orderId,
-                    status=OrderStatus.FILLED,
-                    filled_price=fill_price,
-                    message=f"Trimmed {trim_qty} @ ${fill_price:.2f} | P&L: ${trim_pnl:+,.2f} | Remaining: {session.total_quantity}",
-                )
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return OrderResult(
-                success=False,
-                status=OrderStatus.REJECTED,
-                message=f"Trim execution error: {e}",
-            )
-
-    async def _execute_move_stop(
-        self, event: Event, session: TradeSession
-    ) -> OrderResult:
-        """
-        Update stop loss order to new price (lock in profits, reduce risk).
-
-        Common uses:
-        - "Move stop to breakeven" - Lock in zero loss
-        - "Tighten stop to 0.40" - Reduce risk as position moves favorably
-        - "Trailing stop to entry" - Protect profits
-        """
-        try:
-            # Validate position exists
-            if session.total_quantity == 0:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message="No position to move stop for",
-                )
-
-            # Get new stop price from event
-            new_stop_price = event.stop_loss
-            if not new_stop_price:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message="No stop price provided in MOVE_STOP event",
-                )
-
-            # Validate new stop is tightening (not loosening risk)
-            old_stop = None
-            if session.stop_loss_percent is not None and session.avg_entry_price > 0:
-                old_stop = session.avg_entry_price * (1 + session.stop_loss_percent / 100)
-
-            if old_stop and new_stop_price < old_stop:
-                print(f"  ⚠️ Warning: New stop ${new_stop_price:.2f} is LOWER than old stop ${old_stop:.2f}")
-                print(f"  ⚠️ This INCREASES risk (stops should only tighten, not loosen)")
-                # Allow but warn - trader may have reasons
-
-            # Build contract
-            contract = self._build_contract_from_session(session)
-            qualified = await self.ib.qualifyContractsAsync(contract)
-
-            if not qualified:
-                return OrderResult(
-                    success=False,
-                    status=OrderStatus.REJECTED,
-                    message=f"Contract not found: {contract.symbol} {contract.strike}{contract.right}",
-                )
-
-            contract = qualified[0]
-            print(f"  ✓ Qualified contract: {contract.localSymbol}")
-
-            # Cancel old stop order
-            if session.stop_order_id:
-                print(f"  ⓘ Cancelling old stop order #{session.stop_order_id}...")
-                await self._cancel_sibling_orders([session.stop_order_id])
-                print(f"  ✓ Old stop cancelled")
-            else:
-                print(f"  ⓘ No existing stop order to cancel")
-
-            # Create new stop order at new price
-            from ib_insync import StopOrder
-            oca_group = f"OCA_{session.session_id[:8]}"
-
-            new_stop_order = StopOrder("SELL", session.total_quantity, new_stop_price)
-            new_stop_order.tif = "DAY"
-            new_stop_order.outsideRth = True
-            new_stop_order.ocaGroup = oca_group  # Link with existing target
-            new_stop_order.ocaType = 1
-
-            stop_trade = self.ib.placeOrder(contract, new_stop_order)
-            await asyncio.sleep(0.2)
-
-            # Update session with new stop
-            session.stop_order_id = stop_trade.order.orderId
-
-            # Recalculate stop percentage based on new price
-            if session.avg_entry_price > 0:
-                session.stop_loss_percent = ((new_stop_price - session.avg_entry_price) / session.avg_entry_price) * 100
-                print(f"  ✓ New stop: ${new_stop_price:.2f} ({session.stop_loss_percent:+.1f}% from entry)")
-            else:
-                print(f"  ✓ New stop: ${new_stop_price:.2f}")
-
-            print(f"  ✓ Stop order #{stop_trade.order.orderId} created")
-
-            # Calculate risk reduction
-            if old_stop:
-                risk_reduction = new_stop_price - old_stop
-                print(f"  📊 Risk reduced by ${risk_reduction:.2f} per contract")
-
-            return OrderResult(
-                success=True,
-                order_id=stop_trade.order.orderId,
-                status=OrderStatus.FILLED,  # Stop order is submitted, not filled
-                message=f"Stop moved to ${new_stop_price:.2f}",
-            )
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return OrderResult(
-                success=False,
-                status=OrderStatus.REJECTED,
-                message=f"MOVE_STOP execution error: {e}",
-            )
-
-    def _build_contract(self, event: Event) -> Option:
-        """Build IBKR Option contract from event."""
-        # Convert expiry from ISO format (2025-12-12) to IBKR format (20251212)
-        expiry_ibkr = event.expiry.replace('-', '') if event.expiry else ''
-
-        # Map underlying to IBKR symbol (SPY and QQQ only)
-        if event.underlying in ["SPY", "QQQ"]:
-            symbol = event.underlying
-        else:
-            symbol = event.underlying  # Fallback to raw value
-
-        return Option(
-            symbol=symbol,
-            lastTradeDateOrContractMonth=expiry_ibkr,
-            strike=event.strike,
-            right="C" if event.direction == Direction.CALL else "P",
-            exchange="SMART",
-        )
-
-    def _build_contract_from_session(self, session: TradeSession) -> Option:
-        """Build IBKR Option contract from session."""
-        # Convert expiry from ISO format (2025-12-12) to IBKR format (20251212)
-        expiry_ibkr = session.expiry.replace('-', '') if session.expiry else ''
-
-        # Map underlying to IBKR symbol (SPY and QQQ only)
-        if session.underlying in ["SPY", "QQQ"]:
-            symbol = session.underlying
-        else:
-            symbol = session.underlying  # Fallback to raw value
-
-        return Option(
-            symbol=symbol,
-            lastTradeDateOrContractMonth=expiry_ibkr,
-            strike=session.strike,
-            right="C" if session.direction == Direction.CALL else "P",
-            exchange="SMART",
-        )
-
-    def _build_bracket_order(
-        self,
-        action: str,
-        quantity: int,
-        entry_price: float,
-        stop_price: Optional[float],
-        target_price: Optional[float],
-    ) -> list[Order]:
-        """
-        Build proper IBKR bracket order with parent/child relationships.
-
-        Parent order: Entry
-        Child orders: Stop loss + Profit target (OCO - One Cancels Other)
-
-        Returns list of orders: [parent, stop_child, target_child]
-        """
-        from ib_insync import Order
-
-        orders = []
-
-        # Parent order (entry) - don't transmit yet if we have children
-        parent = LimitOrder(action, quantity, entry_price)
-        parent.orderId = self.ib.client.getReqId()
-        parent.transmit = False  # Don't transmit until children are attached
-        parent.tif = "DAY"  # Explicit Time In Force
-        orders.append(parent)
-
-        # Child orders only activate when parent fills
-        has_children = bool(stop_price or target_price)
-
-        # Stop loss child (if provided)
-        if stop_price:
-            stop = LimitOrder("SELL", quantity, stop_price)
-            stop.orderId = self.ib.client.getReqId()
-            stop.parentId = parent.orderId  # Link to parent
-            stop.transmit = not target_price  # Transmit only if it's the last order
-            stop.tif = "DAY"  # Explicit Time In Force
-            orders.append(stop)
-
-        # Profit target child (if provided)
-        if target_price:
-            target = LimitOrder("SELL", quantity, target_price)
-            target.orderId = self.ib.client.getReqId()
-            target.parentId = parent.orderId  # Link to parent
-            target.transmit = True  # Last order - transmit all
-            target.tif = "DAY"  # Explicit Time In Force
-            orders.append(target)
-
-        # If no children, transmit the parent order
-        if not has_children:
-            parent.transmit = True
-
-        return orders
-
-    def _calculate_bracket_percent(self, price: float, base_price: float, label: str) -> Optional[float]:
-        """Calculate bracket percentage and validate. Returns None if invalid."""
-        if base_price <= 0:
-            return None
-
-        percent = ((price - base_price) / base_price) * 100
-
-        if percent < -99 or percent > 1000:
-            print(f"  ⚠️ WARNING: Extreme {label}: {percent:.2f}%")
-
-        return percent
-
-    def _validate_stop_price(self, stop_price: Optional[float], entry_price: float) -> Optional[float]:
-        """Validate stop price for LONG positions. Returns None if invalid."""
-        if not stop_price:
-            return stop_price
-
-        if stop_price >= entry_price:
-            print(f"  ⚠️ WARNING: Stop ${stop_price:.2f} is above/equal to entry ${entry_price:.2f}")
-            print(f"  ⚠️ For LONG positions, stop must be BELOW entry. Using auto-calculated stop.")
-            return None
-
-        return stop_price
-
-    def _validate_target_price(self, target_price: Optional[float], entry_price: float) -> Optional[float]:
-        """Validate target price for LONG positions. Returns None if invalid."""
-        if not target_price:
-            return target_price
-
-        if target_price > 50:
-            print(f"  ⚠️ WARNING: Target ${target_price:.2f} seems too high for option premium")
-            print(f"  ⚠️ This might be a stock price, not premium. Using auto-calculated target instead.")
-            return None
-
-        if target_price <= entry_price:
-            print(f"  ⚠️ WARNING: Target ${target_price:.2f} is below/equal to entry ${entry_price:.2f}")
-            print(f"  ⚠️ For LONG positions, target must be ABOVE entry. Using auto-calculated target.")
-            return None
-
-        return target_price
-
-    def _calculate_bracket_prices(
-        self,
-        actual_fill_price: float,
-        original_stop: Optional[float],
-        original_target: Optional[float],
-    ) -> tuple[Optional[float], Optional[float]]:
-        """
-        Calculate bracket prices based on actual fill price.
-
-        Priority:
-        1. Use Discord alert stop/target if provided
-        2. Otherwise calculate from fill price using config percentages
-
-        Args:
-            actual_fill_price: Actual fill price from parent order
-            original_stop: Original stop price from Discord (or None)
-            original_target: Original target price from Discord (or None)
-
-        Returns:
-            (stop_price, target_price) tuple
-        """
-        # Validate Discord prices
-        stop_price = self._validate_stop_price(original_stop, actual_fill_price)
-        target_price = self._validate_target_price(original_target, actual_fill_price)
-
-        # Calculate from fill price if not provided
-        if not stop_price:
-            # Get stop percent from config (default: 50% for options)
-            stop_percent = self.config.get('risk', {}).get('auto_stop_loss_percent', 50.0)
-            stop_price = actual_fill_price * (1 - stop_percent / 100)
-            print(f"  ⓘ Auto stop-loss: ${stop_price:.2f} ({stop_percent}% below fill)")
-
-        if not target_price:
-            # Get risk/reward ratio from config (default: 0.6 for 0DTE)
-            rr_ratio = self.config.get('risk', {}).get('risk_reward_ratio', 0.6)
-            risk = actual_fill_price - stop_price
-
-            # Validate risk is positive (stop is below entry)
-            if risk <= 0:
-                print(f"  ⚠️ WARNING: Negative/zero risk detected (entry: ${actual_fill_price:.2f}, stop: ${stop_price:.2f})")
-                print(f"  ⚠️ Recalculating both stop and target with config defaults")
-                # Recalculate stop with config percentage
-                stop_percent = self.config.get('risk', {}).get('auto_stop_loss_percent', 50.0)
-                stop_price = actual_fill_price * (1 - stop_percent / 100)
-                risk = actual_fill_price - stop_price
-                print(f"  ⓘ Auto stop-loss: ${stop_price:.2f} ({stop_percent}% below fill)")
-
-            target_price = actual_fill_price + (risk * rr_ratio)
-            print(f"  ⓘ Auto target: ${target_price:.2f} (R:R = 1:{rr_ratio})")
-
-        # Round to 2 decimals for option premiums
-        if stop_price:
-            stop_price = round(stop_price, 2)
-        if target_price:
-            target_price = round(target_price, 2)
-
-        return stop_price, target_price
-
-    async def _create_bracket_orders(
-        self,
-        contract: Option,
-        quantity: int,
-        stop_price: Optional[float],
-        target_price: Optional[float],
-        session: TradeSession,
-    ) -> Optional[dict]:
-        """
-        Create OCO bracket orders (stop and target linked via OcaGroup).
-
-        These are standalone orders created AFTER entry fills.
-        They use IBKR's native OCO mechanism - when one fills, IBKR automatically
-        cancels the other. This is more reliable than manual callback cancellation.
-
-        Args:
-            contract: Qualified option contract
-            quantity: Number of contracts
-            stop_price: Stop loss price
-            target_price: Take profit price
-            session: Trade session to update with order IDs
-
-        Returns:
-            Dictionary with 'stop_order_id' and 'target_order_ids' keys, or None on error
-        """
-        order_ids = {}
-
-        try:
-            # Generate unique OCA group name for this session
-            # IBKR will automatically cancel other orders in same OCA group when one fills
-            oca_group = f"OCA_{session.session_id[:8]}"
-
-            # Create stop loss order (STOP order triggers when price drops to stop_price)
-            if stop_price:
-                from ib_insync import StopOrder
-                stop_order = StopOrder("SELL", quantity, stop_price)
-                stop_order.tif = "DAY"
-                stop_order.outsideRth = True  # Allow stop to work outside regular hours
-                stop_order.ocaGroup = oca_group  # Link to OCO group
-                stop_order.ocaType = 1  # 1 = Cancel all other orders in group on fill
-                stop_trade = self.ib.placeOrder(contract, stop_order)
-                await asyncio.sleep(0.2)  # Small delay for order submission
-                order_ids['stop_order_id'] = stop_trade.order.orderId
-                print(f"  ✓ Stop order created: ${stop_price:.2f} (Order #{stop_trade.order.orderId}, OCO: {oca_group})")
-
-            # Create target order
-            if target_price:
-                target_order = LimitOrder("SELL", quantity, target_price)
-                target_order.tif = "DAY"
-                target_order.outsideRth = True  # Allow target to work outside regular hours
-                target_order.ocaGroup = oca_group  # Link to same OCO group
-                target_order.ocaType = 1  # 1 = Cancel all other orders in group on fill
-                target_trade = self.ib.placeOrder(contract, target_order)
-                await asyncio.sleep(0.2)
-                order_ids['target_order_ids'] = [target_trade.order.orderId]
-                print(f"  ✓ Target order created: ${target_price:.2f} (Order #{target_trade.order.orderId}, OCO: {oca_group})")
-
-            # Log OCO confirmation
-            if stop_price and target_price:
-                print(f"  ✓ OCO group '{oca_group}' created - IBKR will auto-cancel remaining order when one fills")
-
-            return order_ids
-
-        except Exception as e:
-            print(f"  ⚠️ Failed to create bracket orders: {e}")
-            return None
-
-    def _calculate_trim_quantity(self, event: Event, session: TradeSession) -> int:
-        """
-        Calculate trim quantity from event.
-
-        Supports:
-        - Explicit quantity: event.quantity = 5
-        - Percentage: "half" = 50%, "third" = 33%
-
-        Args:
-            event: TRIM event
-            session: Current session
-
-        Returns:
-            Number of contracts to trim
-        """
-        current_qty = session.total_quantity
-
-        # If explicit quantity provided
-        if event.quantity and event.quantity > 0:
-            return event.quantity
-
-        # If percentage in risk_notes (e.g., "took off half")
-        if event.risk_notes:
-            notes_lower = event.risk_notes.lower()
-
-            if "half" in notes_lower or "50%" in notes_lower:
-                return max(1, int(current_qty * 0.5))
-            elif "third" in notes_lower or "33%" in notes_lower:
-                return max(1, int(current_qty * 0.33))
-            elif "quarter" in notes_lower or "25%" in notes_lower:
-                return max(1, int(current_qty * 0.25))
-            elif "all" in notes_lower or "full" in notes_lower or "100%" in notes_lower:
-                return current_qty
-
-        # Default: trim half (ensure at least 1 contract)
-        return max(1, int(current_qty * 0.5))
-
-    async def _update_brackets_for_trim(self, session: TradeSession, contract: Option):
-        """
-        Update bracket orders after TRIM to reflect new position size.
-
-        Strategy:
-        - Create new brackets (new quantity, same prices)
-        - Note: Old brackets already cancelled before TRIM order (in _execute_trim)
-        """
-        try:
-            # Check session state to prevent race condition with position reconciliation
-            if session.state != SessionState.OPEN:
-                print(f"    ⚠️ Skipping bracket update - session is {session.state.value}, not OPEN")
-                return
-
-            # Create new brackets after TRIM
-            print(f"    Creating new brackets after TRIM...")
-
-            # Note: Old brackets already cancelled before TRIM order
-            # No need to cancel again - just create new ones
-
-            # Calculate bracket prices using stored percentages
-            new_stop = None
-            new_target = None
-
-            if session.stop_loss_percent is not None:
-                new_stop = session.avg_entry_price * (1 + session.stop_loss_percent / 100)
-                new_stop = round(new_stop, 2)
-
-            if session.target_percent is not None:
-                new_target = session.avg_entry_price * (1 + session.target_percent / 100)
-                new_target = round(new_target, 2)
-
-            # Create new brackets with updated quantity
-            if new_stop or new_target:
-                bracket_result = await self._create_bracket_orders(
-                    contract=contract,
-                    quantity=session.total_quantity,  # Use NEW reduced quantity
-                    stop_price=new_stop,
-                    target_price=new_target,
-                    session=session,
-                )
-
-                # Update session with new bracket IDs
-                if bracket_result:
-                    session.stop_order_id = bracket_result.get('stop_order_id')
-                    session.target_order_ids = bracket_result.get('target_order_ids', [])
-                    print(f"    ✓ New brackets created for {session.total_quantity} contracts")
-
-        except Exception as e:
-            print(f"    ⚠️ Failed to update brackets after TRIM: {e}")
-            print(f"    ⚠️ Position may be unprotected - manual monitoring required!")
-
-    async def _update_brackets_for_add(self, session: TradeSession, contract: Option):
-        """
-        Update bracket orders after ADD based on new average entry price.
-
-        Uses percentage-based recalculation:
-        - If stop was -10% from old avg, make it -10% from new avg
-        - Same for target
-
-        Process:
-        1. Cancel old brackets
-        2. Calculate new bracket prices using stored percentages
-        3. Create new brackets with updated quantity and prices
-        """
-        try:
-            # Check session state to prevent race condition with position reconciliation
-            if session.state != SessionState.OPEN:
-                print(f"    ⚠️ Skipping bracket update - session is {session.state.value}, not OPEN")
-                return
-
-            # Cancel old brackets
-            print(f"    Updating brackets for new average...")
-
-            order_ids_to_cancel = []
-            if session.stop_order_id:
-                order_ids_to_cancel.append(session.stop_order_id)
-            if session.target_order_ids:
-                order_ids_to_cancel.extend(session.target_order_ids)
-
-            if order_ids_to_cancel:
-                await self._cancel_sibling_orders(order_ids_to_cancel)
-                print(f"    ✓ Cancelled {len(order_ids_to_cancel)} old bracket order(s)")
-
-            # Calculate new bracket prices using percentages
-            new_avg = session.avg_entry_price
-            new_stop = None
-            new_target = None
-
-            if session.stop_loss_percent is not None:
-                # Apply same percentage offset to new average
-                new_stop = new_avg * (1 + session.stop_loss_percent / 100)
-                new_stop = round(new_stop, 2)
-                print(f"    New Stop: ${new_stop:.2f} ({session.stop_loss_percent:+.1f}% from avg)")
-
-            if session.target_percent is not None:
-                new_target = new_avg * (1 + session.target_percent / 100)
-                new_target = round(new_target, 2)
-                print(f"    New Target: ${new_target:.2f} ({session.target_percent:+.1f}% from avg)")
-
-            # Create new brackets with updated quantity and prices
-            if new_stop or new_target:
-                bracket_result = await self._create_bracket_orders(
-                    contract=contract,
-                    quantity=session.total_quantity,  # Use NEW total quantity
-                    stop_price=new_stop,
-                    target_price=new_target,
-                    session=session,
-                )
-
-                # Update session with new bracket IDs
-                if bracket_result:
-                    session.stop_order_id = bracket_result.get('stop_order_id')
-                    session.target_order_ids = bracket_result.get('target_order_ids', [])
-                    print(f"    ✓ New brackets created for {session.total_quantity} contracts")
-            else:
-                print(f"    ⓘ No bracket percentages stored, skipping bracket update")
-
-        except Exception as e:
-            print(f"    ⚠️ Failed to update brackets after ADD: {e}")
-            print(f"    ⚠️ Position may be unprotected - manual monitoring required!")
-
-    async def _cancel_orders_for_contract(self, contract: Option) -> int:
-        """
-        Cancel all open orders for a given contract.
-
-        This is essential before placing EXIT orders to avoid race conditions
-        with existing bracket orders (stop loss / take profit).
-
-        Returns:
-            Number of orders cancelled
-        """
-        try:
-            # Get all open trades
-            open_trades = self.ib.openTrades()
-
-            cancelled_count = 0
-            for trade in open_trades:
-                # Check if this trade is for the same contract
-                if (trade.contract.symbol == contract.symbol and
-                    trade.contract.strike == contract.strike and
-                    trade.contract.right == contract.right and
-                    trade.contract.lastTradeDateOrContractMonth == contract.lastTradeDateOrContractMonth):
-
-                    # Cancel the order
-                    self.ib.cancelOrder(trade.order)
-                    cancelled_count += 1
-                    print(f"    Cancelled order {trade.order.orderId}: {trade.order.action} {trade.order.totalQuantity} @ ${trade.order.lmtPrice}")
-
-            # Give IBKR a moment to process cancellations
-            if cancelled_count > 0:
-                await asyncio.sleep(0.5)
-
-            return cancelled_count
-        except Exception as e:
-            print(f"  ⚠️  Error cancelling orders: {e}")
-            return 0
-
-    async def _get_market_price(self, contract: Option) -> Optional[float]:
-        """Get current market price for contract."""
-        try:
-            import math
-
-            # Use async qualification (contract should already be qualified, but ensure)
-            qualified = await self.ib.qualifyContractsAsync(contract)
-            if qualified:
-                contract = qualified[0]
-
-            ticker = self.ib.reqMktData(contract)
-            await asyncio.sleep(2)  # Wait for data (longer for delayed data)
-
-            # Clean NaN values
-            bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-            ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-            last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
-
-            # Use midpoint of bid/ask
-            if bid and ask:
-                return (bid + ask) / 2
-            elif last:
-                return last
-
-            return None
-        except Exception as e:
-            print(f"Error getting market price: {e}")
-            return None
-
-    async def _get_underlying_price(self, underlying_symbol: str) -> Optional[float]:
-        """
-        Get current stock price for underlying asset.
-
-        Args:
-            underlying_symbol: Stock symbol (SPY or QQQ)
-
-        Returns:
-            Current stock price or None on error
-        """
-        try:
-            from ib_insync import Stock
-
-            # Create stock contract
-            stock = Stock(symbol=underlying_symbol, exchange="SMART", currency="USD")
-
-            # Qualify contract
-            qualified = await self.ib.qualifyContractsAsync(stock)
-            if not qualified:
-                print(f"  ⚠️ Could not qualify stock contract for {underlying_symbol}")
-                return None
-
-            stock = qualified[0]
-
-            # Get market data
-            import math
-            ticker = self.ib.reqMktData(stock)
-            await asyncio.sleep(2)  # Wait for data (longer for delayed data)
-
-            # Clean NaN values
-            last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
-            bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-            ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-
-            # Use last price or midpoint
-            if last:
-                return last
-            elif bid and ask:
-                return (bid + ask) / 2
-
-            return None
-
-        except Exception as e:
-            print(f"  ⚠️ Failed to get underlying price for {underlying_symbol}: {e}")
-            return None
-
-    async def _convert_underlying_target_to_premium(
-        self,
-        contract: Option,
-        underlying_target: float,
-        current_underlying_price: float,
-    ) -> Optional[float]:
-        """
-        Convert underlying price target to option premium target.
-
-        Uses intrinsic value method:
-        - For CALL: intrinsic = max(0, underlying_target - strike)
-        - For PUT: intrinsic = max(0, strike - underlying_target)
-
-        Then adds time value estimate based on current premium.
-
-        Args:
-            contract: Option contract
-            underlying_target: Target stock price (e.g., 600.0 for QQQ)
-            current_underlying_price: Current stock price
-
-        Returns:
-            Estimated option premium at underlying_target price, or None on error
-        """
-        try:
-            # Get current option premium
-            current_premium = await self._get_market_price(contract)
-            if not current_premium or current_premium <= 0:
-                print(f"  ⚠️ Could not get current premium for target conversion")
-                return None
-
-            strike = contract.strike
-            is_call = contract.right == "C"
-
-            # Calculate current intrinsic value
-            if is_call:
-                current_intrinsic = max(0, current_underlying_price - strike)
-                target_intrinsic = max(0, underlying_target - strike)
-            else:  # PUT
-                current_intrinsic = max(0, strike - current_underlying_price)
-                target_intrinsic = max(0, strike - underlying_target)
-
-            # Estimate time value (extrinsic)
-            current_time_value = max(0, current_premium - current_intrinsic)
-
-            # For 0DTE options, time value decays quickly
-            # Assume 50% time value retention as underlying moves to target
-            estimated_premium = target_intrinsic + (current_time_value * 0.5)
-
-            # Round to 2 decimals
-            estimated_premium = round(estimated_premium, 2)
-
-            # Sanity check: premium should be positive and reasonable
-            if estimated_premium <= 0:
-                print(f"  ⚠️ Invalid premium estimate: ${estimated_premium:.2f}")
-                return None
-
-            print(f"  ⓘ Underlying target ${underlying_target:.2f} → Premium estimate ${estimated_premium:.2f}")
-            print(f"     (Current: ${current_underlying_price:.2f} underlying, ${current_premium:.2f} premium)")
-
-            return estimated_premium
-
-        except Exception as e:
-            print(f"  ⚠️ Failed to convert underlying target: {e}")
-            return None
-
-    async def _wait_for_fill(
-        self, trade: Trade, timeout: int = 30, notifier=None, session=None, order_type: str = "ORDER"
-    ) -> bool:
-        """
-        Wait for order to fill with real-time Telegram updates.
-
-        Args:
-            trade: The order trade to monitor
-            timeout: Max seconds to wait (default 30)
-            notifier: Telegram notifier for status updates (optional)
-            session: Trade session for context (optional)
-            order_type: Type of order (NEW, ADD, EXIT, etc.) for messaging
-
-        Returns:
-            True if filled, False if cancelled/timeout
-        """
-        # Check initial status immediately
-        if trade.orderStatus.status == "Filled":
-            return True
-        if trade.orderStatus.status in ["Cancelled", "ApiCancelled", "Inactive"]:
-            print(f"  ✗ Order cancelled: {trade.orderStatus.status}")
-            return False
-
-        # Get contract info for market data
-        contract = trade.contract
-        order = trade.order
-
-        # Check if this is a LIMIT order (not MARKET)
-        # CRITICAL: MarketOrder may have lmtPrice set to infinity/huge value by IBKR
-        import math
-        from ib_insync import LimitOrder
-
-        is_limit_order = isinstance(order, LimitOrder)
-        limit_price = None
-
-        if is_limit_order and hasattr(order, 'lmtPrice') and order.lmtPrice:
-            # Validate limit price is reasonable (not infinity)
-            if not math.isinf(order.lmtPrice) and not math.isnan(order.lmtPrice):
-                limit_price = order.lmtPrice
-            else:
-                print(f"  ⚠️ Invalid limit price detected: {order.lmtPrice}")
-                is_limit_order = False
-
-        # Request market data for real-time updates
-        ticker = None
-        if is_limit_order:
-            try:
-                ticker = self.ib.reqMktData(contract, snapshot=False)
-                # Wait longer for market data to populate (up to 3 seconds)
-                for attempt in range(6):  # 6 attempts × 0.5s = 3 seconds
-                    await asyncio.sleep(0.5)
-
-                    # Check if we got valid market data
-                    import math
-                    bid_valid = ticker.bid and not math.isnan(ticker.bid)
-                    ask_valid = ticker.ask and not math.isnan(ticker.ask)
-                    last_valid = ticker.last and not math.isnan(ticker.last)
-
-                    if bid_valid or ask_valid or last_valid:
-                        if bid_valid and ask_valid:
-                            print(f"  ✓ Live market data: Bid ${ticker.bid:.2f} / Ask ${ticker.ask:.2f}")
-                        elif last_valid:
-                            print(f"  ✓ Last trade: ${ticker.last:.2f} (delayed)")
-                        break
-
-                    if attempt == 5:  # Last attempt
-                        print(f"  ⚠️ No market data after 3s (markets closed or no subscription)")
-                        print(f"     You'll see 'Market data pending...' in Telegram updates")
-            except Exception as e:
-                print(f"  ⚠️ Market data request failed: {e}")
-                ticker = None
-
-        # Wait for status changes with periodic Telegram updates
-        last_telegram_update = 0
-        telegram_interval = 5  # Send updates every 5 seconds
-
-        for i in range(timeout):
-            await asyncio.sleep(1)
-
-            status = trade.orderStatus.status
-
-            # Check for fill
-            if status == "Filled":
-                # Cancel market data subscription
-                if ticker:
-                    try:
-                        self.ib.cancelMktData(contract)
-                    except:
-                        pass
+    async def _wait_for_fill(self, trade: Trade, timeout: int = 30) -> bool:
+        """Wait for order to fill with timeout."""
+        start_time = asyncio.get_event_loop().time()
+
+        while (asyncio.get_event_loop().time() - start_time) < timeout:
+            if trade.orderStatus.status == "Filled":
                 return True
-
-            # Check for cancellations/errors
-            if status in ["Cancelled", "ApiCancelled", "Inactive", "PendingCancel"]:
-                print(f"  ✗ Order cancelled: {status}")
-                if trade.log:
-                    # Print last log entry for debugging
-                    last_log = trade.log[-1]
-                    if last_log.message:
-                        print(f"    Reason: {last_log.message}")
-
-                # Cancel market data subscription
-                if ticker:
-                    try:
-                        self.ib.cancelMktData(contract)
-                    except:
-                        pass
+            if trade.orderStatus.status in ["Cancelled", "ApiCancelled"]:
                 return False
+            await asyncio.sleep(0.5)
 
-            # Send periodic updates (every 5 seconds)
-            if i > 0 and i % telegram_interval == 0:
-                # Terminal log with current market prices
-                if ticker:
-                    import math
-                    bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-                    ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-
-                    if bid and ask:
-                        print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status})")
-                        if is_limit_order and limit_price:
-                            print(f"     Market: Bid ${bid:.2f} | Ask ${ask:.2f} | Limit ${limit_price:.2f}")
-                        else:
-                            print(f"     Market: Bid ${bid:.2f} | Ask ${ask:.2f}")
-                        print(f"     Ticker update: {ticker.time if hasattr(ticker, 'time') else 'live'}")
-                    else:
-                        print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status}, market data pending...)")
-                else:
-                    print(f"  ⏳ Waiting for fill... ({i}s elapsed, status: {status})")
-
-                # Telegram update with market analysis
-                # Send updates even if ticker is None (will show "no market data" message)
-                if notifier and is_limit_order:
-                    await self._send_fill_status_update(
-                        notifier=notifier,
-                        session=session,
-                        order_type=order_type,
-                        limit_price=limit_price,
-                        ticker=ticker,  # Can be None - function handles it
-                        status=status,
-                        elapsed=i,
-                        timeout=timeout,
-                        order_action=order.action,
-                        order_quantity=order.totalQuantity
-                    )
-                    last_telegram_update = i
-
-        # Timeout - send final update
-        print(f"  ✗ Order timed out after {timeout}s (status: {trade.orderStatus.status})")
-
-        # Send timeout alert even if ticker is None
-        if notifier and is_limit_order:
-            await self._send_timeout_alert(
-                notifier=notifier,
-                session=session,
-                order_type=order_type,
-                limit_price=limit_price,
-                ticker=ticker,  # Can be None - function handles it
-                final_status=trade.orderStatus.status,
-                order_action=order.action
-            )
-
-        # Cancel market data subscription
-        if ticker:
-            try:
-                self.ib.cancelMktData(contract)
-            except:
-                pass
-
-        return False
-
-    async def _send_fill_status_update(
-        self,
-        notifier,
-        session,
-        order_type: str,
-        limit_price: float,
-        ticker,
-        status: str,
-        elapsed: int,
-        timeout: int,
-        order_action: str = "BUY",
-        order_quantity: int = 1
-    ):
-        """Send real-time fill status update to Telegram."""
-        try:
-            import math
-
-            # Get current market prices (handle ticker being None)
-            bid = None
-            ask = None
-            last = None
-
-            if ticker:
-                bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-                ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-                last = ticker.last if ticker.last and not math.isnan(ticker.last) else None
-
-            # Build symbol
-            symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session else "Position"
-
-            # Build concise message
-            text = f"⏳ <b>{symbol}</b> - {order_action} {order_quantity} @ ${limit_price:.2f} ({elapsed}/{timeout}s)\n\n"
-
-            if bid and ask:
-                spread = ask - bid
-                text += f"Market: ${bid:.2f} / ${ask:.2f} (spread ${spread:.2f})\n"
-
-                # Determine why not filling
-                if order_action == "BUY":
-                    if limit_price < ask:
-                        gap = ask - limit_price
-                        text += f"❌ Limit too low by ${gap:.2f}"
-                    elif limit_price >= ask:
-                        text += f"✅ Should fill soon"
-                elif order_action == "SELL":
-                    if limit_price > bid:
-                        gap = limit_price - bid
-                        text += f"❌ Limit too high by ${gap:.2f}"
-                    elif limit_price <= bid:
-                        text += f"✅ Should fill soon"
-            elif last:
-                # Only last trade available (delayed data)
-                text += f"Last: ${last:.2f} (delayed)\n"
-                text += f"<i>Live market data unavailable</i>"
-            else:
-                # No market data at all
-                from datetime import datetime
-                now_et = datetime.now()  # Approximate ET time
-                hour_et = now_et.hour - 6  # CST to ET approximation
-                if hour_et < 9 or hour_et >= 16:
-                    text += f"<i>Markets closed - no live data</i>"
-                else:
-                    text += f"<i>Market data pending (check IBKR subscription)</i>"
-
-            await notifier.send_message(text)
-
-        except Exception as e:
-            print(f"  Warning: Could not send fill status update: {e}")
-
-    async def _send_timeout_alert(
-        self,
-        notifier,
-        session,
-        order_type: str,
-        limit_price: float,
-        ticker,
-        final_status: str,
-        order_action: str = "BUY"
-    ):
-        """Send timeout alert with explanation to Telegram."""
-        try:
-            import math
-
-            # Handle ticker being None
-            bid = None
-            ask = None
-            if ticker:
-                bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) else None
-                ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) else None
-
-            symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session else "Position"
-
-            # Build concise timeout message
-            text = f"⏱️ <b>{symbol}</b> - Order TIMEOUT @ ${limit_price:.2f}\n\n"
-
-            if bid and ask:
-                text += f"Market: ${bid:.2f} / ${ask:.2f}\n"
-
-                if order_action == "BUY" and limit_price < ask:
-                    gap = ask - limit_price
-                    text += f"Limit too low by ${gap:.2f} - market didn't come down"
-                elif order_action == "SELL" and limit_price > bid:
-                    gap = limit_price - bid
-                    text += f"Limit too high by ${gap:.2f} - market didn't come up"
-                else:
-                    text += f"Order didn't fill within timeout"
-            else:
-                text += f"Order didn't fill within timeout"
-
-            text += f"\n\n<i>Order cancelled</i>"
-
-            await notifier.send_message(text)
-
-        except Exception as e:
-            print(f"  Warning: Could not send timeout alert: {e}")
-
-    async def get_account_balance(self) -> Optional[float]:
-        """
-        Get current account balance from IBKR.
-
-        Returns:
-            Account net liquidation value, or None if unavailable
-        """
-        if not self.connected:
-            return None
-
-        try:
-            # Wait a moment for initial data to populate after connection
-            await asyncio.sleep(1)
-
-            # Get account values (already populated by ib_insync after connection)
-            account_values = self.ib.accountValues()
-
-            # Find NetLiquidation value
-            for item in account_values:
-                if item.tag == 'NetLiquidation':
-                    return float(item.value)
-
-            # If not found, try accountSummary
-            account_summary = self.ib.accountSummary()
-            for item in account_summary:
-                if item.tag == 'NetLiquidation':
-                    return float(item.value)
-
-            return None
-        except Exception as e:
-            print(f"Error getting account balance: {e}")
-            return None
-
-    async def get_unrealized_pnl(self) -> float:
-        """
-        Get total unrealized P&L from IBKR.
-
-        Returns:
-            Total unrealized P&L in base currency (USD), or 0.0 if unavailable
-        """
-        if not self.connected:
-            return 0.0
-
-        try:
-            # Get account values (already populated by ib_insync after connection)
-            account_values = self.ib.accountValues()
-
-            # Find UnrealizedPnL value
-            for item in account_values:
-                if item.tag == 'UnrealizedPnL':
-                    try:
-                        return float(item.value)
-                    except ValueError:
-                        continue
-
-            # If not found, try accountSummary
-            account_summary = self.ib.accountSummary()
-            for item in account_summary:
-                if item.tag == 'UnrealizedPnL':
-                    try:
-                        return float(item.value)
-                    except ValueError:
-                        continue
-
-            return 0.0
-        except Exception as e:
-            print(f"Error getting unrealized P&L: {e}")
-            return 0.0
-
-    def get_cash_details(self) -> Optional[dict]:
-        """
-        Get detailed cash information from IBKR (critical for Cash accounts with T+1 settlement).
-
-        Returns:
-            Dict with cash breakdown, or None if unavailable:
-            {
-                'net_liquidation': float,      # Total account value
-                'total_cash': float,            # Total cash (including unsettled)
-                'available_funds': float,       # Cash available for trading TODAY
-                'settled_cash': float,          # Fully settled cash only (T+1)
-                'buying_power': float,          # Available buying power
-            }
-        """
-        if not self.connected:
-            return None
-
-        try:
-            # Use wrapper to handle ib_insync's event loop properly
-            cash_info = {}
-            tags_to_find = {
-                'NetLiquidation': 'net_liquidation',
-                'TotalCashValue': 'total_cash',
-                'AvailableFunds': 'available_funds',
-                'SettledCash': 'settled_cash',
-                'BuyingPower': 'buying_power',
-            }
-
-            # Get account values (cached, doesn't require async)
-            try:
-                account_values = self.ib.accountValues()
-
-                # Extract values from account data
-                for item in account_values:
-                    if item.tag in tags_to_find:
-                        key = tags_to_find[item.tag]
-                        try:
-                            cash_info[key] = float(item.value)
-                        except (ValueError, TypeError):
-                            cash_info[key] = None
-            except RuntimeError as e:
-                if "event loop" in str(e).lower():
-                    # Event loop conflict - use alternative approach
-                    return None
-                raise
-
-            # If any values missing, try accountSummary as fallback
-            if len(cash_info) < len(tags_to_find):
-                try:
-                    account_summary = self.ib.accountSummary()
-                    for item in account_summary:
-                        if item.tag in tags_to_find:
-                            key = tags_to_find[item.tag]
-                            if key not in cash_info or cash_info[key] is None:
-                                try:
-                                    cash_info[key] = float(item.value)
-                                except (ValueError, TypeError):
-                                    cash_info[key] = None
-                except RuntimeError as e:
-                    if "event loop" in str(e).lower():
-                        # Return what we have so far
-                        return cash_info if cash_info else None
-                    raise
-
-            return cash_info if cash_info else None
-
-        except Exception as e:
-            # Silently fail - not critical, just nice-to-have info
-            return None
-
-    async def _display_account_balance(self):
-        """Display account balance and cash details on connection."""
-        try:
-            # Give IBKR extra time to populate account data after connection
-            await asyncio.sleep(2)
-
-            # Get detailed cash info (critical for Cash accounts)
-            try:
-                cash_details = self.get_cash_details()
-            except Exception as e:
-                print(f"Warning: Could not fetch cash details: {e}")
-                cash_details = None
-
-            if cash_details:
-                print("=" * 60)
-                print("💰 ACCOUNT SUMMARY")
-                print("=" * 60)
-
-                net_liq = cash_details.get('net_liquidation')
-                if net_liq:
-                    print(f"Total Value:      ${net_liq:,.2f}")
-
-                available = cash_details.get('available_funds')
-                if available is not None:
-                    print(f"Available Cash:   ${available:,.2f}")
-
-                settled = cash_details.get('settled_cash')
-                if settled is not None and settled != available:
-                    print(f"Settled Cash:     ${settled:,.2f}  (T+1 settlement)")
-
-                total_cash = cash_details.get('total_cash')
-                if total_cash is not None and total_cash != available:
-                    print(f"Total Cash:       ${total_cash:,.2f}  (includes unsettled)")
-
-                buying_power = cash_details.get('buying_power')
-                if buying_power is not None:
-                    print(f"Buying Power:     ${buying_power:,.2f}")
-
-                print("=" * 60)
-
-            else:
-                # Fallback to simple balance display
-                balance = await self.get_account_balance()
-                if balance:
-                    print(f"Account Balance: ${balance:,.2f}")
-                else:
-                    print("Account Balance: Unable to retrieve (data may not be ready yet)")
-
-        except Exception as e:
-            print(f"Could not retrieve account info: {e}")
+        return trade.orderStatus.status == "Filled"
 
     async def get_positions(self) -> list:
-        """
-        Get current positions from IBKR.
-
-        Returns:
-            List of Position objects with contract and quantity info
-        """
-        if not self.connected:
-            return []
-
-        try:
-            await asyncio.sleep(1)  # Wait for data to populate
-            positions = self.ib.positions()
-            return positions
-        except Exception as e:
-            print(f"Error getting positions: {e}")
-            return []
+        """Get all open positions."""
+        return self.ib.positions()
 
     async def get_open_orders(self) -> list:
-        """
-        Get current open orders from IBKR.
+        """Get all open orders."""
+        return [t for t in self.ib.trades() if t.isActive()]
 
-        Returns:
-            List of Trade objects with order info
-        """
-        if not self.connected:
-            return []
-
+    async def get_account_balance(self) -> Optional[float]:
+        """Get current account balance."""
         try:
-            await asyncio.sleep(1)  # Wait for data to populate
-            open_orders = self.ib.openTrades()
-            return open_orders
+            account_values = self.ib.accountSummary()
+            for av in account_values:
+                if av.tag == "NetLiquidation":
+                    return float(av.value)
+        except:
+            pass
+        return None
+
+    async def get_margin_requirement(self, symbol: str = "MNQ") -> Optional[float]:
+        """
+        Get initial margin requirement per contract from IBKR.
+
+        Uses whatIfOrder to simulate a 1-contract order and get margin impact.
+        Returns the initial margin required per contract.
+        """
+        try:
+            contract = self._build_contract(symbol)
+            qualified = await self.ib.qualifyContractsAsync(contract)
+
+            if not qualified:
+                print(f"Could not qualify contract for margin check: {symbol}")
+                return None
+
+            contract = qualified[0]
+
+            # Simulate a 1-contract BUY order to get margin requirement
+            order = MarketOrder("BUY", 1)
+            order.whatIf = True
+
+            # whatIfOrder returns OrderState with margin info
+            order_state = await self.ib.whatIfOrderAsync(contract, order)
+
+            if order_state:
+                # initMarginChange is the margin required for this order
+                init_margin = float(order_state.initMarginChange)
+                print(f"IBKR Margin for {symbol}: ${init_margin:,.2f} per contract")
+                return init_margin
+            else:
+                print(f"Could not get margin info for {symbol}")
+                return None
+
         except Exception as e:
-            print(f"Error getting open orders: {e}")
-            return []
+            print(f"Error fetching margin requirement: {e}")
+            return None
 
-    async def display_account_status(self):
-        """Display complete account status: balance, positions, and open orders."""
-        print("\n" + "="*60)
-        print("IBKR ACCOUNT STATUS")
-        print("="*60)
+    async def get_futures_price(self, symbol: str = "MNQ") -> Optional[float]:
+        """
+        Get current futures price from IBKR.
 
-        # Balance
-        balance = await self.get_account_balance()
-        if balance:
-            print(f"\n💰 Account Balance: ${balance:,.2f}")
-        else:
-            print("\n💰 Account Balance: Unable to retrieve")
+        Returns the last traded price or mid-point if available.
+        """
+        try:
+            contract = self._build_contract(symbol)
+            qualified = await self.ib.qualifyContractsAsync(contract)
 
-        # Positions
-        positions = await self.get_positions()
-        print(f"\n📊 Current Positions ({len(positions)}):")
-        if positions:
-            for pos in positions:
-                contract = pos.contract
-                symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
-                print(f"  • {symbol}: {pos.position} contracts @ avg ${pos.avgCost:.2f}")
-        else:
-            print("  No open positions")
+            if not qualified:
+                return None
 
-        # Open Orders
-        open_orders = await self.get_open_orders()
-        print(f"\n📋 Open Orders ({len(open_orders)}):")
-        if open_orders:
-            for trade in open_orders:
-                contract = trade.contract
-                order = trade.order
-                symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
-                status = trade.orderStatus.status
-                print(f"  • {order.action} {order.totalQuantity} {symbol} @ ${order.lmtPrice:.2f} - {status}")
-        else:
-            print("  No open orders")
+            contract = qualified[0]
 
-        print("="*60 + "\n")
+            # Request market data
+            self.ib.reqMktData(contract, '', False, False)
+            await asyncio.sleep(2)  # Wait for data
+
+            ticker = self.ib.ticker(contract)
+
+            if ticker:
+                # Prefer last price, then mid, then close
+                if ticker.last and ticker.last > 0:
+                    return ticker.last
+                elif ticker.bid and ticker.ask:
+                    return (ticker.bid + ticker.ask) / 2
+                elif ticker.close:
+                    return ticker.close
+
+            return None
+
+        except Exception as e:
+            print(f"Error fetching futures price: {e}")
+            return None
+
+    async def close_all_positions(self) -> list[OrderResult]:
+        """Emergency: Close all open positions."""
+        results = []
+        positions = self.ib.positions()
+
+        for pos in positions:
+            if pos.position != 0:
+                try:
+                    action = "SELL" if pos.position > 0 else "BUY"
+                    qty = abs(int(pos.position))
+                    order = MarketOrder(action, qty)
+                    trade = self.ib.placeOrder(pos.contract, order)
+
+                    filled = await self._wait_for_fill(trade, timeout=30)
+
+                    results.append(OrderResult(
+                        success=filled,
+                        order_id=trade.order.orderId,
+                        status=OrderStatus.FILLED if filled else OrderStatus.CANCELLED,
+                        filled_price=trade.orderStatus.avgFillPrice if filled else None,
+                        message=f"Closed {qty} {pos.contract.symbol}",
+                    ))
+                except Exception as e:
+                    results.append(OrderResult(
+                        success=False,
+                        status=OrderStatus.REJECTED,
+                        message=f"Failed to close {pos.contract.symbol}: {e}",
+                    ))
+
+        return results

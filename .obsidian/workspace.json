@@ -20,8 +20,21 @@
               "icon": "lucide-file",
               "title": "TRADINGVIEW_FINAL"
             }
+          },
+          {
+            "id": "101af3423d75fb6e",
+            "type": "leaf",
+            "state": {
+              "type": "release-notes",
+              "state": {
+                "currentVersion": "1.11.4"
+              },
+              "icon": "lucide-book-up",
+              "title": "Release Notes 1.11.4"
+            }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "vertical"
@@ -183,7 +196,7 @@
       "bases:Create new base": false
     }
   },
-  "active": "b98d20507c559b6f",
+  "active": "101af3423d75fb6e",
   "lastOpenFiles": [
     "README.md",
     "TRADINGVIEW_FINAL.md",

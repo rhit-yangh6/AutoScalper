@@ -1,42 +1,31 @@
+"""
+MNQ Futures Trading Orchestrator
+
+Main orchestrator that coordinates all components for MNQ futures scalping.
+TradingView webhook is the sole signal source.
+"""
+
 import asyncio
-import os
-import platform
 from datetime import datetime, time, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 
-from ..llm_parser import LLMParser
 from ..risk_gate import RiskGate, RiskDecision
 from ..execution import ExecutionEngine
-from ..execution.executor import OrderResult
-from ..discord_listener import DiscordListener
+from ..execution.executor import OrderResult, OrderStatus
 from ..tradingview_listener import TradingViewListener
 from .session_manager import SessionManager
-from ..models import Event, EventType, SessionState, TradeSession, Direction
+from ..models import Event, EventType, SessionState, TradeSession, PositionSide
 from ..logging import init_logger, get_logger, DailySnapshotManager
 from ..notifications import init_notifier, get_notifier
-
-# Optional psutil for system monitoring
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
 
 
 class TradingOrchestrator:
     """
-    Main orchestrator that coordinates all components.
+    Main orchestrator for MNQ futures trading.
 
-    Flow (MIKE mode - Discord):
-    1. Discord message received
-    2. LLM parses to Event
-    3. Session manager correlates Event to TradeSession
-    4. Risk gate validates
-    5. Execution engine executes (if approved)
-
-    Flow (INDICATOR mode - TradingView):
+    Flow:
     1. TradingView webhook received
     2. Parse structured JSON to Event (no LLM)
     3. Session manager correlates Event to TradeSession
@@ -47,11 +36,7 @@ class TradingOrchestrator:
     def __init__(self, config: dict):
         self.config = config
 
-        # Initialize components
-        print("Initializing Trading Orchestrator...")
-
-        # Get signal source mode
-        self.mode = config.get("mode", "MIKE").upper()
+        print("Initializing MNQ Futures Trading Orchestrator...")
 
         # Initialize logger
         log_dir = config.get("log_dir", "logs")
@@ -72,137 +57,56 @@ class TradingOrchestrator:
             self.notifier = None
             print("Telegram notifications disabled")
 
-        # Initialize LLM parser (only needed for MIKE mode)
-        if self.mode == "MIKE":
-            self.parser = LLMParser(
-                api_key=config["anthropic_api_key"],
-                model=config.get("llm_model", "claude-opus-4-5-20251101"),
-            )
-        else:
-            self.parser = None  # Not needed for INDICATOR mode
-
+        # Initialize components
         self.session_manager = SessionManager()
-
         self.risk_gate = RiskGate(config["risk"])
-
-        # Determine order strategy based on IBKR port and config
-        # Gateway ports: 4001 (live), 4002 (paper)
-        # TWS ports: 7497 (live), 7496 (paper)
-        # Paper accounts always use market orders (delayed data)
-        # Live accounts can use market OR limit orders (configurable)
-        ibkr_port = config["ibkr"]["port"]
-        paper_ports = [4002, 7496]  # Gateway paper, TWS paper
-        force_market = config["ibkr"].get("force_market_orders", False)
-
-        # Use market orders if: paper account OR force_market_orders=true
-        use_market_orders = (ibkr_port in paper_ports) or force_market
 
         self.executor = ExecutionEngine(
             host=config["ibkr"]["host"],
-            port=ibkr_port,
+            port=config["ibkr"]["port"],
             client_id=config["ibkr"]["client_id"],
             session_manager=self.session_manager,
-            use_market_orders=use_market_orders,
             config=config,
-            notifier=self.notifier,  # Pass Telegram notifier for real-time updates
+            notifier=self.notifier,
         )
 
-        # Register bracket fill callback
-        self.executor.on_bracket_filled = self._on_bracket_filled
-
-        # Register connection callbacks
-        self.executor.on_disconnected = self._on_ibkr_disconnected
-        self.executor.on_reconnected = self._on_ibkr_reconnected
-
-        # Initialize signal listener based on mode
-        if self.mode == "MIKE":
-            # MIKE mode: Discord + LLM parsing
-            self.discord_listener = DiscordListener(
-                token=config["discord"]["user_token"],
-                channel_ids=config["discord"]["channel_ids"],
-                monitored_users=config["discord"].get("monitored_users"),
-                message_callback=self.on_discord_message,
-            )
-            self.tradingview_listener = None
-            print(f"✓ Signal source: MIKE mode (Discord + LLM)")
-        elif self.mode == "INDICATOR":
-            # INDICATOR mode: TradingView webhook
-            self.tradingview_listener = TradingViewListener(
-                port=config["tradingview"]["webhook_port"],
-                webhook_secret=config["tradingview"]["webhook_secret"],
-                on_signal=self.on_tradingview_signal,
-            )
-            self.discord_listener = None
-            print(f"✓ Signal source: INDICATOR mode (TradingView webhook)")
-        else:
-            raise ValueError(f"Invalid MODE: {self.mode}. Must be 'MIKE' or 'INDICATOR'")
+        # Initialize TradingView webhook listener
+        self.tradingview_listener = TradingViewListener(
+            port=config["tradingview"]["webhook_port"],
+            webhook_secret=config["tradingview"]["webhook_secret"],
+            on_signal=self.on_tradingview_signal,
+        )
+        print(f"✓ Signal source: TradingView webhook")
 
         # State
         self.running = False
         self.dry_run = config.get("dry_run", True)
-        self.start_time = None  # Will be set when bot starts
+        self.start_time = None
 
-        print(
-            f"Orchestrator initialized (dry_run={self.dry_run})"
-        )
-
-    def _categorize_orders(self, open_orders, open_sessions):
-        """Categorize orders into entry, stop, and target."""
-        bracket_order_ids = set()
-        for session in open_sessions:
-            if session.stop_order_id:
-                bracket_order_ids.add(session.stop_order_id)
-            if session.target_order_ids:
-                bracket_order_ids.update(session.target_order_ids)
-
-        entry_orders, stop_orders, target_orders = [], [], []
-
-        for trade in open_orders:
-            order_id = trade.order.orderId
-            if order_id not in bracket_order_ids:
-                entry_orders.append(trade)
-                continue
-
-            # Find bracket type
-            for session in open_sessions:
-                if session.stop_order_id == order_id:
-                    stop_orders.append(trade)
-                    break
-                elif session.target_order_ids and order_id in session.target_order_ids:
-                    target_orders.append(trade)
-                    break
-
-        return entry_orders, stop_orders, target_orders
-
-    def _get_resource_emoji(self, percent: float, warn_threshold: float, critical_threshold: float) -> str:
-        """Get emoji based on resource usage percentage."""
-        if percent < warn_threshold:
-            return "✅"
-        elif percent < critical_threshold:
-            return "⚠️"
-        return "🔴"
+        print(f"Orchestrator initialized (dry_run={self.dry_run})")
 
     async def start(self):
         """Start the orchestrator."""
         print("\n" + "=" * 60)
-        print("STARTING AUTOSCALPER")
+        print("STARTING MNQ FUTURES SCALPER")
         print("=" * 60)
         print(f"Mode: {'DRY-RUN (No IBKR)' if self.dry_run else 'LIVE TRADING'}")
-        print(f"Risk per trade: {self.config['risk']['risk_per_trade_percent']}%")
-        print(f"Daily max loss: {self.config['risk']['daily_max_loss_percent']}%")
-        print(f"Max contracts: {self.config['risk']['max_contracts']}")
+        print(f"Daily max loss: ${self.config['risk']['daily_max_loss']}")
+        num_contracts = self.config['risk'].get('num_contracts', 1)
+        if num_contracts == 0:
+            print(f"Contracts: AUTO (based on balance)")
+        else:
+            print(f"Contracts: {num_contracts}")
         print("=" * 60 + "\n")
 
         self.running = True
         self.start_time = datetime.now(timezone.utc)
 
-        # Connect to IBKR (only if not in paper mode)
+        # Connect to IBKR
         if not self.dry_run:
             print("Connecting to IBKR...")
-
-            # Retry connection up to 10 times with exponential backoff
             max_retries = 10
-            retry_delay = 5  # Start with 5 seconds
+            retry_delay = 5
 
             for attempt in range(1, max_retries + 1):
                 print(f"Connection attempt {attempt}/{max_retries}...")
@@ -214,45 +118,31 @@ class TradingOrchestrator:
                 if attempt < max_retries:
                     print(f"Connection failed. Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, 60)  # Max 60 seconds
+                    retry_delay = min(retry_delay * 2, 60)
                 else:
-                    print("ERROR: Failed to connect to IBKR after all retries. Exiting.")
+                    print("ERROR: Failed to connect to IBKR. Exiting.")
                     return
+
+            # Fetch live margin requirement from IBKR
+            await self._fetch_margin_requirement()
         else:
-            print("Skipping IBKR connection (paper mode - no orders will be sent)")
+            print("Skipping IBKR connection (dry-run mode)")
 
-        # Start signal listener based on mode
-        if self.mode == "MIKE":
-            print("Starting Discord listener...")
-            asyncio.create_task(self.discord_listener.start())
-        elif self.mode == "INDICATOR":
-            print("Starting TradingView webhook server...")
-            await self.tradingview_listener.start()
+        # Start TradingView webhook
+        print("Starting TradingView webhook server...")
+        await self.tradingview_listener.start()
 
-        # Start daily summary and snapshot tasks if Telegram enabled
+        # Start background tasks
         if self.notifier:
-            print("Starting daily summary scheduler...")
-            asyncio.create_task(self._daily_summary_task())
-            print("Starting daily snapshot scheduler...")
-            asyncio.create_task(self._daily_snapshot_task())
-
-            # Register and start Telegram command polling
             print("Starting Telegram command handler...")
             self.notifier.register_command_handler("status", self._handle_status_command)
-            self.notifier.register_command_handler("server", self._handle_server_command)
             self.notifier.register_command_handler("closeall", self._handle_closeall_command)
-            asyncio.create_task(self._telegram_command_polling_task())
+            self.notifier.register_command_handler("restartgw", self._handle_restartgw_command)
+            asyncio.create_task(self._telegram_polling_task())
 
-        # Start connection monitoring (if not in dry-run mode)
         if not self.dry_run:
-            print("Starting IBKR connection monitor...")
+            print("Starting connection monitor...")
             asyncio.create_task(self._connection_monitor_task())
-
-            print("Starting position reconciliation...")
-            asyncio.create_task(self._position_reconciliation_task())
-
-            print("Starting EOD auto-close scheduler...")
-            asyncio.create_task(self._eod_auto_close_task())
 
         # Keep running
         try:
@@ -268,521 +158,311 @@ class TradingOrchestrator:
         print("\nStopping orchestrator...")
         self.running = False
 
-        # Stop signal listener based on mode
-        if self.mode == "MIKE" and self.discord_listener:
-            await self.discord_listener.stop()
-        elif self.mode == "INDICATOR" and self.tradingview_listener:
+        if self.tradingview_listener:
             await self.tradingview_listener.stop()
 
-        # Only disconnect from IBKR if we connected
         if not self.dry_run:
             await self.executor.disconnect()
 
-        # Flush all logs
         print("Flushing logs...")
         self.logger.flush_all()
 
         print("Orchestrator stopped.")
 
-    async def _daily_snapshot_task(self):
+    async def on_tradingview_signal(self, event: Event):
         """
-        Background task that takes snapshot at trading_hours_start.
+        Callback for TradingView webhook signals.
 
-        Uses TRADING_HOURS_START from config (default: 13:30 UTC = 9:30 AM ET)
+        This is the main processing pipeline.
         """
-        snapshot_time_str = self.config["risk"]["trading_hours_start"]
+        session = None
         try:
-            hour, minute = map(int, snapshot_time_str.split(":"))
-            snapshot_time = time(hour=hour, minute=minute)
-        except (ValueError, TypeError, AttributeError) as e:
-            # Default to 9:30 AM ET (13:30 UTC)
-            snapshot_time = time(hour=13, minute=30)
-            print(f"Invalid snapshot time format: {e}")
+            print(f"\n{'='*60}")
+            print(f"PROCESSING SIGNAL: {event.event_type.value}")
+            print(f"{'='*60}")
 
-        print(f"Daily snapshot will be taken at {snapshot_time_str} UTC (trading hours start)")
+            # Step 0: Check for position flip (opposite side needs to be closed first)
+            if event.event_type == EventType.NEW:
+                opposite_session = self.session_manager.check_for_flip(event)
+                if opposite_session and opposite_session.state == SessionState.OPEN:
+                    print("\n[FLIP DETECTED] Closing opposite position first...")
+                    print(f"  Closing: {opposite_session.symbol} {opposite_session.position_side.value}")
+                    await self._close_session_for_flip(opposite_session)
 
-        while self.running:
-            now = datetime.now(timezone.utc)
-            target_time = datetime.combine(now.date(), snapshot_time, tzinfo=timezone.utc)
+            # Step 1: Correlate to session
+            print("\n[1/4] Correlating to trade session...")
+            try:
+                session = self.session_manager.process_event(event)
+            except ValueError as e:
+                print(f"✗ Session error: {e}")
+                if self.notifier:
+                    await self.notifier.send_message(f"⚠️ Signal rejected: {e}")
+                return
 
-            # If target time already passed today, check if snapshot exists
-            if now > target_time:
-                # Try to take snapshot now (will skip if already exists)
-                try:
-                    snapshot = await self.snapshot_manager.take_snapshot(
-                        executor=self.executor,
-                        dry_run=self.dry_run,
-                        account_balance_config=self.config["risk"]["account_balance"],
-                        trading_hours_start=snapshot_time_str
+            if not session:
+                print("✓ Event processed (non-actionable)")
+                return
+
+            print(f"✓ Session {session.session_id[:8]}...")
+            print(f"  {session.symbol} {session.position_side.value if session.position_side else '?'}")
+            print(f"  State: {session.state}")
+
+            # Step 2: Risk validation
+            print("\n[2/4] Validating with risk gate...")
+
+            unrealized_pnl = 0.0
+            if not self.dry_run and self.executor.connected:
+                balance = await self.executor.get_account_balance()
+                if balance:
+                    self.risk_gate.update_account_balance(balance)
+
+            risk_result = self.risk_gate.validate(
+                event=event,
+                session=session,
+                unrealized_pnl=unrealized_pnl,
+            )
+
+            status = "✓" if risk_result.decision == RiskDecision.APPROVE else "✗"
+            print(f"{status} {risk_result.decision}: {risk_result.reason}")
+
+            if risk_result.decision == RiskDecision.REJECT:
+                if event.event_type == EventType.NEW:
+                    session.state = SessionState.CANCELLED
+                    session.closed_at = datetime.now(timezone.utc)
+
+                if self.notifier:
+                    await self.notifier.send_message(
+                        f"⚠️ <b>Trade Rejected</b>\n\n"
+                        f"{event.symbol} {event.position_side.value if event.position_side else ''}\n"
+                        f"Reason: {risk_result.reason}"
                     )
-                    if snapshot:
-                        print(f"✓ Daily snapshot taken: ${snapshot['account_balance']:,.2f}")
-                except Exception as e:
-                    print(f"✗ Failed to take snapshot: {e}")
+                return
 
-                # Schedule for tomorrow
-                from datetime import timedelta
-                target_time += timedelta(days=1)
+            # Step 3: Calculate position size
+            print("\n[3/4] Calculating position size...")
+            quantity = self.risk_gate.calculate_position_size(event, session)
+            print(f"✓ Position size: {quantity} contracts")
 
-            # Calculate seconds until target time
-            seconds_until_snapshot = (target_time - now).total_seconds()
+            if quantity == 0:
+                print("⚠️ Position size = 0 (limit reached)")
+                return
 
-            # Wait until snapshot time
-            await asyncio.sleep(seconds_until_snapshot)
+            # Step 4: Execute
+            print("\n[4/4] Executing order...")
 
-            # Take snapshot
-            if self.running:
-                try:
-                    print(f"\nTaking daily snapshot at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}...")
+            if self.dry_run:
+                print("  [DRY-RUN] Order would be executed")
+                result = OrderResult(
+                    success=True,
+                    status=OrderStatus.FILLED,
+                    message="[DRY-RUN] Simulated fill"
+                )
+            else:
+                result = await self.executor.execute_event(
+                    event=event,
+                    session=session,
+                    quantity=quantity,
+                )
 
-                    snapshot = await self.snapshot_manager.take_snapshot(
-                        executor=self.executor,
-                        dry_run=self.dry_run,
-                        account_balance_config=self.config["risk"]["account_balance"],
-                        trading_hours_start=snapshot_time_str
+            # Log result
+            if result.success:
+                print(f"✓ {result.message}")
+                self.logger.log_execution(session, event, result)
+
+                # Send Telegram notification
+                if self.notifier:
+                    if event.event_type == EventType.NEW:
+                        side = event.position_side.value if event.position_side else "?"
+                        await self.notifier.send_message(
+                            f"✅ <b>Entry Filled</b>\n\n"
+                            f"{event.symbol} {side}\n"
+                            f"Entry: ${result.filled_price:.2f}\n"
+                            f"Qty: {quantity}"
+                        )
+                    elif event.event_type in [EventType.EXIT, EventType.CLOSE_ALL]:
+                        side = session.position_side.value if session.position_side else "?"
+                        pnl = session.realized_pnl
+                        await self.notifier.send_message(
+                            f"📤 <b>Exit Filled</b>\n\n"
+                            f"{session.symbol} {side}\n"
+                            f"Exit: ${result.filled_price:.2f}\n"
+                            f"P&L: ${pnl:+,.2f}"
+                        )
+                        # Record trade result for risk tracking
+                        self.risk_gate.record_trade_result(pnl)
+            else:
+                print(f"✗ {result.message}")
+                self.logger.log_error(session, "EXECUTION_ERROR", result.message)
+
+                if self.notifier:
+                    await self.notifier.send_message(
+                        f"❌ <b>Execution Failed</b>\n\n"
+                        f"{event.symbol}\n"
+                        f"Error: {result.message}"
                     )
 
-                    if snapshot:
-                        print(f"✓ Snapshot saved: ${snapshot['account_balance']:,.2f}")
+        except Exception as e:
+            import traceback
+            print(f"❌ Error processing signal: {e}")
+            traceback.print_exc()
 
-                except Exception as e:
-                    print(f"✗ Failed to take snapshot: {e}")
+            if self.notifier:
+                await self.notifier.send_message(f"❌ Error: {str(e)[:200]}")
 
-            # Wait a bit to avoid taking multiple snapshots
-            await asyncio.sleep(60)
-
-    async def _daily_summary_task(self):
+    async def _close_session_for_flip(self, session: TradeSession):
         """
-        Background task that sends daily summary after trading hours end.
+        Close an existing position before flipping to opposite side.
 
-        Uses TRADING_HOURS_END from config (default: 20:00 UTC = 4:00 PM ET)
+        This is called when a NEW signal comes in for the opposite side
+        of an existing open position.
         """
-        summary_time_str = self.config["risk"]["trading_hours_end"]
         try:
-            hour, minute = map(int, summary_time_str.split(":"))
-            summary_time = time(hour=hour, minute=minute)
-        except (ValueError, TypeError, AttributeError) as e:
-            # Default to 8 PM UTC (4 PM ET)
-            summary_time = time(hour=20, minute=0)
-            print(f"Invalid summary time format: {e}")
+            side = session.position_side.value if session.position_side else "?"
+            print(f"  Flipping from {session.symbol} {side}...")
 
-        print(f"Daily summary will be sent at {summary_time_str} UTC (after trading hours close)")
+            # Create synthetic EXIT event
+            exit_event = Event(
+                event_type=EventType.EXIT,
+                symbol=session.symbol,
+                position_side=session.position_side,
+                timestamp=datetime.now(timezone.utc),
+                author=session.author,
+                message_id=f"flip_exit_{datetime.now(timezone.utc).timestamp()}",
+                raw_message="Auto-generated EXIT for position flip",
+            )
 
+            # Execute the exit
+            if self.dry_run:
+                print(f"  [DRY-RUN] Would close {session.total_quantity} contracts")
+                # Update session state for dry run
+                session.state = SessionState.CLOSED
+                session.closed_at = datetime.now(timezone.utc)
+                session.exit_reason = "FLIP_EXIT"
+            else:
+                result = await self.executor.execute_event(
+                    event=exit_event,
+                    session=session,
+                    quantity=session.total_quantity,
+                )
+
+                if result.success:
+                    pnl = session.realized_pnl
+                    print(f"  ✓ Flip exit filled @ ${result.filled_price:.2f} | P&L: ${pnl:+,.2f}")
+
+                    # Record trade result
+                    self.risk_gate.record_trade_result(pnl)
+
+                    # Log the exit
+                    self.logger.log_execution(session, exit_event, result)
+
+                    # Notify
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            f"🔄 <b>Position Flipped</b>\n\n"
+                            f"Closed: {session.symbol} {side}\n"
+                            f"Exit: ${result.filled_price:.2f}\n"
+                            f"P&L: ${pnl:+,.2f}\n\n"
+                            f"<i>Opening opposite position...</i>"
+                        )
+                else:
+                    print(f"  ✗ Flip exit failed: {result.message}")
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            f"❌ <b>Flip Exit Failed</b>\n\n"
+                            f"{session.symbol} {side}\n"
+                            f"Error: {result.message}"
+                        )
+                    raise Exception(f"Failed to close position for flip: {result.message}")
+
+        except Exception as e:
+            print(f"  ✗ Error closing position for flip: {e}")
+            raise
+
+    async def _fetch_margin_requirement(self):
+        """Fetch live margin requirement from IBKR and update risk gate."""
+        try:
+            print("Fetching margin requirement from IBKR...")
+            margin = await self.executor.get_margin_requirement("MNQ")
+
+            if margin and margin > 0:
+                self.risk_gate.update_margin_requirement(margin)
+            else:
+                fallback = self.config["risk"].get("margin_per_contract", 2000)
+                print(f"Could not fetch margin, using config value: ${fallback:,.2f}")
+
+        except Exception as e:
+            print(f"Error fetching margin: {e}")
+            fallback = self.config["risk"].get("margin_per_contract", 2000)
+            print(f"Using fallback margin: ${fallback:,.2f}")
+
+    async def _connection_monitor_task(self):
+        """Monitor IBKR connection and reconnect if needed."""
         while self.running:
-            now = datetime.now(timezone.utc)
-            target_time = datetime.combine(now.date(), summary_time, tzinfo=timezone.utc)
+            await asyncio.sleep(30)
 
-            # If target time already passed today, schedule for tomorrow
-            if now > target_time:
-                from datetime import timedelta
-                target_time += timedelta(days=1)
+            if not self.executor.connected:
+                print("⚠️ IBKR disconnected. Attempting reconnect...")
+                await self.executor.reconnect()
 
-            # Calculate seconds until target time
-            seconds_until_summary = (target_time - now).total_seconds()
-
-            # Wait until summary time
-            await asyncio.sleep(seconds_until_summary)
-
-            # Send daily summary
-            if self.running and self.notifier:
-                try:
-                    print(f"\nSending daily summary at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}...")
-
-                    # Get today's date
-                    today = datetime.now(timezone.utc).date().isoformat()
-
-                    # Get snapshot for today
-                    snapshot = self.snapshot_manager.get_snapshot_for_date(today)
-
-                    # Get current account balance if connected to IBKR
-                    account_balance = None
-                    if self.executor.connected:
-                        # Get balance for both paper and live modes
-                        account_balance = await self.executor.get_account_balance()
-
-                    # Send summary using snapshot + logs
-                    await self.notifier.send_daily_summary(
-                        date_str=today,
-                        snapshot=snapshot,
-                        account_balance=account_balance,
-                        log_dir=self.config.get("log_dir", "logs")
-                    )
-
-                    print("✓ Daily summary sent")
-                except Exception as e:
-                    print(f"✗ Failed to send daily summary: {e}")
-
-            # Wait a bit to avoid sending multiple times
-            await asyncio.sleep(60)
-
-    async def _telegram_command_polling_task(self):
-        """
-        Background task that polls for Telegram commands.
-
-        Checks for commands every 5 seconds.
-        """
-        print("Telegram command polling active")
-        print("  Available commands: /status, /server, /closeall")
-
+    async def _telegram_polling_task(self):
+        """Poll for Telegram commands."""
         while self.running:
             try:
                 await self.notifier.process_commands()
-                await asyncio.sleep(5)  # Poll every 5 seconds
+                await asyncio.sleep(5)
             except Exception as e:
-                print(f"⚠️  Error in Telegram command polling: {e}")
+                print(f"Telegram polling error: {e}")
                 await asyncio.sleep(5)
 
     async def _handle_status_command(self, cmd: dict) -> str:
-        """
-        Handle /status command from Telegram.
-
-        Returns formatted status message with positions and account info.
-        """
+        """Handle /status command."""
         try:
             mode = "📝 DRY-RUN" if self.dry_run else "🔴 LIVE"
+            text = f"<b>📊 {mode} STATUS</b>\n\n"
 
-            # Get account balance and cash details
-            account_balance = None
-            cash_details = None
+            # Account
             if not self.dry_run and self.executor.connected:
-                account_balance = await self.executor.get_account_balance()
-                cash_details = self.executor.get_cash_details()
+                balance = await self.executor.get_account_balance()
+                if balance:
+                    text += f"<b>💰 Balance:</b> ${balance:,.2f}\n\n"
 
-            # Get positions
+            # Positions
             positions = []
             if not self.dry_run and self.executor.connected:
                 positions = await self.executor.get_positions()
 
-            # Get open orders
-            open_orders = []
-            if not self.dry_run and self.executor.connected:
-                open_orders = await self.executor.get_open_orders()
-
-            # Get active sessions
-            open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
-
-            # Build response
-            text = f"<b>📊 {mode} STATUS</b>\n\n"
-
-            # Account balance with cash details
-            if cash_details:
-                text += f"<b>💰 Account Value:</b> ${cash_details.get('net_liquidation', 0):,.2f}\n"
-
-                # Show available cash (critical for Cash accounts)
-                available = cash_details.get('available_funds')
-                settled = cash_details.get('settled_cash')
-
-                if available is not None:
-                    text += f"<b>💵 Available Cash:</b> ${available:,.2f}"
-                    if settled is not None and settled != available:
-                        text += f" (${settled:,.2f} settled)"
-                    text += "\n"
-                elif account_balance:
-                    text += f"<b>💵 Cash:</b> ${account_balance:,.2f}\n"
-
-                text += "\n"
-            elif account_balance:
-                text += f"<b>💰 Account Balance:</b> ${account_balance:,.2f}\n\n"
-            else:
-                text += f"<b>💰 Account Balance:</b> Not available\n\n"
-
-            # Positions
-            text += f"<b>🔓 Open Positions ({len(positions)}):</b>\n"
+            text += f"<b>🔓 Positions ({len(positions)}):</b>\n"
             if positions:
                 for pos in positions:
-                    contract = pos.contract
-                    symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
-                    qty = pos.position
-                    avg_cost = pos.avgCost
-
-                    # Get current market price for live P&L
-                    current_price = None
-                    pnl_text = ""
-                    try:
-                        # Set exchange for market data request (required by IBKR)
-                        contract.exchange = "SMART"
-
-                        # Request market data snapshot
-                        ticker = self.executor.ib.reqMktData(contract, snapshot=True)
-                        await asyncio.sleep(0.5)  # Wait for market data
-
-                        import math
-                        # Try to get current price from market data
-                        if ticker.last and not math.isnan(ticker.last):
-                            current_price = ticker.last
-                        elif ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
-                            current_price = (ticker.bid + ticker.ask) / 2  # Use midpoint
-                        elif ticker.close and not math.isnan(ticker.close):
-                            current_price = ticker.close
-
-                        # Cancel market data subscription
-                        self.executor.ib.cancelMktData(contract)
-
-                        # Calculate P&L if we have current price
-                        if current_price and avg_cost > 0 and abs(qty) > 0:
-                            # For options: current_price is premium, avg_cost is already in dollars
-                            # Convert premium to dollar value first
-                            current_value = current_price * 100  # Premium to dollar value
-                            unrealized_pnl = (current_value - avg_cost) * qty
-                            pnl_pct = ((current_value - avg_cost) / avg_cost) * 100
-                            pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
-                            pnl_text = f" → ${current_price:.2f} | {pnl_emoji} ${unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
-
-                    except Exception as e:
-                        # Fallback to IBKR's unrealized P&L if market data fails
-                        try:
-                            unrealized_pnl = pos.unrealizedPNL
-                            if unrealized_pnl and avg_cost > 0 and abs(qty) > 0:
-                                pnl_pct = (unrealized_pnl / (avg_cost * abs(qty) * 100)) * 100
-                                pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
-                                pnl_text = f" {pnl_emoji} ${unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
-                        except:
-                            pass
-
-                    text += f"• {symbol}: {qty} @ ${avg_cost:.2f}{pnl_text}\n"
+                    symbol = pos.contract.localSymbol if hasattr(pos.contract, 'localSymbol') else pos.contract.symbol
+                    side = "LONG" if pos.position > 0 else "SHORT"
+                    text += f"• {symbol}: {abs(int(pos.position))} {side} @ ${pos.avgCost:.2f}\n"
             else:
                 text += "  No open positions\n"
 
-            text += "\n"
-
-            # Open orders - separate brackets from entry orders
-            text += f"<b>📋 Open Orders ({len(open_orders)}):</b>\n"
-            if open_orders:
-                entry_orders, stop_orders, target_orders = self._categorize_orders(open_orders, open_sessions)
-
-                # Debug: Log session bracket tracking
-                for session in open_sessions:
-                    print(f"[DEBUG] Session {session.session_id[:8]}: stop_id={session.stop_order_id}, target_ids={session.target_order_ids}")
-
-                # Debug: Log all open order IDs
-                print(f"[DEBUG] Open order IDs: {[t.order.orderId for t in open_orders]}")
-
-                # Display entry orders
-                if entry_orders:
-                    text += "  <i>Entry Orders:</i>\n"
-                    for trade in entry_orders:
-                        contract = trade.contract
-                        order = trade.order
-                        symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
-                        action = order.action
-                        qty = order.totalQuantity
-                        price = order.lmtPrice if order.lmtPrice else order.auxPrice
-                        status = trade.orderStatus.status
-                        text += f"    • {action} {qty} {symbol} @ ${price:.2f} - {status}\n"
-
-                # Display bracket orders
-                if stop_orders or target_orders:
-                    text += "  <i>Bracket Orders:</i>\n"
-                    for trade in stop_orders:
-                        contract = trade.contract
-                        order = trade.order
-                        symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
-                        qty = order.totalQuantity
-                        price = order.lmtPrice if order.lmtPrice else order.auxPrice
-                        status = trade.orderStatus.status
-                        text += f"    • 🛑 STOP: {qty} {symbol} @ ${price:.2f} - {status}\n"
-
-                    for trade in target_orders:
-                        contract = trade.contract
-                        order = trade.order
-                        symbol = contract.localSymbol if hasattr(contract, 'localSymbol') else contract.symbol
-                        qty = order.totalQuantity
-                        price = order.lmtPrice if order.lmtPrice else order.auxPrice
-                        status = trade.orderStatus.status
-                        text += f"    • 🎯 TARGET: {qty} {symbol} @ ${price:.2f} - {status}\n"
-
-                if not entry_orders and not stop_orders and not target_orders:
-                    text += "  No open orders\n"
-            else:
-                text += "  No open orders\n"
-
-            text += "\n"
-
-            # Open sessions
-            text += f"<b>🔄 Active Sessions ({len(open_sessions)}):</b>\n"
+            # Sessions
+            open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
+            text += f"\n<b>📊 Sessions ({len(open_sessions)}):</b>\n"
             if open_sessions:
-                for session in open_sessions[:5]:  # Show first 5
-                    symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "?"
-                    qty = session.total_quantity
-                    text += f"• {symbol} - {qty} contracts\n"
-                if len(open_sessions) > 5:
-                    text += f"  ... and {len(open_sessions) - 5} more\n"
+                for s in open_sessions[:5]:
+                    side = s.position_side.value if s.position_side else "?"
+                    text += f"• {s.symbol} {side}: {s.total_quantity} contracts\n"
             else:
                 text += "  No active sessions\n"
 
-            # Timestamp
-            text += f"\n<i>Updated: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
-
-            return text
-
-        except Exception as e:
-            return f"❌ Error getting status: {str(e)}"
-
-    async def _handle_server_command(self, cmd: dict) -> str:
-        """
-        Handle /server command from Telegram.
-
-        Returns bot health and IBKR connection status.
-        """
-        try:
-            import platform
-
-            mode = "📝 DRY-RUN" if self.dry_run else "🔴 LIVE"
-
-            # Calculate uptime
-            uptime_str = "Unknown"
-            if self.start_time:
-                uptime_delta = datetime.now(timezone.utc) - self.start_time
-                hours = int(uptime_delta.total_seconds() // 3600)
-                minutes = int((uptime_delta.total_seconds() % 3600) // 60)
-                uptime_str = f"{hours}h {minutes}m"
-
-            # Build response
-            text = f"<b>🖥️ {mode} SERVER HEALTH</b>\n\n"
-
-            # Bot Status
-            text += f"<b>🤖 Bot Status</b>\n"
-            if self.running:
-                text += f"• Status: ✅ Running\n"
-            else:
-                text += f"• Status: ⚠️ Stopped\n"
-            text += f"• Uptime: ⏱️ {uptime_str}\n"
-            text += f"• Mode: {mode}\n"
-            text += f"\n"
-
-            # IBKR Connection
-            text += f"<b>🏦 IBKR Connection</b>\n"
-            if self.dry_run:
-                text += f"• Status: ⏸️ Disconnected (Paper Mode)\n"
-                text += f"• Port: {self.config['ibkr']['port']}\n"
-            else:
-                if self.executor.connected:
-                    text += f"• Status: ✅ Connected\n"
-                    text += f"• Host: {self.config['ibkr']['host']}\n"
-                    text += f"• Port: {self.config['ibkr']['port']}\n"
-
-                    # Get account balance
-                    balance = await self.executor.get_account_balance()
-                    if balance:
-                        text += f"• Account: 💰 ${balance:,.2f}\n"
-                else:
-                    text += f"• Status: ❌ Disconnected\n"
-                    text += f"• Host: {self.config['ibkr']['host']}\n"
-                    text += f"• Port: {self.config['ibkr']['port']}\n"
-            text += f"\n"
-
-            # Signal Source Listener (Discord or TradingView)
-            if self.mode == "MIKE" and self.discord_listener:
-                text += f"<b>💬 Discord Listener</b>\n"
-                if self.discord_listener.running:
-                    text += f"• Status: ✅ Running\n"
-                    text += f"• Channels: {len(self.discord_listener.channel_ids)}\n"
-                    if self.discord_listener.monitored_users:
-                        text += f"• Users: {len(self.discord_listener.monitored_users)}\n"
-                    else:
-                        text += f"• Users: All\n"
-                else:
-                    text += f"• Status: ❌ Stopped\n"
-                text += f"\n"
-            elif self.mode == "INDICATOR" and self.tradingview_listener:
-                text += f"<b>📊 TradingView Webhook</b>\n"
-                if self.tradingview_listener.running:
-                    text += f"• Status: ✅ Running\n"
-                    text += f"• Port: {self.tradingview_listener.port}\n"
-                    text += f"• URL: https://webhook.hanyuyang.me/webhook\n"
-                else:
-                    text += f"• Status: ❌ Stopped\n"
-                text += f"\n"
-
-            # Session Manager
-            text += f"<b>📊 Session Manager</b>\n"
-            total_sessions = len(self.session_manager.sessions)
-            open_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN])
-            closed_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.CLOSED])
-            pending_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.PENDING])
-            cancelled_sessions = len([s for s in self.session_manager.sessions.values() if s.state == SessionState.CANCELLED])
-            text += f"• Total Sessions: {total_sessions}\n"
-            text += f"• Open: 🟢 {open_sessions}\n"
-            text += f"• Closed: ⚪ {closed_sessions}\n"
-            if pending_sessions > 0:
-                text += f"• Pending: 🟡 {pending_sessions}\n"
-            if cancelled_sessions > 0:
-                text += f"• Cancelled: ⚫ {cancelled_sessions}\n"
-            text += f"\n"
-
-            # System Resources (if psutil available)
-            if PSUTIL_AVAILABLE:
-                try:
-                    cpu_percent = psutil.cpu_percent(interval=0.1)
-                    memory = psutil.virtual_memory()
-                    disk = psutil.disk_usage('/')
-
-                    text += f"<b>💻 System Resources</b>\n"
-
-                    # Resource usage emojis
-                    cpu_emoji = self._get_resource_emoji(cpu_percent, 50, 80)
-                    text += f"• CPU: {cpu_emoji} {cpu_percent:.1f}%\n"
-
-                    # Memory
-                    mem_percent = memory.percent
-                    mem_emoji = self._get_resource_emoji(mem_percent, 70, 90)
-                    text += f"• Memory: {mem_emoji} {mem_percent:.1f}% ({memory.used / (1024**3):.1f}GB / {memory.total / (1024**3):.1f}GB)\n"
-
-                    # Disk
-                    disk_percent = disk.percent
-                    disk_emoji = self._get_resource_emoji(disk_percent, 70, 90)
-                    text += f"• Disk: {disk_emoji} {disk_percent:.1f}% ({disk.used / (1024**3):.1f}GB / {disk.total / (1024**3):.1f}GB)\n"
-                    text += f"\n"
-
-                    # System Info
-                    text += f"<b>🖥️ System Info</b>\n"
-                    text += f"• OS: {platform.system()} {platform.release()}\n"
-                    text += f"• Python: {platform.python_version()}\n"
-
-                except Exception as e:
-                    text += f"<b>💻 System Resources</b>\n"
-                    text += f"• Error: ⚠️ {str(e)}\n"
-                    text += f"\n"
-            else:
-                # psutil not available
-                text += f"<b>💻 System Resources</b>\n"
-                text += f"• Status: ⚠️ Not available (install psutil)\n"
-                text += f"\n"
-
-            # Risk Gate Status
-            text += f"<b>🛡️ Risk Gate</b>\n"
-            # Kill switch is on executor, not risk_gate
-            if self.executor.kill_switch_active:
-                text += f"• Kill Switch: 🔴 ACTIVE\n"
-            else:
-                text += f"• Kill Switch: ✅ Inactive\n"
+            # Risk
+            text += f"\n<b>🛡️ Risk:</b>\n"
             text += f"• Daily P&L: ${self.risk_gate.daily_pnl:,.2f}\n"
             text += f"• Loss Streak: {self.risk_gate.loss_streak}\n"
-            text += f"\n"
 
-            # Telegram Status
-            text += f"<b>📱 Telegram Bot</b>\n"
-            if self.notifier and self.notifier.enabled:
-                text += f"• Status: ✅ Enabled\n"
-                text += f"• Chat ID: {self.notifier.chat_id}\n"
-            else:
-                text += f"• Status: ⚠️ Disabled\n"
-
-            # Timestamp
-            text += f"\n<i>🕐 Updated: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
-
+            text += f"\n<i>{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
             return text
 
         except Exception as e:
-            return f"❌ Error getting server health: {str(e)}"
+            return f"❌ Error: {str(e)}"
 
     async def _handle_closeall_command(self, cmd: dict) -> str:
-        """
-        Handle /closeall command from Telegram.
-
-        Emergency command to close ALL IBKR positions regardless of session state.
-        Used to handle orphaned positions, SHORT positions, or emergency exits.
-        """
+        """Handle /closeall command - emergency close all positions."""
         try:
             if self.dry_run:
                 return "❌ Cannot close positions in DRY-RUN mode"
@@ -790,1845 +470,50 @@ class TradingOrchestrator:
             if not self.executor.connected:
                 return "❌ Not connected to IBKR"
 
-            # Get all current positions
-            positions = await self.executor.get_positions()
+            results = await self.executor.close_all_positions()
 
-            if not positions:
+            if not results:
                 return "✅ No positions to close"
 
-            text = f"<b>🚨 EMERGENCY: Closing All Positions</b>\n\n"
-            text += f"Found {len(positions)} position(s):\n"
-
-            closed_count = 0
-            failed_count = 0
-
-            for pos in positions:
-                contract = pos.contract
-                quantity = pos.position
-                avg_cost = pos.avgCost
-
-                symbol = f"{contract.symbol} {contract.strike}{contract.right}" if hasattr(contract, 'strike') else contract.symbol
-                position_type = "SHORT" if quantity < 0 else "LONG"
-
-                text += f"\n• {symbol}: {quantity} ({position_type})\n"
-
-                try:
-                    # CRITICAL: Cancel bracket orders FIRST to prevent SHORT positions
-                    # Find and cancel brackets before closing position
-                    session_to_close = None
-                    bracket_cancel_failed = False
-
-                    if hasattr(contract, 'strike'):
-                        # Build session key matching IBKR format (use float for strike)
-                        session_key = f"{contract.symbol} {float(contract.strike)} {contract.right} {contract.lastTradeDateOrContractMonth}"
-                        for session in self.session_manager.sessions.values():
-                            if session.state == SessionState.OPEN:
-                                sess_key = f"{session.underlying} {float(session.strike)} {session.direction.value[0]} {session.expiry.replace('-', '')}"
-                                if sess_key == session_key:
-                                    session_to_close = session
-
-                                    # Cancel brackets FIRST
-                                    if session.stop_order_id or session.target_order_ids:
-                                        print(f"    Cancelling brackets for {symbol}...")
-                                        success = await self._cancel_session_brackets(session)
-                                        bracket_count = (1 if session.stop_order_id else 0) + len(session.target_order_ids or [])
-
-                                        if not success:
-                                            text += f"  ⚠️ Failed to cancel {bracket_count} bracket(s) - SKIPPING close\n"
-                                            bracket_cancel_failed = True
-                                        else:
-                                            text += f"  🛑 Cancelled {bracket_count} bracket order(s)\n"
-                                            # Extra buffer for IBKR to propagate cancellations
-                                            await asyncio.sleep(0.5)
-                                    break
-
-                    # Skip this position if bracket cancellation failed
-                    if bracket_cancel_failed:
-                        failed_count += 1
-                        continue
-
-                    # Determine order action (BUY to close SHORT, SELL to close LONG)
-                    action = "BUY" if quantity < 0 else "SELL"
-                    close_quantity = abs(quantity)
-
-                    # Set exchange for proper routing (required by IBKR)
-                    contract.exchange = "SMART"
-
-                    # Use MARKET order for fast emergency close
-                    from ib_insync import MarketOrder
-                    order = MarketOrder(action, close_quantity)
-                    trade = self.executor.ib.placeOrder(contract, order)
-
-                    # Wait briefly for fill
-                    filled = await self.executor._wait_for_fill(trade, timeout=10)
-
-                    if filled:
-                        fill_price = trade.orderStatus.avgFillPrice
-
-                        # Calculate P&L correctly for options
-                        # fill_price is premium (e.g., $0.10)
-                        # avg_cost is already in dollars per contract (e.g., $12.00)
-                        # For options: convert fill_price to dollars first
-                        if hasattr(contract, 'strike'):
-                            fill_value = fill_price * 100  # Convert premium to dollar value
-                            pnl = (fill_value - avg_cost) * quantity
-                        else:
-                            # For stocks/other securities
-                            pnl = (fill_price - avg_cost) * quantity
-
-                        text += f"  ✅ Closed @ ${fill_price:.2f}"
-                        if pnl != 0:
-                            pnl_emoji = "💰" if pnl > 0 else "📉"
-                            text += f" | {pnl_emoji} P&L: ${pnl:+,.2f}"
-                        text += f"\n"
-
-                        closed_count += 1
-
-                        # Close any associated sessions (already found earlier)
-                        if session_to_close:
-                            now = datetime.now(timezone.utc)
-                            session_to_close.state = SessionState.CLOSED
-                            session_to_close.closed_at = now
-                            session_to_close.updated_at = now
-                            session_to_close.exit_reason = "EMERGENCY_CLOSEALL"
-                            session_to_close.total_quantity = 0
-                            session_to_close.exit_price = fill_price
-                            session_to_close.realized_pnl = pnl if hasattr(contract, 'strike') else 0
-                    else:
-                        text += f"  ⚠️ Close order timed out\n"
-                        failed_count += 1
-
-                except Exception as e:
-                    text += f"  ❌ Error: {str(e)}\n"
-                    failed_count += 1
-
-            text += f"\n<b>Summary:</b>\n"
-            text += f"• Closed: {closed_count}\n"
-            text += f"• Failed: {failed_count}\n"
-            text += f"\n<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
+            text = "<b>🚨 Emergency Close All</b>\n\n"
+            for r in results:
+                status = "✅" if r.success else "❌"
+                text += f"{status} {r.message}\n"
 
             return text
 
         except Exception as e:
-            return f"❌ Error executing closeall: {str(e)}"
+            return f"❌ Error: {str(e)}"
 
-    async def on_discord_message(
-        self, message: str, author: str, message_id: str, timestamp: datetime
-    ):
-        """
-        Callback for Discord messages.
+    async def _handle_restartgw_command(self, cmd: dict) -> str:
+        """Handle /restartgw command - restart IB Gateway Docker container."""
+        import subprocess
 
-        This is the main processing pipeline.
-        """
-        session = None
         try:
-            print(f"\n{'='*60}")
-            print(f"NEW MESSAGE from {author}")
-            print(f"{'='*60}")
-            print(f"{message}\n")
+            # Mark as disconnected since gateway is restarting
+            self.executor.connected = False
 
-            # Step 1: Parse message to Event
-            print("[1/5] Parsing message with LLM...")
-            try:
-                event = self.parser.parse_message(
-                    message=message,
-                    author=author,
-                    message_id=message_id,
-                    timestamp=timestamp,
-                )
-                print(f"✓ Parsed as {event.event_type}")
-                if event.llm_reasoning:
-                    print(f"  Reasoning: {event.llm_reasoning}")
-
-                # Validate NEW events have required fields and sufficient confidence
-                if event.event_type == EventType.NEW:
-                    if not all([event.underlying, event.direction, event.strike]):
-                        print(f"⚠️ NEW event missing required fields (underlying/direction/strike)")
-                        print(f"  Reclassifying as IGNORE (LLM was too aggressive)")
-                        event.event_type = EventType.IGNORE
-                    elif event.parsing_confidence and event.parsing_confidence < 0.7:
-                        print(f"⚠️ NEW event has low confidence ({event.parsing_confidence:.2f})")
-                        print(f"  Reclassifying as IGNORE (insufficient confidence)")
-                        event.event_type = EventType.IGNORE
-
-            except Exception as e:
-                print(f"✗ Parsing failed: {e}")
-                print("  ACTION: NO TRADE (parsing failure)")
-                # Log error
-                self.logger.log_error(None, "PARSING_ERROR", str(e))
-                return
-
-            # Step 2: Correlate to session
-            print("\n[2/5] Correlating to trade session...")
-            session = self.session_manager.process_event(event)
-
-            # Log Discord message (even if not actionable)
-            self.logger.log_discord_message(
-                session=session,
-                author=author,
-                message=message,
-                timestamp=timestamp,
-                message_id=message_id,
+            # Run docker compose restart
+            result = subprocess.run(
+                ["docker", "compose", "restart", "ib-gateway"],
+                capture_output=True,
+                text=True,
+                timeout=120  # 2 minute timeout
             )
 
-            if not session:
-                print("✓ Event processed (non-actionable or ignored)")
-                return
-
-            # Log parsed event
-            self.logger.log_parsed_event(session=session, event=event)
-
-            print(f"✓ Linked to session {session.session_id[:8]}...")
-            print(f"  Session state: {session.state}")
-            print(f"  Trade: {session.underlying} {session.strike} {session.direction}")
-            print(f"  Current qty: {session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"  Current qty: {session.total_quantity}")
-
-            # Step 3: Risk validation
-            print("\n[3/5] Validating with risk gate...")
-
-            # Update account balance and get unrealized P&L
-            unrealized_pnl = 0.0
-            if not self.dry_run and self.executor.connected:
-                # Update balance
-                balance = await self.executor.get_account_balance()
-                if balance:
-                    self.risk_gate.update_account_balance(balance)
-                    print(f"  Account balance updated: ${balance:,.2f}")
-
-                # Get unrealized P&L
-                unrealized_pnl = await self.executor.get_unrealized_pnl()
-                print(f"  Current unrealized P&L: ${unrealized_pnl:+.2f}")
-
-            risk_result = self.risk_gate.validate(
-                event=event,
-                session=session,
-                unrealized_pnl=unrealized_pnl,
-            )
-
-            print(f"{'✓' if risk_result.decision == RiskDecision.APPROVE else '✗'} {risk_result.decision}: {risk_result.reason}")
-
-            if risk_result.decision == RiskDecision.REJECT:
-                print("  ACTION: NO TRADE (risk gate rejection)")
-                if risk_result.failed_checks:
-                    for check in risk_result.failed_checks:
-                        print(f"    - {check}")
-
-                # Cancel the session if it was a NEW trade (never entered)
-                if event.event_type == EventType.NEW and session.state == SessionState.PENDING:
-                    session.state = SessionState.CANCELLED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.exit_reason = f"Risk rejection: {risk_result.reason}"
-                    print(f"  ✓ Session cancelled (never entered)")
-
-                    # Log cancellation
-                    self.logger.log_session_closed(
-                        session,
-                        reason=f"Risk rejection: {risk_result.reason}",
-                        final_pnl=0.0
-                    )
-
-                return
-
-            # Cash check for NEW trades (Cash account with T+1 settlement)
-            if event.event_type == EventType.NEW and not self.dry_run and self.executor.connected:
-                cash_details = self.executor.get_cash_details()
-                if cash_details:
-                    available_cash = cash_details.get('available_funds') or cash_details.get('settled_cash')
-                    if available_cash is not None:
-                        # Estimate cost for 1 contract (will be refined after position sizing)
-                        estimated_cost = (event.entry_price or 0.50) * 100  # Premium × 100
-                        if available_cash < estimated_cost:
-                            print(f"⚠️ INSUFFICIENT SETTLED CASH")
-                            print(f"  Available: ${available_cash:,.2f}")
-                            print(f"  Estimated cost: ${estimated_cost:,.2f}")
-                            print(f"  ACTION: NO TRADE (waiting for T+1 settlement)")
-                            await self.telegram.send_message(
-                                f"⚠️ <b>Trade Blocked - Insufficient Cash</b>\n\n"
-                                f"Cannot enter {event.underlying} {event.strike}{event.direction.value[0]}\n"
-                                f"Available: ${available_cash:,.2f}\n"
-                                f"Needed: ~${estimated_cost:,.2f}\n\n"
-                                f"<i>Waiting for T+1 settlement from previous trades</i>"
-                            )
-                            return
-                        else:
-                            print(f"✓ Settled cash check passed: ${available_cash:,.2f} available")
-
-            # Step 4: Calculate position size and stops/targets
-            print("\n[4/5] Calculating position size and risk parameters...")
-            if event.is_actionable():
-                quantity = self.risk_gate.calculate_position_size(
-                    event=event, session=session
-                )
-                print(f"✓ Position size: {quantity} contracts")
-
-                # Check if quantity is 0 (already at max position)
-                if quantity == 0:
-                    print(f"⚠️ Position size = 0 (already at MAX_CONTRACTS limit)")
-                    print(f"  Current: {session.total_quantity} contracts")
-                    print(f"  Max allowed: {self.config['risk']['max_contracts']}")
-                    print(f"  ACTION: NO TRADE (position limit reached)")
-
-                    # Send Telegram notification
-                    if self.notifier:
-                        await self.notifier.send_message(
-                            f"⚠️ <b>Trade Blocked - Position Limit</b>\n\n"
-                            f"{event.underlying} {event.strike}{event.direction.value[0]}\n\n"
-                            f"Current: {session.total_quantity} contracts\n"
-                            f"Max allowed: {self.config['risk']['max_contracts']}\n\n"
-                            f"<i>Cannot add more contracts - already at maximum</i>"
-                        )
-                    return
-
-                # Calculate stop loss and target based on CONFIG (ignore Discord targets)
-                if event.event_type == EventType.NEW:
-                    # CRITICAL: Clear Discord-parsed targets for NEW orders
-                    # Brackets will be calculated by EXECUTOR from ACTUAL FILL PRICE
-                    # This ensures brackets use real execution price, not Discord alert price
-                    event.stop_loss = None  # Executor will calculate from actual fill
-                    event.targets = None    # Executor will calculate from actual fill
-
-                    print(f"  ℹ️  Brackets will be calculated from actual fill price using config:")
-                    print(f"     - Stop: {self.config['risk']['auto_stop_loss_percent']}% below fill")
-                    print(f"     - Target: {self.config['risk']['risk_reward_ratio']}x risk above fill")
+            if result.returncode == 0:
+                response = "✅ <b>IB Gateway Restarted</b>\n\n"
+                response += "Container restarted successfully.\n"
+                response += "<i>Auto-reconnect will attempt shortly.</i>"
+                return response
             else:
-                print("✓ Non-actionable event (informational only)")
-                return
+                response = "❌ <b>Restart Failed</b>\n\n"
+                response += f"Error: {result.stderr[:200] if result.stderr else 'Unknown error'}"
+                return response
 
-            # Step 5: Execute
-            print("\n[5/5] Executing order...")
-
-            if self.dry_run:
-                print("  [PAPER MODE] Would execute:")
-                print(f"    Event: {event.event_type}")
-                print(f"    Quantity: {quantity}")
-                print(f"    Entry: ${event.entry_price}")
-                if event.targets:
-                    print(f"    Targets: {event.targets}")
-                if event.stop_loss:
-                    print(f"    Stop: ${event.stop_loss}")
-                print("  ACTION: SIMULATED (paper trading)")
-
-                # Log simulated order
-                order_details = {
-                    "quantity": quantity,
-                    "entry_price": event.entry_price,
-                    "stop_loss": event.stop_loss,
-                    "targets": event.targets,
-                    "mode": "PAPER"
-                }
-                self.logger.log_order_submitted(
-                    session=session,
-                    event_type=event.event_type,
-                    order_details=order_details,
-                )
-
-                # Send Telegram notification for order submission
-                if self.notifier:
-                    await self.notifier.notify_order_submitted(
-                        session=session,
-                        event_type=event.event_type,
-                        order_details=order_details,
-                        dry_run=True,
-                    )
-
-                # Log simulated result
-                from ..execution.executor import OrderResult, OrderStatus
-                simulated_result = OrderResult(
-                    success=True,
-                    status=OrderStatus.FILLED,
-                    filled_price=event.entry_price,
-                    message="Simulated fill (dry-run mode)"
-                )
-                self.logger.log_order_result(
-                    session=session,
-                    event_type=event.event_type,
-                    result=simulated_result,
-                )
-
-                # Send Telegram notification for order fill
-                if self.notifier:
-                    await self.notifier.notify_order_filled(
-                        session=session,
-                        event_type=event.event_type,
-                        result=simulated_result,
-                        dry_run=True,
-                    )
-            else:
-                # Log order submission
-                order_details = {
-                    "quantity": quantity,
-                    "entry_price": event.entry_price,
-                    "stop_loss": event.stop_loss,
-                    "targets": event.targets,
-                    "underlying": session.underlying,
-                    "strike": session.strike,
-                    "expiry": session.expiry,
-                    "direction": session.direction.value if session.direction else None
-                }
-                self.logger.log_order_submitted(
-                    session=session,
-                    event_type=event.event_type,
-                    order_details=order_details,
-                )
-
-                # Send Telegram notification for order submission
-                if self.notifier:
-                    await self.notifier.notify_order_submitted(
-                        session=session,
-                        event_type=event.event_type,
-                        order_details=order_details,
-                        dry_run=False,
-                    )
-
-                # Execute the order
-                result = await self.executor.execute_event(
-                    event=event,
-                    session=session,
-                    quantity=quantity,
-                )
-
-                # Log order result
-                self.logger.log_order_result(
-                    session=session,
-                    event_type=event.event_type,
-                    result=result,
-                )
-
-                # Check if session closed after execution
-                # Can happen on success (EXIT, TRIM to zero) OR failure (ENTRY timeout)
-                if session.state == SessionState.CLOSED:
-                    print(f"  ⓘ Session closed: {session.exit_reason}")
-                    self.logger.log_session_closed(
-                        session,
-                        reason=session.exit_reason or "ORDER_EXECUTION",
-                        final_pnl=session.realized_pnl
-                    )
-
-                # Send Telegram notification for order fill
-                if self.notifier:
-                    await self.notifier.notify_order_filled(
-                        session=session,
-                        event_type=event.event_type,
-                        result=result,
-                        dry_run=False,
-                    )
-
-                if result.success:
-                    print(f"✓ Order executed successfully")
-                    print(f"  Order ID: {result.order_id}")
-                    print(f"  Filled at: ${result.filled_price}")
-                else:
-                    print(f"✗ Execution failed: {result.message}")
-
-            print(f"\n{'='*60}\n")
-
+        except subprocess.TimeoutExpired:
+            return "❌ <b>Restart Timeout</b>\n\nCommand timed out after 2 minutes."
+        except FileNotFoundError:
+            return "❌ <b>Docker Not Found</b>\n\nDocker or docker compose is not installed."
         except Exception as e:
-            print(f"\nCRITICAL ERROR in message processing: {e}")
-            print("ACTION: NO TRADE (system error)")
-
-            # Log critical error
-            if session:
-                self.logger.log_error(session, "CRITICAL_ERROR", str(e))
-
-            import traceback
-            traceback.print_exc()
-
-    async def on_tradingview_signal(self, event: Event):
-        """
-        Callback for TradingView webhook signals.
-
-        Skips LLM parsing since TradingView sends structured data.
-        Starts from Step 2 (correlation) of the processing pipeline.
-        """
-        session = None
-        try:
-            # Step 1.5: DIRECTION REVERSAL CHECK (TradingView only)
-            # If NEW signal for opposite direction, close existing positions FIRST
-            if event.event_type == EventType.NEW and event.direction and not self.dry_run:
-                await self._check_and_close_opposite_direction(event.underlying, event.direction)
-
-            # Step 2: Correlate to session
-            print("[2/5] Correlating to trade session...")
-            session = self.session_manager.process_event(event)
-
-            # Log webhook signal (even if not actionable)
-            self.logger.log_parsed_event(session=session, event=event)
-
-            if not session:
-                print("✓ Event processed (non-actionable or ignored)")
-                return
-
-            qty_info = f"{session.total_quantity} @ ${session.avg_entry_price:.2f}" if session.avg_entry_price > 0 else f"{session.total_quantity}"
-            print(f"✓ Session {session.session_id[:8]} | {session.state.value} | {session.underlying} {session.strike}{session.direction.value[0]} | Qty: {qty_info}")
-
-            # Step 2.5: STRIKE SEARCH (TradingView NEW only)
-            # Search for optimal strike with premium in $0.25-$0.60 range
-            if event.event_type == EventType.NEW and event.underlying_price and not self.dry_run:
-                # Check if we're in trading hours before searching
-                from datetime import datetime, timezone
-                import pytz
-
-                now_utc = datetime.now(timezone.utc)
-                now_et = now_utc.astimezone(pytz.timezone('America/New_York'))
-
-                # Market hours: 9:30 AM - 4:00 PM ET, Monday-Friday
-                # But reject trades in last 30 min (3:30 PM - 4:00 PM ET)
-                is_weekday = now_et.weekday() < 5  # 0=Monday, 4=Friday
-                market_open = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
-                market_closed = now_et.hour >= 16
-                in_last_30_min = now_et.hour == 15 and now_et.minute >= 30  # 3:30 PM - 3:59 PM ET
-
-                in_trading_hours = is_weekday and market_open and not market_closed and not in_last_30_min
-
-                if not in_trading_hours:
-                    day_name = now_et.strftime('%A')
-                    time_et = now_et.strftime('%I:%M %p ET')
-
-                    # Determine specific reason
-                    if in_last_30_min:
-                        reason = "Last 30 minutes of trading (too close to close)"
-                        print(f"\n[2.5/5] Too close to market close - rejecting trade")
-                        print(f"  Current time: {day_name} {time_et}")
-                        print(f"  Trading window: Mon-Fri 9:30 AM - 3:30 PM ET")
-                        print(f"  No new trades in last 30 min (3:30-4:00 PM ET)")
-                    else:
-                        reason = "Outside trading hours"
-                        print(f"\n[2.5/5] Outside trading hours - rejecting trade")
-                        print(f"  Current time: {day_name} {time_et}")
-                        print(f"  Market hours: Mon-Fri 9:30 AM - 4:00 PM ET")
-
-                    # Cancel session
-                    session.state = SessionState.CANCELLED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.exit_reason = "OUTSIDE_TRADING_HOURS"
-
-                    self.logger.log_session_closed(
-                        session,
-                        reason=f"{reason} ({day_name} {time_et})",
-                        final_pnl=0.0
-                    )
-
-                    # Send Telegram notification
-                    if self.notifier:
-                        if in_last_30_min:
-                            await self.notifier.send_message(
-                                f"<b>⏰ Trade Rejected - Too Close to Market Close</b>\n\n"
-                                f"<b>Symbol:</b> {session.underlying} {session.direction.value}\n"
-                                f"<b>Current Time:</b> {day_name} {time_et}\n\n"
-                                f"<b>Trading Window:</b> Mon-Fri 9:30 AM - 3:30 PM ET\n\n"
-                                f"<i>No new trades allowed in last 30 minutes (3:30-4:00 PM ET)</i>"
-                            )
-                        else:
-                            await self.notifier.send_message(
-                                f"<b>⏰ Trade Rejected - Outside Trading Hours</b>\n\n"
-                                f"<b>Symbol:</b> {session.underlying} {session.direction.value}\n"
-                                f"<b>Current Time:</b> {day_name} {time_et}\n\n"
-                                f"<b>Market Hours:</b> Mon-Fri 9:30 AM - 4:00 PM ET\n\n"
-                                f"<i>Cannot execute trades outside market hours</i>"
-                            )
-
-                    return  # Stop processing
-
-                print(f"\n[2.5/5] Searching for optimal strike...")
-                print(f"  Current price: ${event.underlying_price:.2f}")
-                print(f"  Direction: {session.direction.value}")
-
-                # Start search from current price (rounded to nearest $1)
-                # For CALL: searches UP (away from money)
-                # For PUT: searches DOWN (away from money)
-                start_strike = round(event.underlying_price)
-
-                # Search for optimal strike
-                optimal_strike = await self._search_optimal_strike(
-                    underlying=session.underlying,
-                    direction=session.direction,
-                    start_strike=start_strike,
-                    expiry=session.expiry
-                )
-
-                if optimal_strike:
-                    original_strike = session.strike
-                    session.strike = optimal_strike
-                    event.strike = optimal_strike
-                    print(f"  ✓ Optimal strike found: ${original_strike:.0f} → ${optimal_strike:.0f}")
-                else:
-                    # No suitable strike found (Telegram notification already sent by search method)
-                    print(f"  ❌ No suitable strike found (premium $0.25-$0.60)")
-                    print(f"     All strikes either too cheap or too expensive")
-
-                    # Cancel session
-                    session.state = SessionState.CANCELLED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.exit_reason = "NO_SUITABLE_STRIKE"
-
-                    self.logger.log_session_closed(
-                        session,
-                        reason="No suitable strike found (premium outside $0.25-$0.60 range)",
-                        final_pnl=0.0
-                    )
-
-                    return  # Stop processing
-
-            # Step 3: Risk validation
-            print("\n[3/5] Validating with risk gate...")
-
-            # Update account balance and get unrealized P&L
-            unrealized_pnl = 0.0
-            if not self.dry_run and self.executor.connected:
-                # Update balance
-                balance = await self.executor.get_account_balance()
-                if balance:
-                    self.risk_gate.update_account_balance(balance)
-                    print(f"  Account balance updated: ${balance:,.2f}")
-
-                # Get unrealized P&L
-                unrealized_pnl = await self.executor.get_unrealized_pnl()
-                print(f"  Current unrealized P&L: ${unrealized_pnl:+.2f}")
-
-            risk_result = self.risk_gate.validate(
-                event=event,
-                session=session,
-                unrealized_pnl=unrealized_pnl,
-            )
-
-            print(f"{'✓' if risk_result.decision == RiskDecision.APPROVE else '✗'} {risk_result.decision}: {risk_result.reason}")
-
-            if risk_result.decision == RiskDecision.REJECT:
-                print("  ACTION: NO TRADE (risk gate rejection)")
-                if risk_result.failed_checks:
-                    for check in risk_result.failed_checks:
-                        print(f"    - {check}")
-
-                # Cancel the session if it was a NEW trade (never entered)
-                if event.event_type == EventType.NEW and session.state == SessionState.PENDING:
-                    session.state = SessionState.CANCELLED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.exit_reason = f"Risk rejection: {risk_result.reason}"
-                    print(f"  ✓ Session cancelled (never entered)")
-
-                    # Log cancellation
-                    self.logger.log_session_closed(
-                        session,
-                        reason=f"Risk rejection: {risk_result.reason}",
-                        final_pnl=0.0
-                    )
-
-                return
-
-            # Step 4: Calculate position size and stops/targets
-            print("\n[4/5] Calculating position size and risk parameters...")
-            if event.is_actionable():
-                quantity = self.risk_gate.calculate_position_size(
-                    event=event, session=session
-                )
-                print(f"✓ Position size: {quantity} contracts")
-
-                # Check if quantity is 0 (already at max position)
-                if quantity == 0:
-                    print(f"⚠️ Position size = 0 (already at MAX_CONTRACTS limit)")
-                    print(f"  Current: {session.total_quantity} contracts")
-                    print(f"  Max allowed: {self.config['risk']['max_contracts']}")
-                    print(f"  ACTION: NO TRADE (position limit reached)")
-
-                    # Cancel session
-                    if event.event_type == EventType.NEW and session.state == SessionState.PENDING:
-                        session.state = SessionState.CANCELLED
-                        session.closed_at = datetime.now(timezone.utc)
-                        session.exit_reason = "Position limit reached"
-                        self.logger.log_session_closed(session, reason="Position limit reached", final_pnl=0.0)
-
-                    # Send Telegram notification
-                    if self.notifier:
-                        await self.notifier.send_message(
-                            f"⚠️ <b>Trade Blocked - Position Limit</b>\n\n"
-                            f"{event.underlying} {event.strike}{event.direction.value[0]}\n\n"
-                            f"Current: {session.total_quantity} contracts\n"
-                            f"Max allowed: {self.config['risk']['max_contracts']}\n\n"
-                            f"<i>Cannot add more contracts - already at maximum</i>"
-                        )
-                    return
-
-                # For NEW orders: Clear Discord-parsed targets, brackets will be calculated from actual fill
-                if event.event_type == EventType.NEW:
-                    event.stop_loss = None  # Executor will calculate from actual fill
-                    event.targets = None    # Executor will calculate from actual fill
-                    print(f"  ℹ️  Brackets will be calculated from actual fill price using config:")
-                    print(f"     - Stop: {self.config['risk']['auto_stop_loss_percent']}% below fill")
-                    print(f"     - Target: {self.config['risk']['risk_reward_ratio']}x risk above fill")
-            else:
-                print("✓ Non-actionable event (informational only)")
-                return
-
-            # Step 5: Execute order
-            print("\n[5/5] Executing order...")
-            await self._execute_order(event, session, quantity)
-
-        except Exception as e:
-            print(f"\n❌ CRITICAL ERROR processing TradingView signal: {e}")
-            if session:
-                self.logger.log_error(session, "CRITICAL_ERROR", str(e))
-
-            import traceback
-            traceback.print_exc()
-
-    async def _execute_order(self, event: Event, session: TradeSession, quantity: int):
-        """
-        Common order execution logic for both MIKE and INDICATOR modes.
-
-        Extracted from on_discord_message to be reusable.
-
-        Args:
-            event: The trading event
-            session: The trade session
-            quantity: Number of contracts to trade (pre-calculated)
-        """
-        try:
-
-            if not self.dry_run:
-                # LIVE TRADING - Execute via IBKR
-                order_details = {
-                    "quantity": quantity,
-                    "entry_price": event.entry_price,
-                    "stop_loss": event.stop_loss,
-                    "targets": event.targets,
-                    "underlying": session.underlying,
-                    "strike": session.strike,
-                    "expiry": session.expiry,
-                    "direction": session.direction.value if session.direction else None
-                }
-
-                # Log order submission
-                self.logger.log_order_submitted(
-                    session=session,
-                    event_type=event.event_type,
-                    order_details=order_details,
-                )
-
-                # Send Telegram notification for order submission
-                if self.notifier:
-                    await self.notifier.notify_order_submitted(
-                        session=session,
-                        event_type=event.event_type,
-                        order_details=order_details,
-                        dry_run=False,
-                    )
-
-                # Execute the order
-                result = await self.executor.execute_event(
-                    event=event,
-                    session=session,
-                    quantity=quantity,
-                )
-
-                # Log order result
-                self.logger.log_order_result(
-                    session=session,
-                    event_type=event.event_type,
-                    result=result,
-                )
-
-                # Check if session closed after execution
-                # Can happen on success (EXIT, TRIM to zero) OR failure (ENTRY timeout)
-                if session.state == SessionState.CLOSED:
-                    print(f"  ⓘ Session closed: {session.exit_reason}")
-                    self.logger.log_session_closed(
-                        session,
-                        reason=session.exit_reason or "ORDER_EXECUTION",
-                        final_pnl=session.realized_pnl
-                    )
-
-                # Send Telegram notification for order fill
-                if self.notifier:
-                    await self.notifier.notify_order_filled(
-                        session=session,
-                        event_type=event.event_type,
-                        result=result,
-                        dry_run=False,
-                    )
-
-                if result.success:
-                    print(f"✓ Order executed successfully")
-                    print(f"  Order ID: {result.order_id}")
-                    print(f"  Filled at: ${result.filled_price}")
-                else:
-                    print(f"✗ Order execution failed: {result.message}")
-
-            else:
-                # DRY-RUN MODE - Simulate trade
-                order_details = {
-                    "quantity": quantity,
-                    "entry_price": event.entry_price,
-                    "stop_loss": event.stop_loss,
-                    "targets": event.targets,
-                    "mode": "DRY-RUN"
-                }
-
-                print(f"  ⚠️  DRY-RUN MODE - No order sent to IBKR")
-                print(f"  Would execute: {event.event_type.value}: {quantity} contracts @ ${event.entry_price:.2f}")
-
-                # Log simulated order submission
-                self.logger.log_order_submitted(
-                    session=session,
-                    event_type=event.event_type,
-                    order_details=order_details,
-                )
-
-                # Send Telegram notification for order submission
-                if self.notifier:
-                    await self.notifier.notify_order_submitted(
-                        session=session,
-                        event_type=event.event_type,
-                        order_details=order_details,
-                        dry_run=True,
-                    )
-
-                # Log simulated result
-                from ..execution.executor import OrderResult, OrderStatus
-                simulated_result = OrderResult(
-                    success=True,
-                    status=OrderStatus.FILLED,
-                    filled_price=event.entry_price,
-                    message="Simulated fill (dry-run mode)"
-                )
-
-                self.logger.log_order_result(
-                    session=session,
-                    event_type=event.event_type,
-                    result=simulated_result,
-                )
-
-            print(f"[5/5] Processing complete\n")
-
-        except Exception as e:
-            print(f"❌ Error executing order: {e}")
-            if session:
-                self.logger.log_error(session, "EXECUTION_ERROR", str(e))
-            raise
-
-    async def _on_bracket_filled(self, session, event_type: EventType, result: OrderResult):
-        """
-        Callback when bracket order fills (stop loss or take profit).
-
-        Args:
-            session: The TradeSession that closed
-            event_type: EventType.SL or EventType.TP
-            result: OrderResult with fill details
-        """
-        # Log to file
-        self.logger.log_order_result(session, event_type, result)
-
-        # Close the session in logs
-        self.logger.log_session_closed(
-            session,
-            reason=session.exit_reason,
-            final_pnl=session.realized_pnl
-        )
-
-        # Send Telegram notification
-        if self.notifier:
-            await self.notifier.notify_order_filled(
-                session=session,
-                event_type=event_type,
-                result=result,
-                dry_run=self.dry_run
-            )
-
-        # Log to console
-        symbol = f"{session.underlying} {session.strike}{session.direction.value[0] if session.direction else '?'}"
-        exit_type = "STOP LOSS" if event_type == EventType.SL else "TAKE PROFIT"
-        print(f"\n{'='*60}")
-        print(f"{exit_type} FILLED: {symbol}")
-        print(f"Exit Price: ${result.filled_price:.2f}")
-        print(f"P&L: ${session.realized_pnl:+,.2f}")
-        print(f"{'='*60}\n")
-
-    async def _connection_monitor_task(self):
-        """
-        Background task to monitor IBKR connection and auto-reconnect if needed.
-
-        Checks connection every 60 seconds and attempts reconnection if disconnected.
-        Sends progressive alerts based on disconnection duration.
-        """
-        print("Connection monitor active (checks every 60 seconds)")
-
-        last_alert_attempts = 0  # Track when we last sent an alert
-
-        while self.running:
-            await asyncio.sleep(60)  # Check every minute
-
-            if not self.executor.connected:
-                print("⚠️ Connection monitor detected disconnection. Attempting reconnection...")
-
-                # Attempt to reconnect
-                success = await self.executor.reconnect()
-
-                if not success:
-                    print("❌ Reconnection failed. Will retry on next check...")
-
-                    # Progressive alerting based on failure duration
-                    attempts = self.executor.reconnect_attempts
-
-                    # Send alerts at specific thresholds to avoid spam
-                    should_alert = False
-                    alert_level = ""
-
-                    if attempts == 3 and last_alert_attempts < 3:
-                        # 3 failures (~5 minutes) - Initial warning
-                        should_alert = True
-                        alert_level = "⚠️ WARNING"
-                    elif attempts == 10 and last_alert_attempts < 10:
-                        # 10 failures (~17 minutes) - Escalate
-                        should_alert = True
-                        alert_level = "🔴 CRITICAL"
-                    elif attempts == 30 and last_alert_attempts < 30:
-                        # 30 failures (~60 minutes) - Severe
-                        should_alert = True
-                        alert_level = "🚨 SEVERE"
-                    elif attempts % 60 == 0:
-                        # Every hour after that
-                        should_alert = True
-                        alert_level = "🚨 PROLONGED OUTAGE"
-
-                    if should_alert and self.notifier:
-                        # Calculate downtime duration
-                        minutes = sum([min(2 ** min(i, 6), 60) for i in range(1, attempts + 1)]) / 60
-
-                        # Build alert message
-                        message = f"<b>{alert_level}: IBKR Gateway Disconnected</b>\n\n"
-                        message += f"Reconnection attempts: {attempts}\n"
-                        message += f"Estimated downtime: ~{int(minutes)} minutes\n\n"
-
-                        if attempts < 10:
-                            message += "<b>Status:</b> Auto-reconnecting...\n\n"
-                            message += "<b>Possible causes:</b>\n"
-                            message += "• Gateway restarting (normal daily restart)\n"
-                            message += "• Network interruption\n"
-                            message += "• Gateway requires IB Key approval\n\n"
-                            message += "<i>No action needed - bot will auto-reconnect</i>"
-                        elif attempts < 30:
-                            message += "<b>Status:</b> Reconnection failing repeatedly\n\n"
-                            message += "<b>Action required:</b>\n"
-                            message += "1. Check if IBKR Gateway container is running:\n"
-                            message += "   <code>docker ps | grep ib-gateway</code>\n"
-                            message += "2. Check if IB Key approval is pending\n"
-                            message += "3. Check gateway logs:\n"
-                            message += "   <code>docker logs ib-gateway</code>\n\n"
-                            message += "<i>⚠️ Trading is paused until reconnection</i>"
-                        else:
-                            message += "<b>Status:</b> PROLONGED OUTAGE\n\n"
-                            message += "<b>🚨 URGENT ACTION REQUIRED:</b>\n"
-                            message += "1. Gateway may have crashed - check container:\n"
-                            message += "   <code>docker ps -a | grep ib-gateway</code>\n"
-                            message += "2. Manually restart gateway if needed:\n"
-                            message += "   <code>docker restart ib-gateway</code>\n"
-                            message += "3. Check for IB Key approval requirement\n"
-                            message += "4. Verify IBKR account status\n\n"
-                            message += f"<i>⚠️ Trading paused for ~{int(minutes)} minutes</i>"
-
-                        await self.notifier.send_message(message)
-                        last_alert_attempts = attempts
-
-    async def _on_ibkr_disconnected(self):
-        """Callback when IBKR connection is lost."""
-        print("🔴 IBKR disconnected - auto-reconnection initiated")
-
-        # Send Telegram notification
-        if self.notifier:
-            await self.notifier.send_message(
-                "<b>🔴 IBKR DISCONNECTED</b>\n\n"
-                "Connection to IBKR Gateway lost.\n"
-                "Auto-reconnection will attempt shortly.\n\n"
-                "<i>Bracket orders are still active on IBKR side.</i>"
-            )
-
-    async def _on_ibkr_reconnected(self):
-        """Callback when IBKR connection is restored."""
-        print("🟢 IBKR reconnected successfully")
-
-        # Send Telegram notification
-        if self.notifier:
-            # Calculate how long we were disconnected
-            attempts = self.executor.reconnect_attempts
-            if attempts > 0:
-                # Estimate downtime based on exponential backoff
-                minutes = sum([min(2 ** min(i, 6), 60) for i in range(1, attempts + 1)]) / 60
-
-                message = "<b>✅ IBKR RECONNECTED</b>\n\n"
-                message += "Connection to IBKR Gateway restored.\n"
-                message += "Bot is now fully operational.\n\n"
-
-                if attempts > 1:
-                    message += f"<b>Reconnection Details:</b>\n"
-                    message += f"• Attempts: {attempts}\n"
-                    message += f"• Downtime: ~{int(minutes)} minutes\n"
-                    message += f"• Reconnected: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n\n"
-
-                    if attempts >= 10:
-                        message += "<b>✓ State Rebuilt:</b>\n"
-                        message += "• Account balance refreshed\n"
-                        message += "• Positions reconciled\n"
-                        message += "• Open orders re-synced\n\n"
-
-                message += "<i>🟢 Trading resumed - all systems operational</i>"
-            else:
-                # First connection or quick reconnect
-                message = (
-                    "<b>✅ IBKR CONNECTED</b>\n\n"
-                    "Connection to IBKR Gateway established.\n"
-                    "Bot is now fully operational.\n\n"
-                    f"<i>Connected at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
-                )
-
-            await self.notifier.send_message(message)
-
-            # Reset reconnect attempts counter for next disconnection
-            self.executor.reconnect_attempts = 0
-
-    async def _position_reconciliation_task(self):
-        """
-        Background task to reconcile sessions with actual IBKR positions.
-
-        Runs every 60 seconds:
-        1. OPEN sessions: Auto-close if position no longer exists (3-min grace period)
-        2. PENDING/CANCELLED sessions: Auto-close if no position and >5 min old
-
-        This prevents:
-        - Orphaned OPEN sessions when positions are manually closed
-        - Stale PENDING/CANCELLED sessions blocking new trades on same contract
-        """
-        print("Position reconciliation active (checks every 60 seconds)")
-
-        while self.running:
-            await asyncio.sleep(60)
-
-            if self.dry_run or not self.executor.connected:
-                continue  # Skip in dry-run mode or when disconnected
-
-            try:
-                # Get current IBKR positions
-                ibkr_positions = await self.executor.get_positions()
-
-                # Build position lookup: contract key -> quantity
-                position_map = {}
-                for pos in ibkr_positions:
-                    contract = pos.contract
-                    # Create key: "SPY 685.0 C 20251217" (use float for strike)
-                    key = f"{contract.symbol} {float(contract.strike)} {contract.right} {contract.lastTradeDateOrContractMonth}"
-                    position_map[key] = pos.position
-
-                # Check all OPEN sessions
-                open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
-
-                # Track which positions we've matched to sessions
-                # IMPORTANT: Mark ALL open sessions as matched (even within grace period)
-                # to prevent false "orphaned" warnings for new positions
-                matched_positions = set()
-
-                for session in open_sessions:
-                    # Build session key (match IBKR format with float strike)
-                    session_key = f"{session.underlying} {float(session.strike)} {session.direction.value[0]} {session.expiry.replace('-', '')}"
-
-                    # Mark this position as matched (tracked by a session)
-                    # This prevents false "orphaned" warnings
-                    if session_key in position_map:
-                        matched_positions.add(session_key)
-
-                    # Skip recently updated sessions for reconciliation checks (grace period for settlement)
-                    # IBKR positions take time to settle after fills
-                    time_since_update = (datetime.now(timezone.utc) - session.updated_at).total_seconds()
-                    if time_since_update < 180:  # 3 minutes grace period
-                        continue  # Don't check for position-gone yet, still settling
-
-                    # Check if position exists (only for sessions past grace period)
-                    ibkr_quantity = position_map.get(session_key, 0)
-
-                    if ibkr_quantity == 0 and session.total_quantity > 0:
-                        # Position is gone but session thinks it's open → Auto-close
-                        print(f"⚠️ Position reconciliation: {session_key} position is 0, auto-closing session")
-
-                        session.state = SessionState.CLOSED
-                        session.closed_at = datetime.now(timezone.utc)
-                        session.exit_reason = "POSITION_RECONCILIATION"
-                        session.total_quantity = 0
-
-                        # Cancel any open bracket orders
-                        if session.stop_order_id or session.target_order_ids:
-                            await self._cancel_session_brackets(session)
-
-                        # Log closure
-                        self.logger.log_session_closed(
-                            session,
-                            reason="Position reconciliation (manually closed outside bot)",
-                            final_pnl=session.realized_pnl
-                        )
-
-                        # Send notification with P&L if available
-                        if self.notifier:
-                            pnl_text = ""
-                            if session.realized_pnl != 0:
-                                pnl_emoji = "💰" if session.realized_pnl > 0 else "📉"
-                                pnl_text = f"P&L: {pnl_emoji} ${session.realized_pnl:+,.2f}\n"
-
-                            await self.notifier.send_message(
-                                f"<b>🔄 Session Auto-Closed</b>\n\n"
-                                f"<b>Position:</b> {session_key}\n"
-                                f"<b>Reason:</b> Manually exited outside bot\n"
-                                f"{pnl_text}\n"
-                                f"<i>Session closed via position reconciliation</i>"
-                            )
-
-                # Clean up stale PENDING/CANCELLED sessions without positions
-                # These can block new trades on the same contract
-                stale_sessions = [s for s in self.session_manager.sessions.values()
-                                 if s.state in [SessionState.PENDING, SessionState.CANCELLED]]
-
-                for session in stale_sessions:
-                    # Build session key (use float for strike to match IBKR format)
-                    session_key = f"{session.underlying} {float(session.strike)} {session.direction.value[0]} {session.expiry.replace('-', '')}"
-
-                    # Check age (only clean up sessions older than 5 minutes)
-                    time_since_update = (datetime.now(timezone.utc) - session.updated_at).total_seconds()
-                    if time_since_update < 300:  # 5 minutes
-                        continue  # Too new, might still be processing
-
-                    # Check if there's an actual position
-                    ibkr_quantity = position_map.get(session_key, 0)
-
-                    if ibkr_quantity == 0:
-                        # No position in IBKR, session is truly stale → Close it
-                        print(f"🧹 Cleaning stale {session.state.value} session: {session_key} (no position, {int(time_since_update/60)} min old)")
-
-                        old_state = session.state
-                        session.state = SessionState.CLOSED
-                        session.closed_at = datetime.now(timezone.utc)
-                        session.exit_reason = f"STALE_{old_state.value}_CLEANUP"
-                        session.total_quantity = 0
-
-                        # Log closure
-                        self.logger.log_session_closed(
-                            session,
-                            reason=f"Stale {old_state.value} session cleanup (no position)",
-                            final_pnl=0.0
-                        )
-
-                        print(f"  ✓ Stale session closed: {session.session_id[:8]}...")
-
-                # Reverse check: IBKR has positions that bot doesn't track
-                unmatched_positions = set(position_map.keys()) - matched_positions
-
-                # CRITICAL: Check for SHORT positions (negative quantity)
-                short_positions = {key: qty for key, qty in position_map.items() if qty < 0}
-                if short_positions:
-                    print(f"🚨 CRITICAL: {len(short_positions)} SHORT position(s) detected!")
-                    for pos_key, quantity in short_positions.items():
-                        print(f"   - {pos_key}: {quantity} contracts (SHORT)")
-                        print(f"     🚨 Bot only trades LONG - this should NEVER happen!")
-                        print(f"     🚨 Likely cause: Bracket filled after session closed")
-                        print(f"     🚨 ACTION REQUIRED: Close manually in TWS immediately!")
-
-                    # Send urgent Telegram alert
-                    if self.notifier:
-                        short_text = "\n".join([f"• {key}: {qty} contracts" for key, qty in short_positions.items()])
-                        await self.notifier.send_message(
-                            f"<b>🚨 CRITICAL: SHORT POSITION DETECTED</b>\n\n"
-                            f"The bot has detected SHORT positions:\n\n"
-                            f"{short_text}\n\n"
-                            f"<b>⚠️ This bot only trades LONG positions!</b>\n\n"
-                            f"<b>Likely cause:</b>\n"
-                            f"• Bracket order filled after session closed\n"
-                            f"• Race condition in position reconciliation\n\n"
-                            f"<b>🚨 IMMEDIATE ACTION REQUIRED:</b>\n"
-                            f"1. Open TWS\n"
-                            f"2. BUY TO CLOSE these positions NOW\n"
-                            f"3. Check for unlimited loss risk\n\n"
-                            f"<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
-                        )
-
-                if unmatched_positions:
-                    print(f"⚠️ WARNING: {len(unmatched_positions)} IBKR position(s) have no active session:")
-                    for pos_key in unmatched_positions:
-                        quantity = position_map[pos_key]
-                        is_short = quantity < 0
-                        print(f"   - {pos_key}: {quantity} contracts{' (SHORT!)' if is_short else ''}")
-                        if not is_short:
-                            print(f"     This position was likely opened manually or is an orphaned bracket order")
-
-                    # Send Telegram warning
-                    if self.notifier and unmatched_positions:
-                        positions_text = "\n".join([f"• {key}: {position_map[key]} contracts" for key in unmatched_positions])
-                        await self.notifier.send_message(
-                            f"<b>⚠️ Orphaned Positions Detected</b>\n\n"
-                            f"IBKR has positions that the bot is not tracking:\n\n"
-                            f"{positions_text}\n\n"
-                            f"<b>Possible causes:</b>\n"
-                            f"• Position opened manually outside bot\n"
-                            f"• Bracket order filled after session closed\n"
-                            f"• Bug in session management\n\n"
-                            f"<i>⚠️ Please check TWS and close manually if needed</i>"
-                        )
-
-            except Exception as e:
-                print(f"⚠️ Error in position reconciliation: {e}")
-
-    async def _eod_auto_close_task(self):
-        """
-        Background task to auto-close all open positions at end of trading day.
-
-        At TRADING_HOURS_END (default: 20:00 UTC = 4:00 PM ET):
-        - Find all OPEN sessions
-        - Submit market orders to close positions
-        - Close sessions with reason "EOD_AUTO_CLOSE"
-        """
-        eod_time_str = self.config["risk"]["trading_hours_end"]
-        try:
-            hour, minute = map(int, eod_time_str.split(":"))
-            eod_time = time(hour=hour, minute=minute)
-        except (ValueError, TypeError, AttributeError):
-            eod_time = time(hour=20, minute=0)  # Default to 8 PM UTC
-
-        print(f"EOD auto-close will run at {eod_time_str} UTC")
-
-        while self.running:
-            now = datetime.now(timezone.utc)
-            target_time = datetime.combine(now.date(), eod_time, tzinfo=timezone.utc)
-
-            # If target time already passed today, schedule for tomorrow
-            if now > target_time:
-                from datetime import timedelta
-                target_time += timedelta(days=1)
-
-            # Wait until EOD time
-            seconds_until_eod = (target_time - now).total_seconds()
-            await asyncio.sleep(seconds_until_eod)
-
-            if not self.running:
-                break
-
-            # Execute EOD close
-            if self.dry_run:
-                print("\n[EOD AUTO-CLOSE] Paper mode - would close all positions")
-            else:
-                print("\n[EOD AUTO-CLOSE] Closing all open positions...")
-                await self._execute_eod_close()
-
-            # Wait a bit to avoid running multiple times
-            await asyncio.sleep(60)
-
-    async def _execute_eod_close(self):
-        """
-        Execute end-of-day close for all open sessions.
-
-        Uses market orders for fast execution at market close.
-        """
-        from ib_insync import MarketOrder
-
-        open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
-
-        if not open_sessions:
-            print("  No open sessions to close")
-            return
-
-        print(f"  Closing {len(open_sessions)} open session(s)...")
-
-        for session in open_sessions:
-            try:
-                # Build contract
-                contract = self.executor._build_contract_from_session(session)
-                qualified = await self.executor.ib.qualifyContractsAsync(contract)
-
-                if not qualified:
-                    print(f"  ⚠️ Could not qualify contract for {session.underlying} {session.strike}")
-                    continue
-
-                contract = qualified[0]
-
-                # Cancel existing brackets
-                await self._cancel_session_brackets(session)
-
-                # Submit MARKET order for fast execution
-                market_order = MarketOrder("SELL", session.total_quantity)
-                trade = self.executor.ib.placeOrder(contract, market_order)
-
-                # Wait briefly for fill
-                filled = await self.executor._wait_for_fill(trade, timeout=10)
-
-                if filled:
-                    fill_price = trade.orderStatus.avgFillPrice
-                    pnl = self.executor._calculate_session_pnl(session, fill_price)
-
-                    # Update session
-                    session.state = SessionState.CLOSED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.exit_reason = "EOD_AUTO_CLOSE"
-                    session.exit_price = fill_price
-                    session.realized_pnl = pnl
-                    session.total_quantity = 0
-
-                    print(f"  ✓ Closed {session.underlying} {session.strike} @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
-
-                    # Log and notify
-                    self.logger.log_session_closed(session, reason="EOD Auto-Close", final_pnl=pnl)
-
-                    if self.notifier:
-                        await self.notifier.send_message(
-                            f"<b>🌙 EOD Auto-Close</b>\n\n"
-                            f"Position: {session.underlying} {session.strike}\n"
-                            f"Exit Price: ${fill_price:.2f}\n"
-                            f"P&L: ${pnl:+,.2f}\n\n"
-                            f"<i>All positions closed at end of trading day</i>"
-                        )
-                else:
-                    print(f"  ⚠️ EOD close timeout for {session.underlying} {session.strike}")
-
-            except Exception as e:
-                print(f"  ⚠️ Error closing session {session.session_id}: {e}")
-
-    async def _find_optimal_strike(self, underlying: str, direction: Direction, expiry: str, current_price: float) -> tuple[Optional[float], Optional[float]]:
-        """
-        Find optimal strike based on premium pricing.
-
-        Searches for strikes with premium in the target range ($0.25-$0.65).
-        Avoids strikes that are too cheap (far OTM) or too expensive (near/ITM).
-
-        Args:
-            underlying: Symbol (e.g., "SPY")
-            direction: CALL or PUT
-            expiry: Expiry date (YYYY-MM-DD)
-            current_price: Current underlying price
-
-        Returns:
-            Tuple of (optimal_strike, premium), or (None, None) if no suitable strike found
-        """
-        from ib_insync import Option
-        import math
-
-        TARGET_MIN_PREMIUM = 0.25
-        TARGET_MAX_PREMIUM = 0.65
-        MAX_STRIKES_TO_CHECK = 20  # Search up to $20 away (20 strikes × $1)
-
-        print(f"  Searching ${TARGET_MIN_PREMIUM:.2f}-${TARGET_MAX_PREMIUM:.2f} range...")
-
-        # Round current price to nearest $1 (SPY options trade in $1 increments)
-        base_strike = round(current_price)
-
-        # Determine search direction
-        if direction == Direction.CALL:
-            # For calls, search upward (OTM calls are above current price)
-            strikes_to_check = [base_strike + i for i in range(MAX_STRIKES_TO_CHECK)]
-        else:
-            # For puts, search downward (OTM puts are below current price)
-            strikes_to_check = [base_strike - i for i in range(MAX_STRIKES_TO_CHECK)]
-            strikes_to_check = [s for s in strikes_to_check if s > 0]  # No negative strikes
-
-        # Convert expiry to IBKR format (YYYYMMDD)
-        expiry_ibkr = expiry.replace('-', '')
-
-        # Temporarily suppress IBKR warnings about market data subscriptions
-        # (Snapshot data works fine, but IBKR prints warnings suggesting upgrades)
-        import sys
-        import io
-        original_stderr = sys.stderr
-        sys.stderr = io.StringIO()
-
-        try:
-            strikes_checked = 0
-            for strike in strikes_to_check:
-                try:
-                    # Build option contract
-                    option = Option(
-                        symbol=underlying,
-                        lastTradeDateOrContractMonth=expiry_ibkr,
-                        strike=strike,
-                        right='C' if direction == Direction.CALL else 'P',
-                        exchange='SMART'
-                    )
-
-                    # Qualify contract
-                    qualified = await self.executor.ib.qualifyContractsAsync(option)
-                    if not qualified:
-                        # Restore stderr temporarily
-                        sys.stderr = original_stderr
-                        print(f"    ${strike:.0f}{direction.value[0]}: [contract not found]")
-                        sys.stderr = io.StringIO()
-                        continue
-
-                    contract = qualified[0]
-
-                    # Get market data - use regular request (not snapshot) for better reliability
-                    ticker = self.executor.ib.reqMktData(contract, '', False, False)
-
-                    # Wait for data to arrive
-                    await asyncio.sleep(1.5)
-
-                    # Get premium from ticker (try multiple fields)
-                    premium = None
-                    if ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
-                        premium = (ticker.bid + ticker.ask) / 2
-                    elif ticker.last and not math.isnan(ticker.last):
-                        premium = ticker.last
-                    elif ticker.close and not math.isnan(ticker.close):
-                        premium = ticker.close
-
-                    # Try marketPrice as fallback
-                    if premium is None:
-                        try:
-                            mp = ticker.marketPrice()
-                            if mp and not math.isnan(mp):
-                                premium = mp
-                        except:
-                            pass
-
-                    # Cancel market data (ignore cleanup errors)
-                    try:
-                        self.executor.ib.cancelMktData(contract)
-                    except:
-                        pass
-
-                    # Restore stderr temporarily to print this strike's price
-                    sys.stderr = original_stderr
-
-                    if premium is None:
-                        # Debug: show what data we got
-                        debug_info = f"bid={ticker.bid}, ask={ticker.ask}, last={ticker.last}, close={ticker.close}"
-                        print(f"    ${strike:.0f}{direction.value[0]}: [no price data - {debug_info}]")
-                        sys.stderr = io.StringIO()
-                        continue
-
-                    strikes_checked += 1
-
-                    # Check if in target range
-                    if TARGET_MIN_PREMIUM <= premium <= TARGET_MAX_PREMIUM:
-                        print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} ✓ TARGET")
-                        # Wait for any pending IBKR cleanup
-                        await asyncio.sleep(0.1)
-                        return (strike, premium)
-                    elif premium > TARGET_MAX_PREMIUM:
-                        print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} (too expensive)")
-                    else:
-                        print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} (too cheap)")
-
-                    # Re-suppress stderr for next iteration
-                    sys.stderr = io.StringIO()
-
-                except Exception as e:
-                    # Print unexpected errors
-                    sys.stderr = original_stderr
-                    print(f"    ${strike:.0f}{direction.value[0]}: [error: {str(e)[:50]}]")
-                    sys.stderr = io.StringIO()
-                    continue
-
-            # No strike found in target range
-            # Wait for any pending IBKR cleanup before restoring stderr
-            await asyncio.sleep(0.1)
-            sys.stderr = original_stderr
-            print(f"  ✗ No strike in target range ${TARGET_MIN_PREMIUM:.2f}-${TARGET_MAX_PREMIUM:.2f}")
-            return (None, None)
-        finally:
-            # Ensure stderr is always restored
-            sys.stderr = original_stderr
-
-    async def _search_optimal_strike(
-        self,
-        underlying: str,
-        direction: Direction,
-        start_strike: float,
-        expiry: str
-    ) -> Optional[float]:
-        """
-        Search for optimal strike with premium in $0.25-$0.60 range.
-
-        Searches 7 strikes total, $1 apart, starting from start_strike.
-        - For CALL: searches UP (start, start+1, start+2, ..., start+6)
-        - For PUT: searches DOWN (start, start-1, start-2, ..., start-6)
-
-        Args:
-            underlying: Symbol (e.g., "SPY")
-            direction: CALL or PUT
-            start_strike: Starting strike to search from
-            expiry: Expiry date (YYYY-MM-DD)
-
-        Returns:
-            Optimal strike with premium in range, or None if not found
-        """
-        from ib_insync import Option
-        import math
-
-        MIN_PREMIUM = 0.25
-        MAX_PREMIUM = 0.60
-        NUM_STRIKES = 7
-
-        print(f"  Target premium: ${MIN_PREMIUM:.2f}-${MAX_PREMIUM:.2f}")
-        print(f"  Checking {NUM_STRIKES} strikes starting at ${start_strike:.0f}...")
-
-        # Send initial Telegram notification
-        if self.notifier:
-            await self.notifier.send_message(
-                f"<b>🔍 Searching for Optimal Strike</b>\n\n"
-                f"<b>Symbol:</b> {underlying} {direction.value}\n"
-                f"<b>Target Premium:</b> ${MIN_PREMIUM:.2f}-${MAX_PREMIUM:.2f}\n"
-                f"<b>Starting Strike:</b> ${start_strike:.0f}\n"
-                f"<b>Checking:</b> {NUM_STRIKES} strikes\n\n"
-                f"<i>Checking strikes now...</i>"
-            )
-
-        # Build list of strikes to check
-        if direction == Direction.CALL:
-            # CALL: search upward (higher strikes)
-            strikes = [start_strike + i for i in range(NUM_STRIKES)]
-        else:
-            # PUT: search downward (lower strikes)
-            strikes = [start_strike - i for i in range(NUM_STRIKES)]
-            strikes = [s for s in strikes if s > 0]  # No negative strikes
-
-        # Convert expiry to IBKR format
-        expiry_ibkr = expiry.replace('-', '')
-
-        # Track results for summary message
-        strike_results = []
-
-        for strike in strikes:
-            try:
-                # Build option contract
-                option = Option(
-                    symbol=underlying,
-                    lastTradeDateOrContractMonth=expiry_ibkr,
-                    strike=strike,
-                    right='C' if direction == Direction.CALL else 'P',
-                    exchange='SMART'
-                )
-
-                # Qualify contract
-                qualified = await self.executor.ib.qualifyContractsAsync(option)
-                if not qualified:
-                    print(f"    ${strike:.0f}{direction.value[0]}: [contract not found]")
-                    continue
-
-                contract = qualified[0]
-
-                # Get market data with OPRA
-                ticker = self.executor.ib.reqMktData(contract, snapshot=False)
-
-                # Wait for data (OPRA should be fast)
-                for attempt in range(4):  # 4 × 0.5s = 2 seconds max per strike
-                    await asyncio.sleep(0.5)
-
-                    # Check for valid bid/ask
-                    if ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
-                        break
-
-                # Get premium (use ask for entry, or mid if both available)
-                premium = None
-                if ticker.ask and not math.isnan(ticker.ask):
-                    premium = ticker.ask
-                elif ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
-                    premium = (ticker.bid + ticker.ask) / 2
-                elif ticker.last and not math.isnan(ticker.last):
-                    premium = ticker.last
-
-                # Cancel market data subscription
-                try:
-                    self.executor.ib.cancelMktData(contract)
-                except:
-                    pass
-
-                if premium is None:
-                    print(f"    ${strike:.0f}{direction.value[0]}: [no price data]")
-                    strike_results.append((strike, None, "no data"))
-                    continue
-
-                # Check if in target range
-                if MIN_PREMIUM <= premium <= MAX_PREMIUM:
-                    print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} ✓ SELECTED")
-                    strike_results.append((strike, premium, "selected"))
-
-                    # Send success notification
-                    if self.notifier:
-                        result_text = "\n".join([
-                            f"${s:.0f}{direction.value[0]}: "
-                            f"{'[no data]' if p is None else f'${p:.2f}' if status == 'selected' else f'${p:.2f} ({status})'}"
-                            for s, p, status in strike_results
-                        ])
-
-                        await self.notifier.send_message(
-                            f"<b>✅ Optimal Strike Selected</b>\n\n"
-                            f"<b>Strike:</b> ${strike:.0f}{direction.value[0]}\n"
-                            f"<b>Premium:</b> ${premium:.2f}\n\n"
-                            f"<b>Search Results:</b>\n"
-                            f"<code>{result_text}</code>"
-                        )
-
-                    return strike
-                elif premium > MAX_PREMIUM:
-                    print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} (too expensive)")
-                    strike_results.append((strike, premium, "too expensive"))
-                elif premium < MIN_PREMIUM:
-                    print(f"    ${strike:.0f}{direction.value[0]}: ${premium:.2f} (too cheap)")
-                    strike_results.append((strike, premium, "too cheap"))
-
-            except Exception as e:
-                print(f"    ${strike:.0f}{direction.value[0]}: [error: {str(e)[:50]}]")
-                strike_results.append((strike, None, "error"))
-                continue
-
-        # No suitable strike found - send summary
-        if self.notifier:
-            result_text = "\n".join([
-                f"${s:.0f}{direction.value[0]}: "
-                f"{'[no data]' if p is None else f'${p:.2f} ({status})'}"
-                for s, p, status in strike_results
-            ])
-
-            await self.notifier.send_message(
-                f"<b>❌ No Suitable Strike Found</b>\n\n"
-                f"<b>Symbol:</b> {underlying} {direction.value}\n"
-                f"<b>Target:</b> ${MIN_PREMIUM:.2f}-${MAX_PREMIUM:.2f}\n\n"
-                f"<b>Strikes Checked:</b>\n"
-                f"<code>{result_text}</code>\n\n"
-                f"<i>Trade rejected - no strike in range</i>"
-            )
-
-        return None
-
-    async def _check_and_close_opposite_direction(self, underlying: str, new_direction: Direction):
-        """
-        Check for open positions in the opposite direction and close them.
-
-        TradingView direction reversal logic:
-        - If CALL alert comes in while holding PUT → close PUT position
-        - If PUT alert comes in while holding CALL → close CALL position
-
-        This ensures we don't hold conflicting positions when indicator flips.
-
-        Args:
-            underlying: The underlying symbol (e.g., "SPY")
-            new_direction: The new direction from the alert (CALL or PUT)
-        """
-        from ib_insync import MarketOrder
-
-        # Determine opposite direction
-        opposite_direction = Direction.PUT if new_direction == Direction.CALL else Direction.CALL
-
-        # Find OPEN sessions for the same underlying but opposite direction
-        open_sessions = [
-            s for s in self.session_manager.sessions.values()
-            if s.state == SessionState.OPEN
-            and s.underlying == underlying
-            and s.direction == opposite_direction
-            and s.total_quantity > 0
-        ]
-
-        if not open_sessions:
-            return  # No opposite positions to close
-
-        print(f"\n⚠️ DIRECTION REVERSAL DETECTED")
-        print(f"  New signal: {underlying} {new_direction.value}")
-        print(f"  Found {len(open_sessions)} open {opposite_direction.value} position(s)")
-        print(f"  Closing opposite direction positions before entering new trade...")
-
-        for session in open_sessions:
-            try:
-                symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}"
-                print(f"\n  Closing {symbol}...")
-
-                # Cancel brackets FIRST to prevent SHORT positions
-                if session.stop_order_id or session.target_order_ids:
-                    success = await self._cancel_session_brackets(session)
-
-                    if not success:
-                        print(f"    ✗ Failed to cancel brackets - SKIPPING close")
-                        continue  # Skip this session
-
-                    print(f"    ✓ Brackets cancelled")
-
-                    # Wait for cancellations to propagate through IBKR
-                    await asyncio.sleep(0.5)
-
-                # Build contract
-                contract = self.executor._build_contract_from_session(session)
-                qualified = await self.executor.ib.qualifyContractsAsync(contract)
-
-                if not qualified:
-                    print(f"    ✗ Could not qualify contract")
-                    continue
-
-                contract = qualified[0]
-                contract.exchange = "SMART"
-
-                # Verify actual IBKR position before closing
-                positions = self.executor.ib.positions()
-                matching_position = None
-                for pos in positions:
-                    if pos.contract.conId == contract.conId:
-                        matching_position = pos
-                        break
-
-                if not matching_position or matching_position.position == 0:
-                    print(f"    ⚠️ No IBKR position found - may have been manually closed")
-                    # Mark session as closed anyway
-                    session.state = SessionState.CLOSED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.exit_reason = "DIRECTION_REVERSAL (no position)"
-                    session.total_quantity = 0
-                    continue
-
-                # Use actual position quantity and determine correct action
-                actual_qty = abs(matching_position.position)
-                action = "SELL" if matching_position.position > 0 else "BUY"
-
-                print(f"    Position: {matching_position.position} contracts ({action} {actual_qty} to close)")
-
-                # Use MARKET order for fast exit
-                order = MarketOrder(action, actual_qty)
-                trade = self.executor.ib.placeOrder(contract, order)
-
-                # Wait for fill
-                filled = await self.executor._wait_for_fill(trade, timeout=10)
-
-                if filled:
-                    fill_price = trade.orderStatus.avgFillPrice
-
-                    # Calculate P&L
-                    fill_value = fill_price * 100  # Premium to dollar value
-                    pnl = (fill_value - session.avg_entry_price) * session.total_quantity
-
-                    # Close session
-                    session.state = SessionState.CLOSED
-                    session.closed_at = datetime.now(timezone.utc)
-                    session.exit_reason = "DIRECTION_REVERSAL"
-                    session.exit_price = fill_price
-                    session.realized_pnl = pnl
-                    session.total_quantity = 0
-
-                    print(f"    ✓ Closed @ ${fill_price:.2f} | P&L: ${pnl:+,.2f}")
-
-                    # Log closure
-                    self.logger.log_session_closed(
-                        session,
-                        reason=f"Direction reversal: {opposite_direction.value} → {new_direction.value}",
-                        final_pnl=pnl
-                    )
-
-                    # Send Telegram notification
-                    if self.notifier:
-                        pnl_emoji = "💰" if pnl > 0 else "📉"
-                        await self.notifier.send_message(
-                            f"<b>🔄 Direction Reversal - Position Closed</b>\n\n"
-                            f"<b>Closed:</b> {symbol}\n"
-                            f"<b>Exit:</b> ${fill_price:.2f}\n"
-                            f"<b>P&L:</b> {pnl_emoji} ${pnl:+,.2f}\n\n"
-                            f"<b>Reason:</b> New {new_direction.value} signal received\n"
-                            f"<b>Direction:</b> {opposite_direction.value} → {new_direction.value}\n\n"
-                            f"<i>Indicator flipped - opposite position auto-closed</i>"
-                        )
-                else:
-                    print(f"    ⚠️ Close order timeout")
-
-            except Exception as e:
-                print(f"    ✗ Error closing opposite position: {e}")
-                import traceback
-                traceback.print_exc()
-
-    async def _cancel_session_brackets(self, session: TradeSession) -> bool:
-        """
-        Cancel all bracket orders for a session.
-
-        Returns:
-            True if all cancellations succeeded, False otherwise
-        """
-        order_ids_to_cancel = []
-
-        if session.stop_order_id:
-            order_ids_to_cancel.append(session.stop_order_id)
-        if session.target_order_ids:
-            order_ids_to_cancel.extend(session.target_order_ids)
-
-        if order_ids_to_cancel:
-            return await self.executor._cancel_sibling_orders(order_ids_to_cancel)
-
-        return True  # No brackets to cancel
-
-
-async def main():
-    """Main entry point."""
-    # Load environment variables
-    load_dotenv()
-
-    # Build config (in production, load from YAML)
-    config = {
-        "mode": os.getenv("MODE", "MIKE").upper(),  # MIKE or INDICATOR
-        "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY"),
-        "discord": {
-            "user_token": os.getenv("DISCORD_USER_TOKEN"),
-            "channel_ids": [
-                int(x)
-                for x in os.getenv("DISCORD_CHANNEL_IDS", "").split(",")
-                if x
-            ],
-            "monitored_users": os.getenv("DISCORD_MONITORED_USERS", "").split(
-                ","
-            )
-            if os.getenv("DISCORD_MONITORED_USERS")
-            else None,
-        },
-        "tradingview": {
-            "webhook_port": int(os.getenv("TRADINGVIEW_WEBHOOK_PORT", "8080")),
-            "webhook_secret": os.getenv("TRADINGVIEW_WEBHOOK_SECRET", ""),
-        },
-        "ibkr": {
-            "host": os.getenv("IBKR_HOST", "127.0.0.1"),
-            "port": int(os.getenv("IBKR_PORT", "7497")),  # 7497 = TWS live, 7496 = TWS paper, 4001 = Gateway live, 4002 = Gateway paper
-            "client_id": int(os.getenv("IBKR_CLIENT_ID", "1")),
-            "force_market_orders": os.getenv("FORCE_MARKET_ORDERS", "false").lower() == "true",
-        },
-        "risk": {
-            "account_balance": float(
-                os.getenv("ACCOUNT_BALANCE", "10000")
-            ),
-            "risk_per_trade_percent": float(
-                os.getenv("RISK_PER_TRADE_PERCENT", "0.5")
-            ),
-            "daily_max_loss_percent": float(
-                os.getenv("DAILY_MAX_LOSS_PERCENT", "2.0")
-            ),
-            "max_loss_streak": int(os.getenv("MAX_LOSS_STREAK", "3")),
-            "initial_contracts": int(os.getenv("INITIAL_CONTRACTS", "1")),
-            "max_contracts": int(os.getenv("MAX_CONTRACTS", "2")),
-            "max_adds_per_trade": int(os.getenv("MAX_ADDS_PER_TRADE", "1")),
-            "trading_hours_start": os.getenv(
-                "TRADING_HOURS_START", "13:30"
-            ),  # 9:30 AM ET
-            "trading_hours_end": os.getenv(
-                "TRADING_HOURS_END", "20:00"
-            ),  # 4:00 PM ET
-            "max_bid_ask_spread_percent": float(
-                os.getenv("MAX_BID_ASK_SPREAD_PERCENT", "10.0")
-            ),
-            "high_risk_size_reduction": float(
-                os.getenv("HIGH_RISK_SIZE_REDUCTION", "0.5")
-            ),
-            "extreme_risk_size_reduction": float(
-                os.getenv("EXTREME_RISK_SIZE_REDUCTION", "0.25")
-            ),
-            # Auto stop loss and targets
-            "auto_stop_loss_percent": float(
-                os.getenv("AUTO_STOP_LOSS_PERCENT", "25.0")
-            ),
-            "risk_reward_ratio": float(
-                os.getenv("RISK_REWARD_RATIO", "2.0")
-            ),
-        },
-        "telegram": {
-            "enabled": os.getenv("TELEGRAM_ENABLED", "false").lower() == "true",
-            "bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            "chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
-        },
-        "dry_run": os.getenv("DRY_RUN", "true").lower() == "true",
-    }
-
-    # Create and start orchestrator
-    orchestrator = TradingOrchestrator(config)
-    await orchestrator.start()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            return f"❌ Error: {str(e)}"

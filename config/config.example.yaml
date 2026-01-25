@@ -1,63 +1,56 @@
-# Example configuration file for AutoScalper
+# Example configuration file for MNQ Futures AutoScalper
 
 system:
-  name: "LLM-Assisted 0DTE Options Auto-Trading"
-  version: "1.0"
+  name: "MNQ Futures Scalping Bot"
+  version: "2.0"
   dry_run: true  # true = no IBKR connection (simulated), false = connect to IBKR
+  log_dir: "logs"
 
-llm:
-  provider: "anthropic"
-  model: "claude-opus-4-5-20251101"
-  temperature: 0.0
-  max_tokens: 1024
+# TradingView Webhook Configuration
+tradingview:
+  webhook_port: 8080
+  webhook_secret: "${TRADINGVIEW_WEBHOOK_SECRET}"
 
-discord:
-  # Your Discord user token (see GET_DISCORD_TOKEN.md)
-  user_token: "${DISCORD_USER_TOKEN}"
-  # Channel IDs to monitor (right-click channel, Copy ID)
-  channel_ids:
-    - 123456789
-    - 987654321
-  # Only monitor these users (leave empty to monitor all)
-  monitored_users:
-    - "trader_username_1"
-    - "trader_username_2"
-
+# Interactive Brokers Configuration
 ibkr:
   host: "127.0.0.1"
-  port: 7497  # 7497 for paper, 7496 for live
+  port: 4002  # 4002 for paper gateway, 4001 for live gateway
   client_id: 1
 
+# Futures Configuration
+futures:
+  symbol: "MNQ"
+  exchange: "CME"
+  tick_size: 0.25
+  point_value: 2.0  # $2 per point for MNQ
+
+# Risk Management
 risk:
-  account_balance: 10000.0
+  account_balance: 10000.0  # Fallback if IBKR balance unavailable
 
   # Position sizing
-  risk_per_trade_percent: 0.5  # 0.5% of account per trade
-  max_contracts: 1
+  # num_contracts > 0: fixed number of contracts per position
+  # num_contracts = 0: auto-calculate based on account balance and margin
+  num_contracts: 1
+  margin_per_contract: 2000.0  # Fallback if IBKR margin fetch fails (auto-detected on startup)
+  margin_buffer: 0.80          # Safety buffer: only use 80% of balance for margin (20% reserve)
 
-  # Daily limits
-  daily_max_loss_percent: 2.0  # Stop trading if down 2%
-  max_loss_streak: 3  # Stop after 3 consecutive losses
+  # Daily limits (dollar-based for futures)
+  daily_max_loss: 500   # Stop trading if down $500
+  max_loss_streak: 3    # Stop after 3 consecutive losses
 
-  # Adds/averaging
-  max_adds_per_trade: 1
+  # IBKR daily maintenance window (UTC) - trading disabled during this time
+  # Default: 23:00-01:00 UTC (6pm-8pm ET) - 2 hour window
+  maintenance_start: "23:00"
+  maintenance_end: "01:00"
 
-  # Trading hours (UTC)
-  trading_hours_start: "13:30"  # 9:30 AM ET
-  trading_hours_end: "20:00"    # 4:00 PM ET
+# Telegram Notifications
+telegram:
+  enabled: false
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_id: "${TELEGRAM_CHAT_ID}"
 
-  # Execution quality
-  max_bid_ask_spread_percent: 10.0
-
-  # Risk level adjustments
-  high_risk_size_reduction: 0.5      # 50% size for HIGH risk
-  extreme_risk_size_reduction: 0.25  # 25% size for EXTREME risk
-
+# Logging
 logging:
   level: "INFO"
   file: "logs/autoscalper.log"
-
-monitoring:
-  enable_alerts: true
-  alert_on_rejection: true
-  alert_on_execution: true

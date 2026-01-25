@@ -2,13 +2,6 @@
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 
-# LLM integration
-anthropic>=0.30.0
-openai>=1.0.0
-
-# Discord integration (WebSocket-based, no external library)
-# Uses aiohttp for WebSocket connections
-
 # IBKR integration
 ib-insync>=0.9.86
 
@@ -19,9 +12,9 @@ pytz>=2023.3
 
 # Logging and monitoring
 structlog>=23.1.0
-psutil>=5.9.0  # System resource monitoring for /server command
+psutil>=5.9.0  # System resource monitoring for /status command
 
-# Notifications
+# Web server and HTTP (for TradingView webhook)
 aiohttp>=3.9.0
 
 # Configuration

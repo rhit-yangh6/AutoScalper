@@ -1,10 +1,10 @@
 """
-Trade logging system for Discord messages and IBKR orders.
+Trade logging system for MNQ futures trading.
 
 Logs are organized by:
 - Trading day
 - Trading session (each NEW event creates a new session log)
-- Discord messages (raw and parsed)
+- Webhook signals
 - Orders (submitted, filled, cancelled, rejected)
 """
 
@@ -32,9 +32,9 @@ class TradeLogger:
     Comprehensive logging for trading activity.
 
     Creates organized logs:
-    - logs/YYYY-MM-DD/session_HHMMSS_SYMBOL_DIRECTION.log (human-readable)
-    - logs/YYYY-MM-DD/session_HHMMSS_SYMBOL_DIRECTION.json (structured)
-    - logs/YYYY-MM-DD/all_messages.log (all Discord messages)
+    - logs/YYYY-MM-DD/session_HHMMSS_SYMBOL_SIDE.log (human-readable)
+    - logs/YYYY-MM-DD/session_HHMMSS_SYMBOL_SIDE.json (structured)
+    - logs/YYYY-MM-DD/all_signals.log (all webhook signals)
     - logs/YYYY-MM-DD/all_orders.log (all orders)
     """
 
@@ -68,10 +68,10 @@ class TradeLogger:
 
         # Create new log files for this session
         timestamp = session.created_at.strftime('%H%M%S')
-        symbol = session.underlying or "UNKNOWN"
-        direction = session.direction.value if session.direction else "UNKNOWN"
+        symbol = session.symbol or "MNQ"
+        side = session.position_side.value if session.position_side else "UNKNOWN"
 
-        base_name = f"session_{timestamp}_{symbol}_{direction}"
+        base_name = f"session_{timestamp}_{symbol}_{side}"
         txt_path = self.current_day_dir / f"{base_name}.log"
         json_path = self.current_day_dir / f"{base_name}.json"
 
@@ -81,10 +81,8 @@ class TradeLogger:
             'json_path': json_path,
             'session_metadata': {
                 'session_id': session.session_id,
-                'underlying': session.underlying,
-                'direction': session.direction.value if session.direction else None,
-                'strike': session.strike,
-                'expiry': session.expiry,
+                'symbol': session.symbol,
+                'position_side': side,
                 'created_at': session.created_at.isoformat(),
                 'author': session.author,
             },
@@ -96,39 +94,39 @@ class TradeLogger:
             f.write("=" * 80 + "\n")
             f.write(f"TRADING SESSION: {session.session_id}\n")
             f.write(f"Started: {session.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
-            f.write(f"Symbol: {symbol} {direction}\n")
-            f.write(f"Strike: {session.strike} Expiry: {session.expiry}\n")
+            f.write(f"Symbol: {symbol} {side}\n")
             f.write("=" * 80 + "\n\n")
 
         return txt_path, json_path
 
-    def log_discord_message(
+    def log_signal(
         self,
         session: Optional[TradeSession],
-        author: str,
-        message: str,
-        timestamp: datetime,
-        message_id: str,
+        event: Event,
     ):
         """
-        Log a Discord message.
+        Log a TradingView webhook signal.
 
         Logs to both:
         - Session-specific log (if session exists)
-        - All messages log for the day
+        - All signals log for the day
         """
         # Update day directory if needed
         if not self.current_day_dir or self.current_day_dir.name != datetime.now().strftime('%Y-%m-%d'):
             self._update_day_directory()
 
-        # Format message
-        time_str = timestamp.strftime('%H:%M:%S')
-        log_entry = f"[{time_str}] {author}: {message}\n"
+        # Format signal
+        time_str = event.timestamp.strftime('%H:%M:%S')
+        side = event.position_side.value if event.position_side else "?"
+        log_entry = f"[{time_str}] {event.event_type.value}: {event.symbol} {side}\n"
 
-        # Log to all_messages.log
-        all_messages_path = self.current_day_dir / "all_messages.log"
-        with open(all_messages_path, 'a') as f:
+        # Log to all_signals.log
+        all_signals_path = self.current_day_dir / "all_signals.log"
+        with open(all_signals_path, 'a') as f:
             f.write(log_entry)
+            if event.entry_price:
+                f.write(f"  Entry: ${event.entry_price:.2f}\n")
+            f.write("\n")
 
         # Log to session-specific log if session exists
         if session:
@@ -136,118 +134,35 @@ class TradeLogger:
 
             # Append to text log
             with open(txt_path, 'a') as f:
-                f.write(f"[DISCORD MESSAGE]\n")
+                f.write(f"[SIGNAL: {event.event_type.value}]\n")
                 f.write(log_entry)
-                f.write(f"  Message ID: {message_id}\n\n")
+                if event.entry_price:
+                    f.write(f"  Entry: ${event.entry_price:.2f}\n")
+                f.write(f"  Quantity: {event.quantity}\n\n")
 
             # Add to JSON entries
             self.session_logs[session.session_id]['entries'].append({
-                'type': 'discord_message',
-                'timestamp': timestamp.isoformat(),
-                'author': author,
-                'message': message,
-                'message_id': message_id
+                'type': 'signal',
+                'timestamp': event.timestamp.isoformat(),
+                'event_type': event.event_type.value,
+                'symbol': event.symbol,
+                'position_side': side,
+                'entry_price': event.entry_price,
+                'quantity': event.quantity
             })
 
-    def log_parsed_event(
+    def log_execution(
         self,
-        session: Optional[TradeSession],
+        session: TradeSession,
         event: Event,
-    ):
-        """Log a parsed event from LLM."""
-        if not session:
-            return
-
-        txt_path, json_path = self._get_session_log_files(session)
-
-        # Format for text log
-        with open(txt_path, 'a') as f:
-            f.write(f"[PARSED EVENT: {event.event_type.value}]\n")
-            f.write(f"  Source: {event.author}\n")
-            if event.parsing_confidence is not None:
-                f.write(f"  Confidence: {event.parsing_confidence:.2f}\n")
-            if event.llm_reasoning:
-                f.write(f"  Reasoning: {event.llm_reasoning}\n")
-
-            # Event details
-            if event.entry_price:
-                f.write(f"  Entry Price: ${event.entry_price:.2f}\n")
-            if event.stop_loss:
-                f.write(f"  Stop Loss: ${event.stop_loss:.2f}\n")
-            if event.targets:
-                f.write(f"  Targets: {', '.join(f'${t:.2f}' for t in event.targets)}\n")
-            if event.quantity:
-                f.write(f"  Quantity: {event.quantity}\n")
-            if event.risk_level:
-                f.write(f"  Risk Level: {event.risk_level.value}\n")
-            if event.risk_notes:
-                f.write(f"  Risk Notes: {event.risk_notes}\n")
-
-            f.write("\n")
-
-        # Add to JSON entries
-        self.session_logs[session.session_id]['entries'].append({
-            'type': 'parsed_event',
-            'timestamp': event.timestamp.isoformat(),
-            'event_type': event.event_type.value,
-            'entry_price': event.entry_price,
-            'stop_loss': event.stop_loss,
-            'targets': event.targets,
-            'quantity': event.quantity,
-            'risk_level': event.risk_level.value if event.risk_level else None,
-            'risk_notes': event.risk_notes,
-            'parsing_confidence': event.parsing_confidence,
-            'llm_reasoning': event.llm_reasoning
-        })
-
-    def log_order_submitted(
-        self,
-        session: TradeSession,
-        event_type: EventType,
-        order_details: dict,
-    ):
-        """Log an order submission to IBKR."""
-        txt_path, json_path = self._get_session_log_files(session)
-
-        timestamp = datetime.now(timezone.utc)
-        time_str = timestamp.strftime('%H:%M:%S')
-
-        # Format for text log
-        with open(txt_path, 'a') as f:
-            f.write(f"[{time_str}] [ORDER SUBMITTED: {event_type.value}]\n")
-            for key, value in order_details.items():
-                f.write(f"  {key}: {value}\n")
-            f.write("\n")
-
-        # Log to all_orders.log
-        all_orders_path = self.current_day_dir / "all_orders.log"
-        with open(all_orders_path, 'a') as f:
-            f.write(f"[{time_str}] [{event_type.value}] SUBMITTED\n")
-            for key, value in order_details.items():
-                f.write(f"  {key}: {value}\n")
-            f.write("\n")
-
-        # Add to JSON entries
-        self.session_logs[session.session_id]['entries'].append({
-            'type': 'order_submitted',
-            'timestamp': timestamp.isoformat(),
-            'event_type': event_type.value,
-            'order_details': order_details
-        })
-
-    def log_order_result(
-        self,
-        session: TradeSession,
-        event_type: EventType,
         result: OrderResult,
     ):
-        """Log the result of an order execution."""
+        """Log an execution result."""
         txt_path, json_path = self._get_session_log_files(session)
 
         timestamp = datetime.now(timezone.utc)
         time_str = timestamp.strftime('%H:%M:%S')
 
-        # result.status is already a string value (Pydantic's use_enum_values = True)
         # Determine status emoji based on string value
         status_symbol = {
             "FILLED": "✓",
@@ -259,7 +174,7 @@ class TradeLogger:
 
         # Format for text log
         with open(txt_path, 'a') as f:
-            f.write(f"[{time_str}] [ORDER RESULT: {event_type.value}] {status_symbol} {result.status}\n")
+            f.write(f"[{time_str}] [EXECUTION: {event.event_type.value}] {status_symbol} {result.status}\n")
             if result.order_id:
                 f.write(f"  Order ID: {result.order_id}\n")
             if result.filled_price:
@@ -271,7 +186,7 @@ class TradeLogger:
         # Log to all_orders.log
         all_orders_path = self.current_day_dir / "all_orders.log"
         with open(all_orders_path, 'a') as f:
-            f.write(f"[{time_str}] [{event_type.value}] {status_symbol} {result.status}\n")
+            f.write(f"[{time_str}] [{event.event_type.value}] {status_symbol} {result.status}\n")
             if result.order_id:
                 f.write(f"  Order ID: {result.order_id}\n")
             if result.filled_price:
@@ -282,9 +197,9 @@ class TradeLogger:
 
         # Add to JSON entries
         self.session_logs[session.session_id]['entries'].append({
-            'type': 'order_result',
+            'type': 'execution',
             'timestamp': timestamp.isoformat(),
-            'event_type': event_type.value,
+            'event_type': event.event_type.value,
             'status': result.status,
             'success': result.success,
             'order_id': result.order_id,
@@ -292,7 +207,7 @@ class TradeLogger:
             'message': result.message
         })
 
-        # Update session metadata after order result
+        # Update session metadata after execution
         self.update_session_metadata(session)
 
     def update_session_metadata(self, session: TradeSession):

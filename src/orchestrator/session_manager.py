@@ -1,22 +1,59 @@
+"""
+Session Manager for MNQ Futures Trading
+
+Manages trade sessions and correlates events to sessions.
+Simplified for futures trading (no options complexity).
+"""
+
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from ..models import Event, TradeSession, EventType, SessionState
+from ..models import Event, TradeSession, EventType, SessionState, PositionSide
 
 
 class SessionManager:
     """
     Manages trade sessions and correlates events to sessions.
 
-    Correlation rules:
-    - CRITICAL: Only ONE active session per author at any time
+    Correlation rules for futures:
+    - Only ONE active session per author at any time
     - If author has active session, NEW events for different trades are REJECTED
-    - UPDATE events (ADD, TRIM, EXIT, etc.) correlate to the active session
+    - UPDATE events (ADD, EXIT, etc.) correlate to the active session
     - Session must be closed before starting a new trade
     """
 
     def __init__(self):
         self.sessions: dict[str, TradeSession] = {}
+
+    def check_for_flip(self, event: Event) -> Optional[TradeSession]:
+        """
+        Check if a NEW event would flip an existing position.
+
+        Returns the session that needs to be closed first, or None if no flip.
+
+        A flip occurs when:
+        - NEW event for symbol X, side LONG
+        - Active session exists for symbol X, side SHORT (or vice versa)
+        """
+        if event.event_type != EventType.NEW:
+            return None
+
+        if not event.position_side:
+            return None
+
+        # Find active sessions for same author and symbol but OPPOSITE side
+        for session in self.sessions.values():
+            if not session.is_active():
+                continue
+            if session.author != event.author:
+                continue
+            if session.symbol != event.symbol:
+                continue
+            # Check if opposite side
+            if session.position_side != event.position_side:
+                return session
+
+        return None
 
     def process_event(self, event: Event) -> Optional[TradeSession]:
         """
@@ -24,68 +61,59 @@ class SessionManager:
 
         Returns the updated/created session, or None if event should be ignored.
         """
-        # Ignore non-actionable events at session level
         if event.event_type == EventType.IGNORE:
             return None
 
-        # CANCEL or NEW events might create new sessions
         if event.event_type == EventType.NEW:
             return self._handle_new_event(event)
         elif event.event_type == EventType.CANCEL:
             return self._handle_cancel_event(event)
         else:
-            # All other events need to correlate to existing session
             return self._handle_update_event(event)
 
     def _handle_new_event(self, event: Event) -> TradeSession:
         """Handle a NEW event by creating a new session."""
         # Validate required fields
-        if not all([event.underlying, event.direction, event.strike]):
+        if not all([event.symbol, event.position_side]):
             raise ValueError(
-                f"NEW event missing required fields: {event.raw_message}"
+                f"NEW event missing required fields: symbol, position_side"
             )
 
-        # CRITICAL: Only allow ONE active session at a time per author
-        # Check for ANY active session for this author
+        # Check for existing active session
         active_sessions = [
             s for s in self.sessions.values()
             if s.author == event.author and s.is_active()
         ]
 
         if active_sessions:
-            # Found active session(s) - check if it matches this trade
+            # Check if it matches this trade (same symbol and side)
             matching = self._find_matching_session(event)
             if matching:
-                # Same trade (same strike/expiry) - convert NEW to ADD
+                # Same trade - convert NEW to ADD
                 print(f"⚠️ Detected duplicate NEW signal for existing position")
-                print(f"  Existing: {matching.underlying} {matching.strike}{matching.direction.value[0]} @ ${matching.avg_entry_price:.2f} ({matching.total_quantity} contracts)")
-                print(f"  Converting NEW → ADD (averaging down/up)")
+                print(f"  Existing: {matching.symbol} {matching.position_side.value} @ ${matching.avg_entry_price:.2f}")
+                print(f"  Converting NEW → ADD")
 
-                # CRITICAL: Convert event type from NEW to ADD
                 event.event_type = EventType.ADD
                 matching.add_event(event)
                 return matching
             else:
-                # Different trade - reject NEW event (only one active session allowed)
+                # Different trade - reject
                 existing_session = active_sessions[0]
-                symbol = f"{existing_session.underlying} {existing_session.strike}{existing_session.direction.value[0]}"
+                symbol = f"{existing_session.symbol} {existing_session.position_side.value}"
                 print(f"⚠️ Cannot create new session - already have active session: {symbol}")
-                print(f"⚠️ Close existing position before opening new one")
                 raise ValueError(
-                    f"Only one active session allowed at a time. "
-                    f"Current active: {symbol} (session {existing_session.session_id[:8]}...)"
+                    f"Only one active session allowed. Current: {symbol}"
                 )
 
-        # No active sessions - safe to create new session
+        # Create new session
         session_id = self._generate_session_id()
         session = TradeSession(
             session_id=session_id,
             state=SessionState.PENDING,
             author=event.author,
-            underlying=event.underlying,
-            direction=event.direction,
-            strike=event.strike,
-            expiry=event.expiry or self._get_today_expiry(),
+            symbol=event.symbol,
+            position_side=event.position_side,
             created_at=event.timestamp,
             updated_at=event.timestamp,
             entry_event=event,
@@ -104,17 +132,15 @@ class SessionManager:
 
     def _handle_update_event(self, event: Event) -> Optional[TradeSession]:
         """
-        Handle ADD, TRIM, EXIT, TP, SL, MOVE_STOP, TARGETS, etc.
+        Handle ADD, EXIT, TP, SL events.
 
-        These all require an existing active session.
+        These require an existing active session.
         """
         session = self._find_matching_session(event)
 
         if not session:
-            # No matching session - this is a failure case
-            # Could be orphaned message or out-of-order delivery
             print(
-                f"WARNING: Event {event.event_type} has no matching session: {event.raw_message}"
+                f"WARNING: Event {event.event_type} has no matching session"
             )
             return None
 
@@ -124,7 +150,6 @@ class SessionManager:
             )
             return None
 
-        # Add event to session
         session.add_event(event)
         return session
 
@@ -132,34 +157,21 @@ class SessionManager:
         """
         Check if session matches event criteria.
 
-        For precise matching (NEW/ADD to same contract), checks:
+        For futures, checks:
         - Same author
-        - Same underlying (SPY/QQQ)
-        - Same direction (CALL/PUT)
-        - Same strike (if event has strike)
-        - Same expiry (if event has expiry)
+        - Same symbol
+        - Same position side (if provided)
         - Same trading day
         """
-        # Basic checks
         if not session.is_active() or session.author != event.author:
             return False
 
-        # Underlying check (allow None event.underlying for update events)
-        if event.underlying and session.underlying != event.underlying:
+        # Symbol check (allow None for update events like EXIT)
+        if event.symbol and session.symbol != event.symbol:
             return False
 
-        # Direction check (allow None event.direction for update events)
-        if event.direction and session.direction != event.direction:
-            return False
-
-        # CRITICAL: Strike check (for NEW/ADD to same contract)
-        # If event has strike (NEW/ADD), it MUST match session strike
-        if event.strike is not None and session.strike != event.strike:
-            return False
-
-        # CRITICAL: Expiry check (for NEW/ADD to same contract)
-        # If event has expiry, it MUST match session expiry
-        if event.expiry and session.expiry != event.expiry:
+        # Position side check (allow None for update events)
+        if event.position_side and session.position_side != event.position_side:
             return False
 
         # Same trading day check
@@ -192,10 +204,6 @@ class SessionManager:
     def _generate_session_id(self) -> str:
         """Generate unique session ID."""
         return str(uuid.uuid4())
-
-    def _get_today_expiry(self) -> str:
-        """Get today's date as expiry (for 0DTE)."""
-        return datetime.now(timezone.utc).date().isoformat()
 
     def get_sessions_for_date_str(self, date_str: str) -> list:
         """

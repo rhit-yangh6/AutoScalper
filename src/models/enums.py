@@ -2,20 +2,16 @@ from enum import Enum
 
 
 class EventType(str, Enum):
-    """Types of events that can be parsed from Discord messages."""
+    """Types of events from TradingView webhook signals."""
 
-    NEW = "NEW"  # Initial trade idea
-    PLAN = "PLAN"  # Intent or permission (e.g., may average down later)
-    ADD = "ADD"  # Explicit scale-in or average-down action
-    TARGETS = "TARGETS"  # Profit targets
-    TRIM = "TRIM"  # Partial exit
-    MOVE_STOP = "MOVE_STOP"  # Tighten stop
-    TP = "TP"  # Target hit
-    SL = "SL"  # Stop hit
-    EXIT = "EXIT"  # Close entire position
-    CANCEL = "CANCEL"  # Invalidate trade before entry
-    RISK_NOTE = "RISK_NOTE"  # Contextual warning or commentary
-    IGNORE = "IGNORE"  # Chatter or irrelevant message
+    NEW = "NEW"  # New trade entry
+    ADD = "ADD"  # Scale-in / add to position
+    TP = "TP"  # Take profit triggered
+    SL = "SL"  # Stop loss triggered
+    EXIT = "EXIT"  # Manual exit / close position
+    CLOSE_ALL = "CLOSE_ALL"  # Close all positions
+    CANCEL = "CANCEL"  # Cancel pending entry
+    IGNORE = "IGNORE"  # Non-actionable signal
 
 
 class SessionState(str, Enum):
@@ -27,11 +23,11 @@ class SessionState(str, Enum):
     CANCELLED = "CANCELLED"  # Trade invalidated before entry
 
 
-class Direction(str, Enum):
-    """Option direction."""
+class PositionSide(str, Enum):
+    """Futures position side."""
 
-    CALL = "CALL"
-    PUT = "PUT"
+    LONG = "LONG"
+    SHORT = "SHORT"
 
 
 class RiskLevel(str, Enum):

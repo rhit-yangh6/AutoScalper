@@ -1,20 +1,27 @@
 """
 TradingView Webhook Listener
 
-Receives trading signals from TradingView via webhook HTTP server.
-Parses structured JSON payloads (no LLM needed).
+Receives MNQ futures trading signals from TradingView via webhook HTTP server.
+TradingView provides buy/sell signals. No bracket orders - positions are naked.
 """
 
 import asyncio
-import hmac
-import hashlib
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Callable, Optional
 from aiohttp import web
 
 from src.models.event import Event
-from src.models.enums import EventType, Direction, RiskLevel
+from src.models.enums import EventType, PositionSide, RiskLevel
+
+
+# MNQ tick size
+MNQ_TICK_SIZE = 0.25
+
+
+def round_to_tick(price: float, tick_size: float = MNQ_TICK_SIZE) -> float:
+    """Round price to nearest tick size."""
+    return round(price / tick_size) * tick_size
 
 
 class TradingViewListener:
@@ -24,23 +31,14 @@ class TradingViewListener:
     Expected TradingView Alert JSON format:
     {
         "secret": "your_webhook_secret",
-        "action": "NEW",  // NEW or EXIT
-        "ticker": "SPY",
-        "direction": "PUT",  // PUT or CALL
-        "underlying_price": 682.50,  // Current price of SPY (from TradingView)
-        "strike_offset": 3.5,  // Optional: Dollars away from current price (default: 3.5)
-        "expiry_days": 0,  // Optional: 0 = same day (0DTE), 1 = next day, etc.
-        "quantity": 1,  // Optional: default 1
-        "risk_level": "EXTREME",  // Optional: LOW, MEDIUM, HIGH, EXTREME
-        "notes": "0DTE trade"  // Optional
+        "action": "NEW",           // NEW, ADD, EXIT, CLOSE_ALL
+        "symbol": "MNQ",           // Futures symbol (optional, default MNQ)
+        "side": "LONG",            // LONG or SHORT (required for NEW/ADD)
+        "quantity": 1              // Contracts (optional, default 1)
     }
 
-    AutoScalper AUTO-CALCULATES everything:
-    - Strike: underlying_price ± strike_offset, rounded to nearest $5
-    - Expiry: Today + expiry_days (default 0 for 0DTE)
-    - Option Premium: Fetched from IBKR market data (real-time quote)
-    - Stop Loss: Auto-calculated from AUTO_STOP_LOSS_PERCENT config
-    - Target: Auto-calculated from RISK_REWARD_RATIO config
+    Positions are naked - no stop loss or take profit orders.
+    TradingView sends EXIT signals when it's time to close.
     """
 
     def __init__(
@@ -94,7 +92,7 @@ class TradingViewListener:
         """Health check endpoint."""
         return web.json_response({
             "status": "healthy",
-            "service": "TradingView Webhook Listener",
+            "service": "TradingView Webhook Listener (MNQ Futures)",
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
@@ -137,10 +135,13 @@ class TradingViewListener:
                     status=400
                 )
 
-            # Log received signal (concise)
+            # Log received signal
             print(f"\n{'='*60}")
             print(f"[TRADINGVIEW SIGNAL]")
-            print(f"{event.event_type.value}: {event.underlying} {event.strike}{event.direction.value[0]} {event.expiry} x{event.quantity}")
+            if event.position_side:
+                print(f"{event.event_type.value}: {event.symbol} {event.position_side.value} x{event.quantity}")
+            else:
+                print(f"{event.event_type.value}: {event.symbol}")
             print(f"{'='*60}\n")
 
             # Send to orchestrator
@@ -150,11 +151,14 @@ class TradingViewListener:
             return web.json_response({
                 "status": "success",
                 "event_type": event.event_type.value,
-                "ticker": f"{event.underlying} {event.strike}{event.direction.value[0]}"
+                "symbol": event.symbol,
+                "side": event.position_side.value if event.position_side else None
             })
 
         except Exception as e:
             print(f"❌ Error processing webhook: {e}")
+            import traceback
+            traceback.print_exc()
             return web.json_response(
                 {"error": str(e)},
                 status=500
@@ -164,7 +168,7 @@ class TradingViewListener:
         """
         Parse TradingView webhook payload into Event object.
 
-        Auto-calculates strike and expiry based on underlying price.
+        TradingView tells us when to buy/sell. Positions are naked (no brackets).
 
         Args:
             payload: JSON payload from TradingView
@@ -173,73 +177,63 @@ class TradingViewListener:
             Event object or None if parsing fails
         """
         try:
-            # Required fields
+            # Required field: action
             action = payload.get('action')
-            ticker = payload.get('ticker')
-            direction = payload.get('direction')
-            underlying_price = payload.get('underlying_price')
-
-            if not all([action, ticker, direction, underlying_price]):
-                print(f"❌ Missing required fields: action, ticker, direction, underlying_price")
+            if not action:
+                print(f"❌ Missing required field: action")
                 return None
 
             # Parse event type
             try:
                 event_type = EventType[action.upper()]
             except KeyError:
-                print(f"❌ Invalid action: {action}. Must be NEW or EXIT")
+                print(f"❌ Invalid action: {action}. Must be NEW, ADD, EXIT, or CLOSE_ALL")
                 return None
 
-            # Parse direction
-            try:
-                option_direction = Direction[direction.upper()]
-            except KeyError:
-                print(f"❌ Invalid direction: {direction}. Must be PUT or CALL")
-                return None
+            # Get symbol (default MNQ)
+            symbol = payload.get('symbol', 'MNQ').upper()
 
-            underlying_price = float(underlying_price)
+            # For NEW and ADD events, require side only
+            position_side = None
+            quantity = int(payload.get('quantity', 1))
 
-            # Calculate strike price (3-4 dollars away from current, rounded to nearest $5)
-            strike_offset = float(payload.get('strike_offset', 3.5))  # Default 3.5 dollars
-            strike = self._calculate_strike(underlying_price, option_direction, strike_offset)
+            if event_type in [EventType.NEW, EventType.ADD]:
+                # Required field: side
+                side = payload.get('side')
 
-            # Calculate expiry date
-            expiry_days = int(payload.get('expiry_days', 0))  # Default 0DTE
-            expiry = self._calculate_expiry(expiry_days)
+                if not side:
+                    print(f"❌ Missing required field for {action}: side")
+                    return None
 
-            print(f"  Calculated strike: ${strike:.2f} (underlying ${underlying_price:.2f}, offset ${strike_offset:.2f})")
-            print(f"  Calculated expiry: {expiry} ({expiry_days} days from today)")
+                # Parse position side
+                try:
+                    position_side = PositionSide[side.upper()]
+                except KeyError:
+                    print(f"❌ Invalid side: {side}. Must be LONG or SHORT")
+                    return None
+
+                print(f"  Signal: {action} {symbol} {side} x{quantity}")
 
             # Parse risk level (optional)
-            risk_level_str = payload.get('risk_level', 'EXTREME')  # Default EXTREME for options
+            risk_level_str = payload.get('risk_level', 'MEDIUM')
             try:
                 risk_level = RiskLevel[risk_level_str.upper()]
             except KeyError:
-                risk_level = RiskLevel.EXTREME
+                risk_level = RiskLevel.MEDIUM
 
             # Build Event
-            # Note: entry_price, stop_loss, and targets are left as 0/None
-            # The execution engine will:
-            # - Fetch real-time option premium from IBKR
-            # - Auto-calculate stop loss from AUTO_STOP_LOSS_PERCENT
-            # - Auto-calculate target from RISK_REWARD_RATIO
             event = Event(
                 event_type=event_type,
-                underlying=ticker.upper(),
-                strike=strike,
-                direction=option_direction,
-                expiry=expiry,
-                underlying_price=underlying_price,  # Store for optimal strike selection
-                entry_price=0,  # Will be fetched from IBKR market data
-                stop_loss=None,  # Will be auto-calculated
-                targets=None,  # Will be auto-calculated
-                quantity=int(payload.get('quantity', 1)),
+                symbol=symbol,
+                position_side=position_side,
+                entry_price=0.0,  # Will be set from actual fill
+                quantity=quantity,
                 risk_level=risk_level,
                 risk_notes=payload.get('notes', ''),
                 message_id=f"tv_{datetime.now(timezone.utc).timestamp()}",
                 timestamp=datetime.now(timezone.utc),
-                author="TradingView",  # Required field - source of signal
-                raw_message=json.dumps(payload, indent=2)  # Required field - original webhook payload
+                author="TradingView",
+                raw_message=json.dumps(payload, indent=2)
             )
 
             return event
@@ -249,52 +243,3 @@ class TradingViewListener:
             import traceback
             traceback.print_exc()
             return None
-
-    def _calculate_strike(self, underlying_price: float, direction: Direction, offset: float) -> float:
-        """
-        Calculate option strike price based on underlying price and direction.
-
-        Args:
-            underlying_price: Current price of underlying (e.g., SPY at 682.50)
-            direction: CALL or PUT
-            offset: Dollars away from current price (e.g., 3.5)
-
-        Returns:
-            Strike price rounded to nearest $5 (standard for index options)
-
-        Examples:
-            underlying_price=682.50, direction=PUT, offset=3.5
-            → 682.50 - 3.5 = 679.0 → rounds to 680.0
-
-            underlying_price=682.50, direction=CALL, offset=3.5
-            → 682.50 + 3.5 = 686.0 → rounds to 685.0
-        """
-        if direction == Direction.PUT:
-            # For puts, strike below current price
-            raw_strike = underlying_price - offset
-        else:
-            # For calls, strike above current price
-            raw_strike = underlying_price + offset
-
-        # Round to nearest $5 (standard for SPY/QQQ)
-        # For smaller tickers, you might want $1 or $2.50 increments
-        strike = round(raw_strike / 5) * 5
-
-        return float(strike)
-
-    def _calculate_expiry(self, days_offset: int = 0) -> str:
-        """
-        Calculate option expiry date.
-
-        Args:
-            days_offset: Days from today (0 = today for 0DTE, 1 = tomorrow, etc.)
-
-        Returns:
-            Expiry date in YYYY-MM-DD format
-
-        Examples:
-            days_offset=0 → "2025-12-24" (today, 0DTE)
-            days_offset=7 → "2025-12-31" (next week)
-        """
-        expiry_date = datetime.now(timezone.utc).date() + timedelta(days=days_offset)
-        return expiry_date.strftime('%Y-%m-%d')

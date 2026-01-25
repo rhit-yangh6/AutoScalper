@@ -1,50 +1,40 @@
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, Field
-from .enums import EventType, Direction, RiskLevel
+from .enums import EventType, PositionSide, RiskLevel
 
 
 class Event(BaseModel):
     """
-    Represents a single parsed Discord message event.
+    Represents a trading signal event from TradingView webhook.
 
-    This is the structured output of the LLM parser. Each Discord message
-    becomes one Event, which is then linked to a TradeSession.
+    This is the structured output from TradingView alerts.
+    Each webhook becomes one Event, which is then linked to a TradeSession.
     """
 
     # Core identification
     event_type: EventType
     timestamp: datetime
-    author: str  # Discord username
-    message_id: str  # Discord message ID for idempotency
+    author: str  # Signal source (e.g., "TradingView")
+    message_id: str  # Unique ID for idempotency
 
-    # Trade details (populated based on event type)
-    underlying: Optional[str] = None  # "SPY" or "QQQ"
-    direction: Optional[Direction] = None
-    strike: Optional[float] = None
-    expiry: Optional[str] = None  # ISO date string for the option expiry
-    underlying_price: Optional[float] = None  # Current price of underlying (from TradingView)
+    # Futures trade details
+    symbol: str = "MNQ"  # Futures symbol (MNQ, ES, NQ, etc.)
+    position_side: Optional[PositionSide] = None  # LONG or SHORT
 
-    # Pricing
-    entry_price: Optional[float] = None
-    targets: Optional[list[float]] = Field(default=None)  # Multiple target prices
-    target_type: Optional[str] = None  # "PREMIUM" or "UNDERLYING" - distinguishes option premium vs stock price targets
-    stop_loss: Optional[float] = None
+    # Pricing (optional, for reference only)
+    entry_price: float = 0.0  # Entry price if provided
 
     # Position sizing
-    quantity: Optional[int] = None  # Number of contracts
+    quantity: int = 1  # Number of contracts
 
     # Risk assessment
     risk_level: Optional[RiskLevel] = None
     risk_notes: Optional[str] = None  # Free-form risk commentary
 
     # Context
-    raw_message: str  # Original Discord message text
+    raw_message: str  # Original webhook payload
     session_id: Optional[str] = None  # Linked session (set after correlation)
-
-    # Metadata
-    parsing_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    llm_reasoning: Optional[str] = None  # LLM's explanation of its parse
 
     class Config:
         json_encoders = {
@@ -56,11 +46,10 @@ class Event(BaseModel):
         actionable_types = {
             EventType.NEW,
             EventType.ADD,
-            EventType.TRIM,
-            EventType.MOVE_STOP,
             EventType.TP,
             EventType.SL,
             EventType.EXIT,
+            EventType.CLOSE_ALL,
         }
         return self.event_type in actionable_types
 
@@ -68,9 +57,8 @@ class Event(BaseModel):
         """Returns True if this event requires an open position."""
         return self.event_type in {
             EventType.ADD,
-            EventType.TRIM,
-            EventType.MOVE_STOP,
             EventType.TP,
             EventType.SL,
             EventType.EXIT,
+            EventType.CLOSE_ALL,
         }

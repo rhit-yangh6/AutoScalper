@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional, List, Dict
 from enum import Enum
 
-from ..models import TradeSession, EventType, Direction
+from ..models import TradeSession, EventType, PositionSide
 from ..execution.executor import OrderResult, OrderStatus
 
 
@@ -130,25 +130,18 @@ class TelegramNotifier:
 
         # Format message
         mode = "📝 DRY-RUN" if dry_run else "🔴 LIVE"
-        symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "UNKNOWN"
+        side = session.position_side.value if session.position_side else "?"
+        symbol = f"{session.symbol} {side}"
 
         text = f"<b>{mode} ORDER SUBMITTED</b>\n\n"
         text += f"<b>Action:</b> {event_type.value}\n"
         text += f"<b>Symbol:</b> {symbol}\n"
-        text += f"<b>Expiry:</b> {session.expiry}\n"
 
         if order_details.get('quantity'):
             text += f"<b>Quantity:</b> {order_details['quantity']} contracts\n"
 
         if order_details.get('entry_price'):
             text += f"<b>Entry:</b> ${order_details['entry_price']:.2f}\n"
-
-        if order_details.get('stop_loss'):
-            text += f"<b>Stop:</b> ${order_details['stop_loss']:.2f}\n"
-
-        if order_details.get('targets'):
-            targets_str = ", ".join([f"${t:.2f}" for t in order_details['targets']])
-            text += f"<b>Targets:</b> {targets_str}\n"
 
         text += f"\n<i>Session: {session.session_id[:8]}...</i>"
         text += f"\n<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
@@ -187,7 +180,8 @@ class TelegramNotifier:
             status_text = result.status
 
         mode = "📝 DRY-RUN" if dry_run else "🔴 LIVE"
-        symbol = f"{session.underlying} {session.strike}{session.direction.value[0]}" if session.direction else "UNKNOWN"
+        side = session.position_side.value if session.position_side else "?"
+        symbol = f"{session.symbol} {side}"
 
         text = f"<b>{emoji} {mode} ORDER {status_text}</b>\n\n"
         text += f"<b>Action:</b> {event_type.value}\n"
@@ -361,17 +355,9 @@ class TelegramNotifier:
             text += f"<b>🔒 Closed Positions</b>\n"
             for session_data in closed_sessions[:5]:  # Show first 5
                 # Extract session info from top-level metadata
-                underlying = session_data.get("underlying", "?")
-                strike = session_data.get("strike", 0)
-                direction = session_data.get("direction", "?")
-
-                # Format direction (could be "CALL" or "PUT")
-                if direction and direction in ["CALL", "PUT"]:
-                    direction_short = "C" if direction == "CALL" else "P"
-                else:
-                    direction_short = "?"
-
-                symbol = f"{underlying} {strike}{direction_short}"
+                symbol = session_data.get("symbol", "MNQ")
+                position_side = session_data.get("position_side", "?")
+                display_symbol = f"{symbol} {position_side}"
 
                 # Get P&L from session_closed entry
                 session_closed = next(
@@ -381,7 +367,7 @@ class TelegramNotifier:
 
                 pnl = session_closed.get("final_pnl", 0.0) if session_closed else 0.0
                 pnl_emoji = "✅" if pnl > 0 else "❌" if pnl < 0 else "⚪"
-                text += f"• {symbol} - {pnl_emoji} ${pnl:+.2f}\n"
+                text += f"• {display_symbol} - {pnl_emoji} ${pnl:+.2f}\n"
 
             if len(closed_sessions) > 5:
                 text += f"<i>... and {len(closed_sessions) - 5} more</i>\n"
@@ -400,17 +386,9 @@ class TelegramNotifier:
             text += f"<b>🔓 Open Positions</b>\n"
             for session_data in open_sessions_with_positions[:5]:  # Show first 5
                 # Extract session info from top-level metadata
-                underlying = session_data.get("underlying", "?")
-                strike = session_data.get("strike", 0)
-                direction = session_data.get("direction", "?")
-
-                # Format direction (could be "CALL" or "PUT")
-                if direction and direction in ["CALL", "PUT"]:
-                    direction_short = "C" if direction == "CALL" else "P"
-                else:
-                    direction_short = "?"
-
-                symbol = f"{underlying} {strike}{direction_short}"
+                symbol = session_data.get("symbol", "MNQ")
+                position_side = session_data.get("position_side", "?")
+                display_symbol = f"{symbol} {position_side}"
 
                 # Get quantity and avg price from session_metadata
                 session_metadata = session_data.get("session_metadata", {})
@@ -418,9 +396,9 @@ class TelegramNotifier:
                 avg_entry = session_metadata.get("avg_entry_price", session_data.get("avg_entry_price"))
 
                 if avg_entry:
-                    text += f"• {symbol} - {qty} @ ${avg_entry:.2f}\n"
+                    text += f"• {display_symbol} - {qty} @ ${avg_entry:.2f}\n"
                 else:
-                    text += f"• {symbol} - {qty} contracts\n"
+                    text += f"• {display_symbol} - {qty} contracts\n"
 
             if len(open_sessions_with_positions) > 5:
                 text += f"<i>... and {len(open_sessions_with_positions) - 5} more</i>\n"

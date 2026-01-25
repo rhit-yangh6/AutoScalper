@@ -1,14 +1,14 @@
 from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel, Field
-from .enums import SessionState, Direction
+from .enums import SessionState, PositionSide
 from .event import Event
 
 
 class Position(BaseModel):
     """Represents a single position within a trade session."""
 
-    contract_symbol: str  # Full option symbol
+    symbol: str  # Futures symbol (e.g., "MNQ")
     quantity: int
     entry_price: float
     entry_time: datetime
@@ -22,13 +22,13 @@ class Position(BaseModel):
 
 class TradeSession(BaseModel):
     """
-    Represents a stateful trade session composed of multiple events.
+    Represents a stateful trade session for futures trading.
 
-    A session correlates related Discord messages (NEW, ADD, EXIT, etc.)
+    A session correlates related signals (NEW, ADD, EXIT, etc.)
     for the same trade idea. Session correlation rules:
-    - Same author
-    - Same underlying (SPY/QQQ)
-    - Same direction (CALL/PUT)
+    - Same author (signal source)
+    - Same symbol (MNQ)
+    - Same position side (LONG/SHORT)
     - Same trading day
     - Most recent open session wins
     """
@@ -38,11 +38,9 @@ class TradeSession(BaseModel):
     state: SessionState = SessionState.PENDING
 
     # Trade definition
-    author: str  # Discord username who initiated the trade
-    underlying: str  # "SPY" or "QQQ"
-    direction: Direction
-    strike: float
-    expiry: str  # ISO date string
+    author: str  # Signal source (e.g., "TradingView")
+    symbol: str  # Futures symbol (e.g., "MNQ")
+    position_side: PositionSide  # LONG or SHORT
 
     # Lifecycle
     created_at: datetime
@@ -63,24 +61,13 @@ class TradeSession(BaseModel):
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
 
-    # Order tracking (for bracket monitoring)
+    # Order tracking
     entry_order_id: Optional[int] = None
-    stop_order_id: Optional[int] = None
-    target_order_ids: list[int] = Field(default_factory=list)
 
     # Exit tracking
-    exit_reason: Optional[str] = None  # "STOP_HIT", "TARGET_HIT", "MANUAL_EXIT"
+    exit_reason: Optional[str] = None  # "SIGNAL_EXIT", "MANUAL_EXIT", "FLIP_EXIT"
     exit_order_id: Optional[int] = None
     exit_price: Optional[float] = None
-
-    # Controls
-    max_adds: int = 1  # From config, default from proposal
-    num_adds: int = 0
-    stop_invalidated: bool = False  # True if stop was hit
-
-    # Bracket tracking (percentage-based for recalculation after ADD)
-    stop_loss_percent: Optional[float] = None  # e.g., -10.0 means 10% below entry
-    target_percent: Optional[float] = None  # e.g., +20.0 means 20% above entry
 
     class Config:
         json_encoders = {
@@ -103,18 +90,6 @@ class TradeSession(BaseModel):
             if self.state == SessionState.OPEN:
                 self.state = SessionState.CLOSED
                 self.closed_at = datetime.now(timezone.utc)
-        elif event.event_type.value == "ADD":
-            self.num_adds += 1
-
-    def can_add_position(self) -> bool:
-        """Check if we can add to this position based on rules."""
-        if self.state != SessionState.OPEN:
-            return False
-        if self.num_adds >= self.max_adds:
-            return False
-        if self.stop_invalidated:
-            return False
-        return True
 
     def is_active(self) -> bool:
         """Returns True if session is PENDING or OPEN."""
