@@ -103,6 +103,10 @@ class ExecutionEngine:
     async def _display_account_balance(self):
         """Display current account balance."""
         try:
+            # Request account summary and wait for data
+            self.ib.reqAccountSummary()
+            await asyncio.sleep(1)  # Wait for data to arrive
+
             account_values = self.ib.accountSummary()
             for av in account_values:
                 if av.tag == "NetLiquidation":
@@ -460,12 +464,16 @@ class ExecutionEngine:
     async def get_account_balance(self) -> Optional[float]:
         """Get current account balance."""
         try:
+            # Request fresh account summary
+            self.ib.reqAccountSummary()
+            await asyncio.sleep(0.5)  # Wait for data
+
             account_values = self.ib.accountSummary()
             for av in account_values:
                 if av.tag == "NetLiquidation":
                     return float(av.value)
-        except:
-            pass
+        except Exception as e:
+            print(f"Error getting account balance: {e}")
         return None
 
     async def get_margin_requirement(self, symbol: str = "MNQ") -> Optional[float]:
@@ -484,25 +492,29 @@ class ExecutionEngine:
                 return None
 
             contract = qualified[0]
+            print(f"  Contract qualified: {contract.localSymbol}")
 
             # Simulate a 1-contract BUY order to get margin requirement
             order = MarketOrder("BUY", 1)
-            order.whatIf = True
 
             # whatIfOrder returns OrderState with margin info
-            order_state = await self.ib.whatIfOrderAsync(contract, order)
+            order_state = self.ib.whatIfOrder(contract, order)
+            await asyncio.sleep(0.5)  # Give it time to process
 
-            if order_state:
+            if order_state and order_state.initMarginChange:
                 # initMarginChange is the margin required for this order
                 init_margin = float(order_state.initMarginChange)
-                print(f"IBKR Margin for {symbol}: ${init_margin:,.2f} per contract")
-                return init_margin
-            else:
-                print(f"Could not get margin info for {symbol}")
-                return None
+                if init_margin > 0:
+                    print(f"IBKR Margin for {symbol}: ${init_margin:,.2f} per contract")
+                    return init_margin
+
+            print(f"Could not get margin info for {symbol}")
+            return None
 
         except Exception as e:
             print(f"Error fetching margin requirement: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     async def get_futures_price(self, symbol: str = "MNQ") -> Optional[float]:
