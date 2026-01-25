@@ -102,6 +102,35 @@ class TradingOrchestrator:
         self.running = True
         self.start_time = datetime.now(timezone.utc)
 
+        # Send Telegram startup notification immediately
+        if self.notifier:
+            mode = "DRY-RUN" if self.dry_run else "LIVE"
+            num_contracts = self.config['risk'].get('num_contracts', 1)
+            contracts_str = "AUTO" if num_contracts == 0 else str(num_contracts)
+            startup_msg = (
+                f"🚀 <b>AutoScalper Started</b>\n\n"
+                f"Mode: {mode}\n"
+                f"Contracts: {contracts_str}\n"
+                f"Daily Max Loss: ${self.config['risk']['daily_max_loss']}\n"
+                f"Webhook Port: {self.config['tradingview']['webhook_port']}\n\n"
+                f"<b>Commands:</b>\n"
+                f"/status - Check positions\n"
+                f"/closeall - Emergency close\n"
+                f"/restartgw - Restart IB Gateway"
+            )
+            sent = await self.notifier.send_message(startup_msg)
+            if sent:
+                print("✓ Startup notification sent to Telegram")
+            else:
+                print("✗ Failed to send Telegram notification - check bot token and chat ID")
+
+            # Start Telegram command listener early (works even without IBKR)
+            print("Starting Telegram command handler...")
+            self.notifier.register_command_handler("status", self._handle_status_command)
+            self.notifier.register_command_handler("closeall", self._handle_closeall_command)
+            self.notifier.register_command_handler("restartgw", self._handle_restartgw_command)
+            asyncio.create_task(self._telegram_polling_task())
+
         # Connect to IBKR
         if not self.dry_run:
             print("Connecting to IBKR...")
@@ -132,32 +161,7 @@ class TradingOrchestrator:
         print("Starting TradingView webhook server...")
         await self.tradingview_listener.start()
 
-        # Start background tasks
-        if self.notifier:
-            print("Starting Telegram command handler...")
-            self.notifier.register_command_handler("status", self._handle_status_command)
-            self.notifier.register_command_handler("closeall", self._handle_closeall_command)
-            self.notifier.register_command_handler("restartgw", self._handle_restartgw_command)
-            asyncio.create_task(self._telegram_polling_task())
-
-            # Send startup notification
-            mode = "DRY-RUN" if self.dry_run else "LIVE"
-            num_contracts = self.config['risk'].get('num_contracts', 1)
-            contracts_str = "AUTO" if num_contracts == 0 else str(num_contracts)
-            startup_msg = (
-                f"🚀 <b>AutoScalper Started</b>\n\n"
-                f"Mode: {mode}\n"
-                f"Contracts: {contracts_str}\n"
-                f"Daily Max Loss: ${self.config['risk']['daily_max_loss']}\n"
-                f"Webhook Port: {self.config['tradingview']['webhook_port']}\n\n"
-                f"<b>Commands:</b>\n"
-                f"/status - Check positions\n"
-                f"/closeall - Emergency close\n"
-                f"/restartgw - Restart IB Gateway"
-            )
-            await self.notifier.send_message(startup_msg)
-            print("Startup notification sent to Telegram")
-
+        # Start connection monitor
         if not self.dry_run:
             print("Starting connection monitor...")
             asyncio.create_task(self._connection_monitor_task())
