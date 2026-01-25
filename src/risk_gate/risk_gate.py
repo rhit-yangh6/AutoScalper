@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Optional
 from pydantic import BaseModel
 
-from ..models import Event, TradeSession, EventType, RiskLevel
+from ..models import Event, TradeSession, EventType
 
 
 # MNQ contract specifications
@@ -35,13 +35,10 @@ class RiskCheckResult(BaseModel):
 
 class RiskGate:
     """
-    Final deterministic approval gate before execution.
+    Position sizing and P&L tracking for MNQ futures.
 
-    Implements risk checks for MNQ futures:
-    - Daily max loss
-    - Loss streak limit
-
-    CRITICAL: Any check failure = NO TRADE
+    All signals are approved - no trading restrictions.
+    Primary function is position sizing and trade tracking.
     """
 
     def __init__(self, config: dict):
@@ -50,8 +47,6 @@ class RiskGate:
 
         Expected config keys:
         - account_balance: float (fallback if IBKR balance unavailable)
-        - daily_max_loss: float (dollar amount, e.g., 500)
-        - max_loss_streak: int
         - num_contracts: int (0 = auto-calculate from balance)
         - margin_per_contract: float (margin required per contract)
         """
@@ -94,68 +89,11 @@ class RiskGate:
         """
         failed_checks = []
 
-        # Only validate actionable events
-        if not event.is_actionable():
-            return RiskCheckResult(
-                decision=RiskDecision.APPROVE,
-                reason="Non-actionable event",
-            )
-
-        # 1. Daily max loss check (including unrealized P&L)
-        if not self._check_daily_max_loss(unrealized_pnl):
-            failed_checks.append(
-                f"Daily max loss exceeded (Realized: ${self.daily_pnl:.2f}, Unrealized: ${unrealized_pnl:.2f})"
-            )
-
-        # 2. Loss streak check
-        if not self._check_loss_streak():
-            failed_checks.append("Loss streak limit exceeded")
-
-        # 3. High risk check
-        if event.risk_level in [RiskLevel.HIGH, RiskLevel.EXTREME]:
-            if not self._check_high_risk_allowed():
-                failed_checks.append("High risk trades blocked in current state")
-
-        # Decision
-        if failed_checks:
-            return RiskCheckResult(
-                decision=RiskDecision.REJECT,
-                reason="; ".join(failed_checks),
-                failed_checks=failed_checks,
-            )
-
+        # All signals are approved - no risk restrictions
         return RiskCheckResult(
             decision=RiskDecision.APPROVE,
-            reason="All risk checks passed"
+            reason="Approved"
         )
-
-    def _check_daily_max_loss(self, unrealized_pnl: float = 0.0) -> bool:
-        """
-        Check if daily max loss has been exceeded.
-
-        Uses dollar-based max loss for futures (not percentage).
-        """
-        max_loss = self.config.get("daily_max_loss", 500.0)
-        total_pnl = self.daily_pnl + unrealized_pnl
-        return total_pnl > -max_loss
-
-    def _check_loss_streak(self) -> bool:
-        """Check if loss streak limit has been exceeded."""
-        return self.loss_streak < self.config.get("max_loss_streak", 3)
-
-    def _check_high_risk_allowed(self) -> bool:
-        """
-        Check if high-risk trades are allowed.
-
-        Block high-risk if:
-        - Already in drawdown
-        - Loss streak active
-        """
-        if self.daily_pnl < 0:
-            return False
-        if self.loss_streak > 0:
-            return False
-        return True
 
     def calculate_position_size(
         self, event: Event, session: TradeSession
@@ -221,15 +159,11 @@ class RiskGate:
         self.trades_today = []
 
     def get_risk_summary(self) -> dict:
-        """Get current risk state summary."""
-        max_loss = self.config.get("daily_max_loss", 500.0)
-
+        """Get current trading state summary."""
         return {
             "account_balance": self.account_balance,
             "daily_pnl": self.daily_pnl,
             "daily_pnl_percent": (self.daily_pnl / self.account_balance) * 100 if self.account_balance > 0 else 0,
-            "remaining_loss_allowance": max_loss + self.daily_pnl,
             "loss_streak": self.loss_streak,
             "trades_today": len(self.trades_today),
-            "can_trade": self._check_daily_max_loss() and self._check_loss_streak(),
         }

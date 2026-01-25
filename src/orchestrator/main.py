@@ -95,7 +95,6 @@ class TradingOrchestrator:
         print("STARTING MNQ FUTURES SCALPER")
         print("=" * 60)
         print(f"Mode: {'DRY-RUN (No IBKR)' if self.dry_run else 'LIVE TRADING'}")
-        print(f"Daily max loss: ${self.config['risk']['daily_max_loss']}")
         num_contracts = self.config['risk'].get('num_contracts', 1)
         if num_contracts == 0:
             print(f"Contracts: AUTO (based on balance)")
@@ -115,7 +114,6 @@ class TradingOrchestrator:
                 f"🚀 <b>AutoScalper Started</b>\n\n"
                 f"Mode: {mode}\n"
                 f"Contracts: {contracts_str}\n"
-                f"Daily Max Loss: ${self.config['risk']['daily_max_loss']}\n"
                 f"Webhook Port: {self.config['tradingview']['webhook_port']}\n\n"
                 f"<b>Commands:</b>\n"
                 f"/status - Check positions\n"
@@ -460,8 +458,7 @@ class TradingOrchestrator:
                 f"• Safety Buffer: {margin_buffer:.0%}\n\n"
                 f"<b>Trading:</b>\n"
                 f"• Contract: {contract_name}\n"
-                f"• Contracts: {contracts_str}\n"
-                f"• Daily Max Loss: ${self.config['risk']['daily_max_loss']:,.0f}\n\n"
+                f"• Contracts: {contracts_str}\n\n"
                 f"<i>Ready to receive signals</i>"
             )
 
@@ -556,10 +553,10 @@ class TradingOrchestrator:
             else:
                 text += "  No active sessions\n"
 
-            # Risk
-            text += f"\n<b>🛡️ Risk:</b>\n"
-            text += f"• Daily P&L: ${self.risk_gate.daily_pnl:,.2f}\n"
-            text += f"• Loss Streak: {self.risk_gate.loss_streak}\n"
+            # Stats
+            text += f"\n<b>📈 Today:</b>\n"
+            text += f"• P&L: ${self.risk_gate.daily_pnl:+,.2f}\n"
+            text += f"• Trades: {len(self.risk_gate.trades_today)}\n"
 
             text += f"\n<i>{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
             return text
@@ -661,8 +658,6 @@ def load_config() -> dict:
             "num_contracts": env("NUM_CONTRACTS", 1, int),
             "margin_per_contract": env("MARGIN_PER_CONTRACT", 2000, float),
             "margin_buffer": env("MARGIN_BUFFER", 0.80, float),
-            "daily_max_loss": env("DAILY_MAX_LOSS", 500, float),
-            "max_loss_streak": env("MAX_LOSS_STREAK", 3, int),
         },
 
         "telegram": {
