@@ -62,13 +62,14 @@ class TelegramNotifier:
         self.daily_orders: List[Dict] = []
         self.daily_fills: List[Dict] = []
 
-    async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
+    async def send_message(self, text: str, parse_mode: str = "HTML", chat_id: str = None) -> bool:
         """
         Send a message to Telegram.
 
         Args:
             text: Message text (supports HTML formatting)
             parse_mode: "HTML" or "Markdown"
+            chat_id: Optional chat ID to send to (defaults to configured chat_id)
 
         Returns:
             True if sent successfully, False otherwise
@@ -76,13 +77,14 @@ class TelegramNotifier:
         if not self.enabled:
             return False
 
-        if not self.bot_token or not self.chat_id:
+        target_chat_id = chat_id or self.chat_id
+        if not self.bot_token or not target_chat_id:
             print("⚠️  Telegram not configured (missing bot_token or chat_id)")
             return False
 
         try:
             payload = {
-                "chat_id": self.chat_id,
+                "chat_id": target_chat_id,
                 "text": text,
                 "parse_mode": parse_mode,
                 "disable_web_page_preview": True,
@@ -469,18 +471,28 @@ class TelegramNotifier:
                             for update in updates:
                                 message = update.get("message", {})
                                 text = message.get("text", "")
-                                chat_id = str(message.get("chat", {}).get("id", ""))
+                                msg_chat_id = str(message.get("chat", {}).get("id", ""))
 
-                                # Only process messages from our chat
-                                if chat_id == self.chat_id and text.startswith("/"):
-                                    commands.append({
-                                        "command": text.split()[0][1:],  # Remove leading /
-                                        "args": text.split()[1:],
-                                        "message": message
-                                    })
+                                # Process commands - check chat_id if configured
+                                if text.startswith("/"):
+                                    # If no chat_id configured, accept from any chat
+                                    # Otherwise only accept from configured chat
+                                    if not self.chat_id or msg_chat_id == str(self.chat_id):
+                                        commands.append({
+                                            "command": text.split()[0][1:],  # Remove leading /
+                                            "args": text.split()[1:],
+                                            "message": message,
+                                            "chat_id": msg_chat_id,
+                                        })
 
                             return commands
+                    else:
+                        error_text = await response.text()
+                        print(f"⚠️ Telegram API error {response.status}: {error_text[:100]}")
                     return []
+        except asyncio.TimeoutError:
+            # Timeout is normal for long polling, ignore
+            return []
         except Exception as e:
             print(f"⚠️  Error polling Telegram commands: {e}")
             return []
@@ -495,6 +507,7 @@ class TelegramNotifier:
 
         for cmd in commands:
             command_name = cmd["command"]
+            reply_chat_id = cmd.get("chat_id", self.chat_id)
             handler = self.command_handlers.get(command_name)
 
             if handler:
@@ -502,14 +515,21 @@ class TelegramNotifier:
                     # Call the handler
                     response = await handler(cmd)
                     if response:
-                        await self.send_message(response)
+                        await self.send_message(response, chat_id=reply_chat_id)
                 except Exception as e:
                     error_msg = f"❌ Error executing /{command_name}: {str(e)}"
-                    await self.send_message(error_msg)
+                    await self.send_message(error_msg, chat_id=reply_chat_id)
                     print(f"⚠️  Error executing /{command_name}: {e}")
             else:
                 # Unknown command
-                await self.send_message(f"❓ Unknown command: /{command_name}\n\nAvailable commands:\n📊 /status - Check positions and account\n🖥️ /server - Check bot and IBKR health")
+                help_text = (
+                    f"❓ Unknown command: /{command_name}\n\n"
+                    f"<b>Available commands:</b>\n"
+                    f"📊 /status - Check positions and account\n"
+                    f"🚨 /closeall - Emergency close all positions\n"
+                    f"🔄 /restartgw - Restart IB Gateway container"
+                )
+                await self.send_message(help_text, chat_id=reply_chat_id)
 
     def get_daily_stats(self) -> dict:
         """Get current daily statistics."""
