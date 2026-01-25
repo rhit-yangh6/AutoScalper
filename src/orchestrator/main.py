@@ -158,6 +158,9 @@ class TradingOrchestrator:
 
             # Fetch live margin requirement from IBKR
             await self._fetch_margin_requirement()
+
+            # Send IBKR connected notification
+            await self._send_ibkr_connected_notification()
         else:
             print("Skipping IBKR connection (dry-run mode)")
 
@@ -420,6 +423,53 @@ class TradingOrchestrator:
             print(f"Error fetching margin: {e}")
             fallback = self.config["risk"].get("margin_per_contract", 2000)
             print(f"Using fallback margin: ${fallback:,.2f}")
+
+    async def _send_ibkr_connected_notification(self):
+        """Send Telegram notification when IBKR is connected with account info."""
+        if not self.notifier:
+            return
+
+        try:
+            # Get account balance
+            balance = await self.executor.get_account_balance()
+            balance_str = f"${balance:,.2f}" if balance else "N/A"
+
+            # Get margin info
+            margin = self.config["risk"].get("margin_per_contract", 2000)
+            margin_buffer = self.config["risk"].get("margin_buffer", 0.80)
+
+            # Calculate max contracts
+            num_contracts = self.config["risk"].get("num_contracts", 1)
+            if num_contracts == 0 and balance and margin > 0:
+                usable = balance * margin_buffer
+                max_contracts = int(usable / margin)
+                contracts_str = f"AUTO ({max_contracts} max)"
+            else:
+                contracts_str = str(num_contracts)
+
+            # Get front-month contract info
+            contract_name = "MNQ"
+            if hasattr(self.executor, '_front_month_contract') and self.executor._front_month_contract:
+                contract_name = self.executor._front_month_contract.localSymbol
+
+            msg = (
+                f"✅ <b>IBKR Connected</b>\n\n"
+                f"<b>Account:</b>\n"
+                f"• Balance: {balance_str}\n"
+                f"• Margin/Contract: ${margin:,.2f}\n"
+                f"• Safety Buffer: {margin_buffer:.0%}\n\n"
+                f"<b>Trading:</b>\n"
+                f"• Contract: {contract_name}\n"
+                f"• Contracts: {contracts_str}\n"
+                f"• Daily Max Loss: ${self.config['risk']['daily_max_loss']:,.0f}\n\n"
+                f"<i>Ready to receive signals</i>"
+            )
+
+            await self.notifier.send_message(msg)
+            print("✓ IBKR connected notification sent to Telegram")
+
+        except Exception as e:
+            print(f"Error sending IBKR connected notification: {e}")
 
     async def _connection_monitor_task(self):
         """Monitor IBKR connection and reconnect if needed."""
