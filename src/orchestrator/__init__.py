@@ -1,3 +1,3 @@
-from .session_manager import SessionManager
+from .main import TradingOrchestrator
 
-__all__ = ["SessionManager"]
+__all__ = ["TradingOrchestrator"]

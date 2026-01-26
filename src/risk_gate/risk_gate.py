@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Optional
 from pydantic import BaseModel
 
-from ..models import Event, TradeSession, EventType
+from ..models import Event, TradeSession
 
 
 # MNQ contract specifications
@@ -73,30 +73,18 @@ class RiskGate:
             self.config["margin_per_contract"] = margin
             print(f"Margin requirement updated: ${margin:,.2f} per contract")
 
-    def validate(
-        self,
-        event: Event,
-        session: TradeSession,
-        unrealized_pnl: float = 0.0,
-    ) -> RiskCheckResult:
+    def validate(self, event: Event) -> RiskCheckResult:
         """
         Validate if an event should be executed.
-
-        Args:
-            event: The event to validate
-            session: The associated trade session
-            unrealized_pnl: Current unrealized P&L from open positions
+        All signals are approved - no trading restrictions.
         """
-        failed_checks = []
-
-        # All signals are approved - no risk restrictions
         return RiskCheckResult(
             decision=RiskDecision.APPROVE,
             reason="Approved"
         )
 
     def calculate_position_size(
-        self, event: Event, session: TradeSession
+        self, event: Event, session: Optional[TradeSession] = None
     ) -> int:
         """
         Calculate position size for the trade.

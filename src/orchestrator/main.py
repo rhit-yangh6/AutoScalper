@@ -15,12 +15,11 @@ nest_asyncio.apply()
 
 from dotenv import load_dotenv
 
-from ..risk_gate import RiskGate, RiskDecision
+from ..risk_gate import RiskGate
 from ..execution import ExecutionEngine
-from ..execution.executor import OrderResult, OrderStatus
+from ib_insync import MarketOrder
 from ..tradingview_listener import TradingViewListener
-from .session_manager import SessionManager
-from ..models import Event, EventType, SessionState, TradeSession, PositionSide
+from ..models import Event, EventType
 from ..logging import init_logger, get_logger, DailySnapshotManager
 from ..notifications import init_notifier, get_notifier
 
@@ -62,14 +61,12 @@ class TradingOrchestrator:
             print("Telegram notifications disabled")
 
         # Initialize components
-        self.session_manager = SessionManager()
         self.risk_gate = RiskGate(config["risk"])
 
         self.executor = ExecutionEngine(
             host=config["ibkr"]["host"],
             port=config["ibkr"]["port"],
             client_id=config["ibkr"]["client_id"],
-            session_manager=self.session_manager,
             config=config,
             notifier=self.notifier,
         )
@@ -200,210 +197,220 @@ class TradingOrchestrator:
         """
         Callback for TradingView webhook signals.
 
-        This is the main processing pipeline.
+        Position-based logic - checks actual IBKR position, not in-memory state.
+        This makes the bot resilient to restarts and disconnections.
         """
-        session = None
         try:
             print(f"\n{'='*60}")
-            print(f"PROCESSING SIGNAL: {event.event_type.value}")
+            print(f"SIGNAL: {event.event_type.value} {event.symbol} {event.position_side.value if event.position_side else ''}")
             print(f"{'='*60}")
 
-            # Step 0: Check for position flip (opposite side needs to be closed first)
-            if event.event_type == EventType.NEW:
-                opposite_session = self.session_manager.check_for_flip(event)
-                if opposite_session and opposite_session.state == SessionState.OPEN:
-                    print("\n[FLIP DETECTED] Closing opposite position first...")
-                    print(f"  Closing: {opposite_session.symbol} {opposite_session.position_side.value}")
-                    await self._close_session_for_flip(opposite_session)
+            # Get current position from IBKR
+            if self.dry_run:
+                current_side, current_qty, current_avg = "FLAT", 0, 0.0
+                print(f"\n[DRY-RUN] Assuming FLAT position")
+            else:
+                if not self.executor.connected:
+                    print("✗ Not connected to IBKR")
+                    if self.notifier:
+                        await self.notifier.send_message("❌ Signal ignored - IBKR not connected")
+                    return
 
-            # Step 1: Correlate to session
-            print("\n[1/4] Correlating to trade session...")
-            try:
-                session = self.session_manager.process_event(event)
-            except ValueError as e:
-                print(f"✗ Session error: {e}")
-                if self.notifier:
-                    await self.notifier.send_message(f"⚠️ Signal rejected: {e}")
-                return
+                current_side, current_qty, current_avg = await self.executor.get_mnq_position()
+                print(f"\nCurrent position: {current_side} {current_qty} @ ${current_avg:.2f}" if current_qty > 0 else "\nCurrent position: FLAT")
 
-            if not session:
-                print("✓ Event processed (non-actionable)")
-                return
-
-            print(f"✓ Session {session.session_id[:8]}...")
-            print(f"  {session.symbol} {session.position_side.value if session.position_side else '?'}")
-            print(f"  State: {session.state}")
-
-            # Step 2: Risk validation
-            print("\n[2/4] Validating with risk gate...")
-
-            unrealized_pnl = 0.0
+            # Update account balance
             if not self.dry_run and self.executor.connected:
                 balance = await self.executor.get_account_balance()
                 if balance:
                     self.risk_gate.update_account_balance(balance)
 
-            risk_result = self.risk_gate.validate(
-                event=event,
-                session=session,
-                unrealized_pnl=unrealized_pnl,
-            )
-
-            status = "✓" if risk_result.decision == RiskDecision.APPROVE else "✗"
-            print(f"{status} {risk_result.decision}: {risk_result.reason}")
-
-            if risk_result.decision == RiskDecision.REJECT:
-                if event.event_type == EventType.NEW:
-                    session.state = SessionState.CANCELLED
-                    session.closed_at = datetime.now(timezone.utc)
-
-                if self.notifier:
-                    await self.notifier.send_message(
-                        f"⚠️ <b>Trade Rejected</b>\n\n"
-                        f"{event.symbol} {event.position_side.value if event.position_side else ''}\n"
-                        f"Reason: {risk_result.reason}"
-                    )
-                return
-
-            # Step 3: Calculate position size
-            print("\n[3/4] Calculating position size...")
-            quantity = self.risk_gate.calculate_position_size(event, session)
-            print(f"✓ Position size: {quantity} contracts")
-
+            # Calculate position size
+            quantity = self.risk_gate.calculate_position_size(event, None)
             if quantity == 0:
-                print("⚠️ Position size = 0 (limit reached)")
+                print("⚠️ Position size = 0 (insufficient margin)")
                 return
 
-            # Step 4: Execute
-            print("\n[4/4] Executing order...")
+            # Handle signal based on current position
+            if event.event_type == EventType.NEW:
+                await self._handle_new_signal(event, current_side, current_qty, quantity)
 
-            if self.dry_run:
-                print("  [DRY-RUN] Order would be executed")
-                result = OrderResult(
-                    success=True,
-                    status=OrderStatus.FILLED,
-                    message="[DRY-RUN] Simulated fill"
-                )
-            else:
-                result = await self.executor.execute_event(
-                    event=event,
-                    session=session,
-                    quantity=quantity,
-                )
+            elif event.event_type == EventType.EXIT or event.event_type == EventType.CLOSE_ALL:
+                await self._handle_exit_signal(event, current_side, current_qty, current_avg)
 
-            # Log result
-            if result.success:
-                print(f"✓ {result.message}")
-                self.logger.log_execution(session, event, result)
-
-                # Send Telegram notification
-                if self.notifier:
-                    if event.event_type == EventType.NEW:
-                        side = event.position_side.value if event.position_side else "?"
-                        await self.notifier.send_message(
-                            f"✅ <b>Entry Filled</b>\n\n"
-                            f"{event.symbol} {side}\n"
-                            f"Entry: ${result.filled_price:.2f}\n"
-                            f"Qty: {quantity}"
-                        )
-                    elif event.event_type in [EventType.EXIT, EventType.CLOSE_ALL]:
-                        side = session.position_side.value if session.position_side else "?"
-                        pnl = session.realized_pnl
-                        await self.notifier.send_message(
-                            f"📤 <b>Exit Filled</b>\n\n"
-                            f"{session.symbol} {side}\n"
-                            f"Exit: ${result.filled_price:.2f}\n"
-                            f"P&L: ${pnl:+,.2f}"
-                        )
-                        # Record trade result for risk tracking
-                        self.risk_gate.record_trade_result(pnl)
-            else:
-                print(f"✗ {result.message}")
-                self.logger.log_error(session, "EXECUTION_ERROR", result.message)
-
-                if self.notifier:
-                    await self.notifier.send_message(
-                        f"❌ <b>Execution Failed</b>\n\n"
-                        f"{event.symbol}\n"
-                        f"Error: {result.message}"
-                    )
+            elif event.event_type == EventType.ADD:
+                await self._handle_add_signal(event, current_side, current_qty, quantity)
 
         except Exception as e:
             import traceback
             print(f"❌ Error processing signal: {e}")
             traceback.print_exc()
-
             if self.notifier:
                 await self.notifier.send_message(f"❌ Error: {str(e)[:200]}")
 
-    async def _close_session_for_flip(self, session: TradeSession):
-        """
-        Close an existing position before flipping to opposite side.
+    async def _handle_new_signal(self, event: Event, current_side: str, current_qty: int, quantity: int):
+        """Handle NEW signal based on current position."""
+        signal_side = event.position_side.value if event.position_side else None
 
-        This is called when a NEW signal comes in for the opposite side
-        of an existing open position.
-        """
-        try:
-            side = session.position_side.value if session.position_side else "?"
-            print(f"  Flipping from {session.symbol} {side}...")
+        if not signal_side:
+            print("✗ NEW signal missing side")
+            return
 
-            # Create synthetic EXIT event
-            exit_event = Event(
-                event_type=EventType.EXIT,
-                symbol=session.symbol,
-                position_side=session.position_side,
-                timestamp=datetime.now(timezone.utc),
-                author=session.author,
-                message_id=f"flip_exit_{datetime.now(timezone.utc).timestamp()}",
-                raw_message="Auto-generated EXIT for position flip",
-            )
+        # FLAT - open new position
+        if current_side == "FLAT":
+            print(f"\n→ Opening {signal_side} position ({quantity} contracts)")
+            await self._execute_entry(event, signal_side, quantity)
 
-            # Execute the exit
-            if self.dry_run:
-                print(f"  [DRY-RUN] Would close {session.total_quantity} contracts")
-                # Update session state for dry run
-                session.state = SessionState.CLOSED
-                session.closed_at = datetime.now(timezone.utc)
-                session.exit_reason = "FLIP_EXIT"
-            else:
-                result = await self.executor.execute_event(
-                    event=exit_event,
-                    session=session,
-                    quantity=session.total_quantity,
+        # Same side - already in position
+        elif current_side == signal_side:
+            print(f"⚠️ Already {current_side} {current_qty} contracts - ignoring NEW signal")
+            if self.notifier:
+                await self.notifier.send_message(
+                    f"⚠️ Signal ignored - already {current_side} {current_qty} contracts"
                 )
 
-                if result.success:
-                    pnl = session.realized_pnl
-                    print(f"  ✓ Flip exit filled @ ${result.filled_price:.2f} | P&L: ${pnl:+,.2f}")
+        # Opposite side - flip position
+        else:
+            print(f"\n→ FLIP: Closing {current_side} {current_qty}, then opening {signal_side}")
+            # Close current position
+            closed = await self._execute_close(current_side, current_qty)
+            if closed:
+                # Open new position
+                await self._execute_entry(event, signal_side, quantity)
 
-                    # Record trade result
-                    self.risk_gate.record_trade_result(pnl)
+    async def _handle_exit_signal(self, event: Event, current_side: str, current_qty: int, current_avg: float):
+        """Handle EXIT signal based on current position."""
+        if current_side == "FLAT":
+            print("⚠️ No position to exit")
+            if self.notifier:
+                await self.notifier.send_message("⚠️ EXIT signal ignored - no open position")
+            return
 
-                    # Log the exit
-                    self.logger.log_execution(session, exit_event, result)
+        print(f"\n→ Closing {current_side} {current_qty} contracts")
+        await self._execute_close(current_side, current_qty)
 
-                    # Notify
-                    if self.notifier:
-                        await self.notifier.send_message(
-                            f"🔄 <b>Position Flipped</b>\n\n"
-                            f"Closed: {session.symbol} {side}\n"
-                            f"Exit: ${result.filled_price:.2f}\n"
-                            f"P&L: ${pnl:+,.2f}\n\n"
-                            f"<i>Opening opposite position...</i>"
-                        )
-                else:
-                    print(f"  ✗ Flip exit failed: {result.message}")
-                    if self.notifier:
-                        await self.notifier.send_message(
-                            f"❌ <b>Flip Exit Failed</b>\n\n"
-                            f"{session.symbol} {side}\n"
-                            f"Error: {result.message}"
-                        )
-                    raise Exception(f"Failed to close position for flip: {result.message}")
+    async def _handle_add_signal(self, event: Event, current_side: str, current_qty: int, quantity: int):
+        """Handle ADD signal based on current position."""
+        signal_side = event.position_side.value if event.position_side else None
 
-        except Exception as e:
-            print(f"  ✗ Error closing position for flip: {e}")
-            raise
+        if current_side == "FLAT":
+            print("⚠️ No position to add to - treating as NEW")
+            await self._execute_entry(event, signal_side, quantity)
+            return
+
+        if signal_side and current_side != signal_side:
+            print(f"⚠️ Cannot ADD {signal_side} to {current_side} position")
+            return
+
+        print(f"\n→ Adding {quantity} contracts to {current_side} position")
+        await self._execute_add(current_side, quantity)
+
+    async def _execute_entry(self, event: Event, side: str, quantity: int):
+        """Execute entry order."""
+        if self.dry_run:
+            print(f"  [DRY-RUN] Would {('BUY' if side == 'LONG' else 'SELL')} {quantity} MNQ")
+            if self.notifier:
+                await self.notifier.send_message(
+                    f"📝 <b>[DRY-RUN] Entry</b>\n\n"
+                    f"MNQ {side} x{quantity}"
+                )
+            return
+
+        action = "BUY" if side == "LONG" else "SELL"
+        contract = self.executor._build_contract("MNQ")
+        order = MarketOrder(action, quantity)
+
+        print(f"  Submitting {action} MARKET x{quantity}...")
+        trade = self.executor.ib.placeOrder(contract, order)
+
+        filled = await self.executor._wait_for_fill(trade, timeout=30)
+
+        if filled:
+            price = trade.orderStatus.avgFillPrice
+            print(f"  ✓ Filled @ ${price:.2f}")
+
+            if self.notifier:
+                await self.notifier.send_message(
+                    f"✅ <b>Entry Filled</b>\n\n"
+                    f"MNQ {side}\n"
+                    f"Entry: ${price:.2f}\n"
+                    f"Qty: {quantity}"
+                )
+        else:
+            print(f"  ✗ Order timeout")
+            self.executor.ib.cancelOrder(trade.order)
+            if self.notifier:
+                await self.notifier.send_message(f"❌ Entry order timed out")
+
+    async def _execute_close(self, current_side: str, current_qty: int) -> bool:
+        """Execute close order. Returns True if successful."""
+        if self.dry_run:
+            print(f"  [DRY-RUN] Would close {current_side} {current_qty}")
+            if self.notifier:
+                await self.notifier.send_message(
+                    f"📝 <b>[DRY-RUN] Exit</b>\n\n"
+                    f"MNQ {current_side} x{current_qty}"
+                )
+            return True
+
+        # To close: SELL if LONG, BUY if SHORT
+        action = "SELL" if current_side == "LONG" else "BUY"
+        contract = self.executor._build_contract("MNQ")
+        order = MarketOrder(action, current_qty)
+
+        print(f"  Submitting {action} MARKET x{current_qty} (close)...")
+        trade = self.executor.ib.placeOrder(contract, order)
+
+        filled = await self.executor._wait_for_fill(trade, timeout=30)
+
+        if filled:
+            price = trade.orderStatus.avgFillPrice
+            print(f"  ✓ Closed @ ${price:.2f}")
+
+            if self.notifier:
+                await self.notifier.send_message(
+                    f"📤 <b>Position Closed</b>\n\n"
+                    f"MNQ {current_side}\n"
+                    f"Exit: ${price:.2f}\n"
+                    f"Qty: {current_qty}"
+                )
+            return True
+        else:
+            print(f"  ✗ Close order timeout")
+            self.executor.ib.cancelOrder(trade.order)
+            if self.notifier:
+                await self.notifier.send_message(f"❌ Close order timed out")
+            return False
+
+    async def _execute_add(self, current_side: str, quantity: int):
+        """Execute add to position order."""
+        if self.dry_run:
+            print(f"  [DRY-RUN] Would add {quantity} to {current_side}")
+            return
+
+        action = "BUY" if current_side == "LONG" else "SELL"
+        contract = self.executor._build_contract("MNQ")
+        order = MarketOrder(action, quantity)
+
+        print(f"  Submitting {action} MARKET x{quantity} (add)...")
+        trade = self.executor.ib.placeOrder(contract, order)
+
+        filled = await self.executor._wait_for_fill(trade, timeout=30)
+
+        if filled:
+            price = trade.orderStatus.avgFillPrice
+            print(f"  ✓ Added @ ${price:.2f}")
+
+            if self.notifier:
+                await self.notifier.send_message(
+                    f"➕ <b>Added to Position</b>\n\n"
+                    f"MNQ {current_side}\n"
+                    f"Price: ${price:.2f}\n"
+                    f"Added: {quantity}"
+                )
+        else:
+            print(f"  ✗ Add order timeout")
+            self.executor.ib.cancelOrder(trade.order)
 
     async def _fetch_margin_requirement(self):
         """Fetch live margin requirement from IBKR and update risk gate."""
@@ -523,40 +530,31 @@ class TradingOrchestrator:
             mode = "📝 DRY-RUN" if self.dry_run else "🔴 LIVE"
             text = f"<b>📊 {mode} STATUS</b>\n\n"
 
-            # Account
+            # Account & Position
             if not self.dry_run and self.executor.connected:
                 balance = await self.executor.get_account_balance()
                 if balance:
                     text += f"<b>💰 Balance:</b> ${balance:,.2f}\n\n"
 
-            # Positions
-            positions = []
-            if not self.dry_run and self.executor.connected:
-                positions = await self.executor.get_positions()
-
-            text += f"<b>🔓 Positions ({len(positions)}):</b>\n"
-            if positions:
-                for pos in positions:
-                    symbol = pos.contract.localSymbol if hasattr(pos.contract, 'localSymbol') else pos.contract.symbol
-                    side = "LONG" if pos.position > 0 else "SHORT"
-                    text += f"• {symbol}: {abs(int(pos.position))} {side} @ ${pos.avgCost:.2f}\n"
+                # Get MNQ position
+                side, qty, avg_price = await self.executor.get_mnq_position()
+                text += f"<b>📈 Position:</b>\n"
+                if side == "FLAT":
+                    text += "  No open position\n"
+                else:
+                    text += f"  MNQ {side} x{qty} @ ${avg_price:.2f}\n"
             else:
-                text += "  No open positions\n"
-
-            # Sessions
-            open_sessions = [s for s in self.session_manager.sessions.values() if s.state == SessionState.OPEN]
-            text += f"\n<b>📊 Sessions ({len(open_sessions)}):</b>\n"
-            if open_sessions:
-                for s in open_sessions[:5]:
-                    side = s.position_side.value if s.position_side else "?"
-                    text += f"• {s.symbol} {side}: {s.total_quantity} contracts\n"
-            else:
-                text += "  No active sessions\n"
+                text += "<b>📈 Position:</b>\n"
+                text += "  Not connected to IBKR\n"
 
             # Stats
-            text += f"\n<b>📈 Today:</b>\n"
+            text += f"\n<b>📊 Today:</b>\n"
             text += f"• P&L: ${self.risk_gate.daily_pnl:+,.2f}\n"
             text += f"• Trades: {len(self.risk_gate.trades_today)}\n"
+
+            # Connection status
+            text += f"\n<b>🔌 Connection:</b>\n"
+            text += f"• IBKR: {'✅ Connected' if self.executor.connected else '❌ Disconnected'}\n"
 
             text += f"\n<i>{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
             return text

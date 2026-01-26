@@ -504,6 +504,35 @@ class ExecutionEngine:
         """Get all open positions."""
         return self.ib.positions()
 
+    async def get_mnq_position(self) -> tuple[str, int, float]:
+        """
+        Get current MNQ position from IBKR.
+
+        Returns:
+            tuple: (side, quantity, avg_price)
+            - side: "LONG", "SHORT", or "FLAT"
+            - quantity: absolute number of contracts (0 if flat)
+            - avg_price: average entry price (0 if flat)
+        """
+        try:
+            positions = self.ib.positions()
+
+            for pos in positions:
+                # Check if it's an MNQ contract
+                symbol = pos.contract.symbol if hasattr(pos.contract, 'symbol') else ""
+                if symbol == "MNQ" or (hasattr(pos.contract, 'localSymbol') and 'MNQ' in pos.contract.localSymbol):
+                    qty = int(pos.position)
+                    if qty > 0:
+                        return ("LONG", qty, pos.avgCost)
+                    elif qty < 0:
+                        return ("SHORT", abs(qty), pos.avgCost)
+
+            return ("FLAT", 0, 0.0)
+
+        except Exception as e:
+            print(f"Error getting MNQ position: {e}")
+            return ("FLAT", 0, 0.0)
+
     async def get_open_orders(self) -> list:
         """Get all open orders."""
         return [t for t in self.ib.trades() if t.isActive()]
