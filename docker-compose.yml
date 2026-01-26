@@ -3,8 +3,6 @@ services:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     container_name: ib-gateway
     restart: unless-stopped
-    labels:
-      autoheal: "true"  # Enable autoheal to restart on unhealthy
     environment:
       - TWS_USERID=${IB_USERNAME}
       - TWS_PASSWORD=${IB_PASSWORD}
@@ -12,8 +10,8 @@ services:
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-changeme}
       - TIME_ZONE=America/Los_Angeles
       - READ_ONLY_API=no
-      # Reconnect mode: survive disconnects without re-auth
-      - AUTO_RESTART_TIME=  # Disable auto restart
+      # Auto-restart without 2FA
+      - SAVE_AUTORESTART_FILE=yes  # Save session for restart without 2FA
       - RELOGIN_AFTER_2FA_TIMEOUT=yes
       - TWOFA_TIMEOUT_ACTION=restart
       # Keep gateway alive through disconnects
@@ -32,17 +30,6 @@ services:
       timeout: 5s        # Fail if check takes >5s
       retries: 30        # Try 30 times (5 minutes) before marking unhealthy
       start_period: 180s # Allow 3 minutes for MFA approval before checking
-
-  autoheal:
-    image: willfarrell/autoheal:latest
-    container_name: autoheal
-    restart: unless-stopped
-    environment:
-      - AUTOHEAL_INTERVAL=10           # Check every 10 seconds
-      - AUTOHEAL_START_PERIOD=180      # Wait 3 minutes before first check (MFA window)
-      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10  # Stop timeout before restart
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   gateway-settings:
