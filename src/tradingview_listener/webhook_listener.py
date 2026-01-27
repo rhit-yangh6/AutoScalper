@@ -12,7 +12,7 @@ from typing import Callable, Optional
 from aiohttp import web
 
 from src.models.event import Event
-from src.models.enums import EventType, PositionSide, RiskLevel
+from src.models.enums import EventType, PositionSide
 
 
 # MNQ tick size
@@ -31,14 +31,15 @@ class TradingViewListener:
     Expected TradingView Alert JSON format:
     {
         "secret": "your_webhook_secret",
-        "action": "NEW",           // NEW, ADD, EXIT, CLOSE_ALL
-        "symbol": "MNQ",           // Futures symbol (optional, default MNQ)
-        "side": "LONG",            // LONG or SHORT (required for NEW/ADD)
-        "quantity": 1              // Contracts (optional, default 1)
+        "action": "LONG_NEW",      // LONG_NEW, LONG_EXIT, SHORT_NEW, SHORT_EXIT
+        "symbol": "MNQ"            // Futures symbol (optional, default MNQ)
     }
 
-    Positions are naked - no stop loss or take profit orders.
-    TradingView sends EXIT signals when it's time to close.
+    Actions:
+    - LONG_NEW: Open a long position
+    - LONG_EXIT: Close a long position
+    - SHORT_NEW: Open a short position
+    - SHORT_EXIT: Close a short position
     """
 
     def __init__(
@@ -168,7 +169,7 @@ class TradingViewListener:
         """
         Parse TradingView webhook payload into Event object.
 
-        TradingView tells us when to buy/sell. Positions are naked (no brackets).
+        Actions: LONG_NEW, LONG_EXIT, SHORT_NEW, SHORT_EXIT
 
         Args:
             payload: JSON payload from TradingView
@@ -183,43 +184,26 @@ class TradingViewListener:
                 print(f"❌ Missing required field: action")
                 return None
 
-            # Parse event type
-            try:
-                event_type = EventType[action.upper()]
-            except KeyError:
-                print(f"❌ Invalid action: {action}. Must be NEW, ADD, EXIT, or CLOSE_ALL")
+            action = action.upper()
+
+            # Parse combined action (e.g., "LONG_NEW" -> side=LONG, type=NEW)
+            valid_actions = {
+                "LONG_NEW": (PositionSide.LONG, EventType.NEW),
+                "LONG_EXIT": (PositionSide.LONG, EventType.EXIT),
+                "SHORT_NEW": (PositionSide.SHORT, EventType.NEW),
+                "SHORT_EXIT": (PositionSide.SHORT, EventType.EXIT),
+            }
+
+            if action not in valid_actions:
+                print(f"❌ Invalid action: {action}. Must be LONG_NEW, LONG_EXIT, SHORT_NEW, or SHORT_EXIT")
                 return None
+
+            position_side, event_type = valid_actions[action]
 
             # Get symbol (default MNQ)
             symbol = payload.get('symbol', 'MNQ').upper()
 
-            # For NEW and ADD events, require side only
-            position_side = None
-            quantity = int(payload.get('quantity', 1))
-
-            if event_type in [EventType.NEW, EventType.ADD]:
-                # Required field: side
-                side = payload.get('side')
-
-                if not side:
-                    print(f"❌ Missing required field for {action}: side")
-                    return None
-
-                # Parse position side
-                try:
-                    position_side = PositionSide[side.upper()]
-                except KeyError:
-                    print(f"❌ Invalid side: {side}. Must be LONG or SHORT")
-                    return None
-
-                print(f"  Signal: {action} {symbol} {side} x{quantity}")
-
-            # Parse risk level (optional)
-            risk_level_str = payload.get('risk_level', 'MEDIUM')
-            try:
-                risk_level = RiskLevel[risk_level_str.upper()]
-            except KeyError:
-                risk_level = RiskLevel.MEDIUM
+            print(f"  Signal: {action} {symbol}")
 
             # Build Event
             event = Event(
@@ -227,9 +211,7 @@ class TradingViewListener:
                 symbol=symbol,
                 position_side=position_side,
                 entry_price=0.0,  # Will be set from actual fill
-                quantity=quantity,
-                risk_level=risk_level,
-                risk_notes=payload.get('notes', ''),
+                quantity=1,
                 message_id=f"tv_{datetime.now(timezone.utc).timestamp()}",
                 timestamp=datetime.now(timezone.utc),
                 author="TradingView",

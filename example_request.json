@@ -1,7 +1,5 @@
 {
     "secret": "your_webhook_secret_here",
-    "action": "NEW",
-    "symbol": "MNQ",
-    "side": "LONG",
-    "quantity": 1
+    "action": "LONG_NEW",
+    "symbol": "MNQ"
 }

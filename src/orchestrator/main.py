@@ -280,10 +280,22 @@ class TradingOrchestrator:
 
     async def _handle_exit_signal(self, event: Event, current_side: str, current_qty: int, current_avg: float):
         """Handle EXIT signal based on current position."""
+        signal_side = event.position_side.value if event.position_side else None
+
         if current_side == "FLAT":
-            print("⚠️ No position to exit")
+            print(f"⚠️ No position to exit ({signal_side}_EXIT ignored)")
             if self.notifier:
-                await self.notifier.send_message("⚠️ EXIT signal ignored - no open position")
+                await self.notifier.send_message(f"⚠️ {signal_side}_EXIT ignored - no open position")
+            return
+
+        # Only exit if signal side matches current position
+        # e.g., LONG_EXIT only closes LONG, not SHORT
+        if signal_side and current_side != signal_side:
+            print(f"⚠️ {signal_side}_EXIT ignored - current position is {current_side}")
+            if self.notifier:
+                await self.notifier.send_message(
+                    f"⚠️ {signal_side}_EXIT ignored - current position is {current_side}"
+                )
             return
 
         print(f"\n→ Closing {current_side} {current_qty} contracts")
