@@ -78,7 +78,7 @@ class BalanceLogger:
 
     def generate_plot(self) -> Optional[bytes]:
         """
-        Generate a balance plot image.
+        Generate a balance plot image in LA timezone.
 
         Returns PNG image as bytes, or None if no data or matplotlib unavailable.
         """
@@ -87,6 +87,7 @@ class BalanceLogger:
             matplotlib.use('Agg')  # Non-interactive backend
             import matplotlib.pyplot as plt
             import matplotlib.dates as mdates
+            import pytz
         except ImportError:
             print("matplotlib not installed - cannot generate plot")
             return None
@@ -96,8 +97,9 @@ class BalanceLogger:
         if len(history) < 2:
             return None
 
-        # Extract data
-        timestamps = [h['timestamp'] for h in history]
+        # Convert timestamps to LA timezone
+        la_tz = pytz.timezone('America/Los_Angeles')
+        timestamps = [h['timestamp'].astimezone(la_tz) for h in history]
         balances = [h['balance'] for h in history]
 
         # Create plot
@@ -110,15 +112,15 @@ class BalanceLogger:
         ax.fill_between(timestamps, balances, alpha=0.3)
 
         # Formatting
-        ax.set_title('Account Balance Over Time', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Time', fontsize=12)
+        ax.set_title('Account Balance Over Time (Pacific Time)', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Time (PT)', fontsize=12)
         ax.set_ylabel('Balance ($)', fontsize=12)
 
         # Format y-axis as currency
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
 
-        # Format x-axis dates
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+        # Format x-axis dates in LA timezone
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M', tz=la_tz))
         plt.xticks(rotation=45)
 
         # Add grid
