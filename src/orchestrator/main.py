@@ -172,9 +172,9 @@ class TradingOrchestrator:
             print("Starting connection monitor...")
             asyncio.create_task(self._connection_monitor_task())
 
-            # Start pre-restart close task (closes positions at 23:40 PT)
-            print("Starting pre-restart position close task (23:40 PT)...")
-            asyncio.create_task(self._pre_restart_close_task())
+            # Start Friday close task (closes positions before market close)
+            print("Starting Friday market close task (1:50 PM PT)...")
+            asyncio.create_task(self._friday_close_task())
 
         # Keep running
         try:
@@ -505,58 +505,64 @@ class TradingOrchestrator:
         except Exception as e:
             print(f"Error sending IBKR connected notification: {e}")
 
-    async def _pre_restart_close_task(self):
+    async def _friday_close_task(self):
         """
-        Close all positions at 23:40 PT before IB Gateway restart at 23:45 PT.
+        Close all positions on Friday before market close.
+        MNQ futures close at 4:00 PM CT / 2:00 PM PT on Fridays.
+        We close at 1:50 PM PT to give a 10-minute buffer.
         """
         la_tz = pytz.timezone('America/Los_Angeles')
-        close_time = time(23, 40)  # 23:40 PT
-        closed_today = False
+        close_hour = 13  # 1:50 PM PT
+        close_minute = 50
+        closed_this_week = False
 
         while self.running:
             try:
                 now_la = datetime.now(la_tz)
+                weekday = now_la.weekday()  # 0=Monday, 4=Friday
                 current_time = now_la.time()
 
-                # Reset flag at midnight
-                if current_time.hour == 0 and current_time.minute == 0:
-                    closed_today = False
+                # Reset flag on Monday
+                if weekday == 0 and current_time.hour == 0:
+                    closed_this_week = False
 
-                # Check if it's 23:40 PT (within the minute)
-                if (current_time.hour == close_time.hour and
-                    current_time.minute == close_time.minute and
-                    not closed_today):
+                # Only check on Friday (weekday == 4)
+                if weekday == 4:
+                    # Check if it's 1:50 PM PT (within the minute)
+                    if (current_time.hour == close_hour and
+                        current_time.minute == close_minute and
+                        not closed_this_week):
 
-                    closed_today = True
-                    print(f"\n{'='*60}")
-                    print(f"PRE-RESTART: Closing all positions at 23:40 PT")
-                    print(f"{'='*60}")
+                        closed_this_week = True
+                        print(f"\n{'='*60}")
+                        print(f"FRIDAY CLOSE: Closing all positions before market close")
+                        print(f"{'='*60}")
 
-                    if self.notifier:
-                        await self.notifier.send_message(
-                            "⏰ <b>Pre-Restart Close</b>\n\n"
-                            "Closing all positions before IB Gateway restart at 23:45 PT"
-                        )
-
-                    # Get current position
-                    side, qty, avg = await self.executor.get_mnq_position()
-
-                    if side != "FLAT" and qty > 0:
-                        print(f"Closing {side} {qty} contracts...")
-                        closed = await self._execute_close(side, qty)
-                        if closed:
-                            print("✓ Pre-restart close complete")
-                        else:
-                            print("✗ Pre-restart close failed")
-                            if self.notifier:
-                                await self.notifier.send_message("❌ Pre-restart close failed!")
-                    else:
-                        print("No position to close")
                         if self.notifier:
-                            await self.notifier.send_message("✅ No position to close before restart")
+                            await self.notifier.send_message(
+                                "📅 <b>Friday Market Close</b>\n\n"
+                                "Closing all positions before market close at 2:00 PM PT"
+                            )
+
+                        # Get current position
+                        side, qty, avg = await self.executor.get_mnq_position()
+
+                        if side != "FLAT" and qty > 0:
+                            print(f"Closing {side} {qty} contracts...")
+                            closed = await self._execute_close(side, qty)
+                            if closed:
+                                print("✓ Friday close complete")
+                            else:
+                                print("✗ Friday close failed")
+                                if self.notifier:
+                                    await self.notifier.send_message("❌ Friday close failed!")
+                        else:
+                            print("No position to close")
+                            if self.notifier:
+                                await self.notifier.send_message("✅ No position to close before weekend")
 
             except Exception as e:
-                print(f"Pre-restart close task error: {e}")
+                print(f"Friday close task error: {e}")
 
             await asyncio.sleep(30)  # Check every 30 seconds
 
