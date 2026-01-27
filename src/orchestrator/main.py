@@ -570,8 +570,6 @@ class TradingOrchestrator:
                     disconnect_notified = False
                     duration_msg = ""
                     if self.executor._disconnected_at:
-                        from datetime import datetime, timezone, time
-import pytz
                         duration = datetime.now(timezone.utc) - self.executor._disconnected_at
                         minutes = int(duration.total_seconds() / 60)
                         if minutes > 0:
