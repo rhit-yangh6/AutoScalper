@@ -1,3 +1,2 @@
-from .main import TradingOrchestrator
-
-__all__ = ["TradingOrchestrator"]
+# Orchestrator module
+# Run with: python -m src.orchestrator.main
