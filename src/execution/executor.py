@@ -512,7 +512,7 @@ class ExecutionEngine:
             tuple: (side, quantity, avg_price)
             - side: "LONG", "SHORT", or "FLAT"
             - quantity: absolute number of contracts (0 if flat)
-            - avg_price: average entry price (0 if flat)
+            - avg_price: average entry price per contract (0 if flat)
         """
         try:
             positions = self.ib.positions()
@@ -522,10 +522,14 @@ class ExecutionEngine:
                 symbol = pos.contract.symbol if hasattr(pos.contract, 'symbol') else ""
                 if symbol == "MNQ" or (hasattr(pos.contract, 'localSymbol') and 'MNQ' in pos.contract.localSymbol):
                     qty = int(pos.position)
+                    abs_qty = abs(qty)
+                    # avgCost is total cost, divide by quantity to get per-contract price
+                    # For MNQ, also need to account for multiplier (2)
+                    avg_price_per_contract = pos.avgCost / abs_qty if abs_qty > 0 else 0.0
                     if qty > 0:
-                        return ("LONG", qty, pos.avgCost)
+                        return ("LONG", abs_qty, avg_price_per_contract)
                     elif qty < 0:
-                        return ("SHORT", abs(qty), pos.avgCost)
+                        return ("SHORT", abs_qty, avg_price_per_contract)
 
             return ("FLAT", 0, 0.0)
 

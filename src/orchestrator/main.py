@@ -655,19 +655,27 @@ class TradingOrchestrator:
             if not self.executor.connected:
                 return "❌ Not connected to IBKR"
 
-            results = await self.executor.close_all_positions()
+            # Get current MNQ position
+            side, qty, avg_price = await self.executor.get_mnq_position()
 
-            if not results:
-                return "✅ No positions to close"
+            if side == "FLAT" or qty == 0:
+                return "✅ No position to close"
 
-            text = "<b>🚨 Emergency Close All</b>\n\n"
-            for r in results:
-                status = "✅" if r.success else "❌"
-                text += f"{status} {r.message}\n"
+            # Use the working _execute_close method
+            text = f"<b>🚨 Emergency Close</b>\n\nClosing {side} x{qty}...\n\n"
+
+            closed = await self._execute_close(side, qty)
+
+            if closed:
+                text += "✅ Position closed successfully"
+            else:
+                text += "❌ Failed to close position"
 
             return text
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return f"❌ Error: {str(e)}"
 
     async def _handle_restartgw_command(self, cmd: dict) -> str:
