@@ -168,6 +168,10 @@ class TradingOrchestrator:
             print("Starting connection monitor...")
             asyncio.create_task(self._connection_monitor_task())
 
+            # Start pre-restart close task (closes positions at 23:40 PT)
+            print("Starting pre-restart position close task (23:40 PT)...")
+            asyncio.create_task(self._pre_restart_close_task())
+
         # Keep running
         try:
             while self.running:
@@ -487,6 +491,61 @@ class TradingOrchestrator:
         except Exception as e:
             print(f"Error sending IBKR connected notification: {e}")
 
+    async def _pre_restart_close_task(self):
+        """
+        Close all positions at 23:40 PT before IB Gateway restart at 23:45 PT.
+        """
+        la_tz = pytz.timezone('America/Los_Angeles')
+        close_time = time(23, 40)  # 23:40 PT
+        closed_today = False
+
+        while self.running:
+            try:
+                now_la = datetime.now(la_tz)
+                current_time = now_la.time()
+
+                # Reset flag at midnight
+                if current_time.hour == 0 and current_time.minute == 0:
+                    closed_today = False
+
+                # Check if it's 23:40 PT (within the minute)
+                if (current_time.hour == close_time.hour and
+                    current_time.minute == close_time.minute and
+                    not closed_today):
+
+                    closed_today = True
+                    print(f"\n{'='*60}")
+                    print(f"PRE-RESTART: Closing all positions at 23:40 PT")
+                    print(f"{'='*60}")
+
+                    if self.notifier:
+                        await self.notifier.send_message(
+                            "⏰ <b>Pre-Restart Close</b>\n\n"
+                            "Closing all positions before IB Gateway restart at 23:45 PT"
+                        )
+
+                    # Get current position
+                    side, qty, avg = await self.executor.get_mnq_position()
+
+                    if side != "FLAT" and qty > 0:
+                        print(f"Closing {side} {qty} contracts...")
+                        closed = await self._execute_close(side, qty)
+                        if closed:
+                            print("✓ Pre-restart close complete")
+                        else:
+                            print("✗ Pre-restart close failed")
+                            if self.notifier:
+                                await self.notifier.send_message("❌ Pre-restart close failed!")
+                    else:
+                        print("No position to close")
+                        if self.notifier:
+                            await self.notifier.send_message("✅ No position to close before restart")
+
+            except Exception as e:
+                print(f"Pre-restart close task error: {e}")
+
+            await asyncio.sleep(30)  # Check every 30 seconds
+
     async def _connection_monitor_task(self):
         """Monitor IBKR connection and reconnect if needed."""
         disconnect_notified = False
@@ -511,7 +570,8 @@ class TradingOrchestrator:
                     disconnect_notified = False
                     duration_msg = ""
                     if self.executor._disconnected_at:
-                        from datetime import datetime, timezone
+                        from datetime import datetime, timezone, time
+import pytz
                         duration = datetime.now(timezone.utc) - self.executor._disconnected_at
                         minutes = int(duration.total_seconds() / 60)
                         if minutes > 0:

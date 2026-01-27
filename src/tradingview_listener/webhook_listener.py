@@ -32,7 +32,7 @@ class TradingViewListener:
     {
         "secret": "your_webhook_secret",
         "action": "LONG_NEW",      // LONG_NEW, LONG_EXIT, SHORT_NEW, SHORT_EXIT
-        "symbol": "MNQ"            // Futures symbol (optional, default MNQ)
+        "ticker": "MNQ1!"          // TradingView ticker (optional, default MNQ)
     }
 
     Actions:
@@ -40,6 +40,10 @@ class TradingViewListener:
     - LONG_EXIT: Close a long position
     - SHORT_NEW: Open a short position
     - SHORT_EXIT: Close a short position
+
+    Notes:
+    - Accepts both 'symbol' and 'ticker' fields
+    - Parses TradingView format (MNQ1! -> MNQ)
     """
 
     def __init__(
@@ -200,8 +204,13 @@ class TradingViewListener:
 
             position_side, event_type = valid_actions[action]
 
-            # Get symbol (default MNQ)
-            symbol = payload.get('symbol', 'MNQ').upper()
+            # Get symbol - accept both 'symbol' and 'ticker' fields
+            # TradingView uses format like "MNQ1!" for continuous contract
+            raw_symbol = payload.get('symbol') or payload.get('ticker') or 'MNQ'
+            # Extract base symbol (MNQ1! -> MNQ, MNQH2025 -> MNQ)
+            symbol = ''.join(c for c in raw_symbol.upper() if c.isalpha())[:3]
+            if not symbol:
+                symbol = 'MNQ'
 
             print(f"  Signal: {action} {symbol}")
 
