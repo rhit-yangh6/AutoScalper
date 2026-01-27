@@ -106,6 +106,53 @@ class TelegramNotifier:
             print(f"⚠️  Failed to send Telegram notification: {e}")
             return False
 
+    async def send_photo(self, photo: bytes, caption: str = "", chat_id: str = None) -> bool:
+        """
+        Send a photo to Telegram.
+
+        Args:
+            photo: Photo data as bytes (PNG/JPG)
+            caption: Optional caption for the photo
+            chat_id: Optional chat ID to send to (defaults to configured chat_id)
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        if not self.enabled:
+            return False
+
+        target_chat_id = chat_id or self.chat_id
+        if not self.bot_token or not target_chat_id:
+            print("⚠️  Telegram not configured (missing bot_token or chat_id)")
+            return False
+
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendPhoto"
+
+            # Use FormData for file upload
+            import io
+            data = aiohttp.FormData()
+            data.add_field('chat_id', str(target_chat_id))
+            data.add_field('photo', io.BytesIO(photo), filename='plot.png', content_type='image/png')
+            if caption:
+                data.add_field('caption', caption)
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, data=data, timeout=30) as response:
+                    if response.status == 200:
+                        return True
+                    else:
+                        error_text = await response.text()
+                        print(f"⚠️  Telegram API error: {response.status} - {error_text}")
+                        return False
+
+        except asyncio.TimeoutError:
+            print("⚠️  Telegram photo upload timed out")
+            return False
+        except Exception as e:
+            print(f"⚠️  Failed to send Telegram photo: {e}")
+            return False
+
     async def notify_order_submitted(
         self,
         session: TradeSession,

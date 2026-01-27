@@ -21,7 +21,7 @@ from ..execution import ExecutionEngine
 from ib_insync import MarketOrder
 from ..tradingview_listener import TradingViewListener
 from ..models import Event, EventType
-from ..logging import init_logger, get_logger, DailySnapshotManager
+from ..logging import init_logger, get_logger, DailySnapshotManager, init_balance_logger
 from ..notifications import init_notifier, get_notifier
 
 
@@ -46,6 +46,7 @@ class TradingOrchestrator:
         log_dir = config.get("log_dir", "logs")
         self.logger = init_logger(base_dir=log_dir)
         self.snapshot_manager = DailySnapshotManager(base_dir=log_dir)
+        self.balance_logger = init_balance_logger(log_dir=log_dir)
         print(f"Logger initialized (log_dir={log_dir})")
 
         # Initialize Telegram notifier
@@ -115,6 +116,7 @@ class TradingOrchestrator:
                 f"Webhook Port: {self.config['tradingview']['webhook_port']}\n\n"
                 f"<b>Commands:</b>\n"
                 f"/status - Check positions\n"
+                f"/plot - Balance history chart\n"
                 f"/closeall - Emergency close\n"
                 f"/restartgw - Restart IB Gateway"
             )
@@ -129,6 +131,7 @@ class TradingOrchestrator:
             self.notifier.register_command_handler("status", self._handle_status_command)
             self.notifier.register_command_handler("closeall", self._handle_closeall_command)
             self.notifier.register_command_handler("restartgw", self._handle_restartgw_command)
+            self.notifier.register_command_handler("plot", self._handle_plot_command)
             asyncio.create_task(self._telegram_polling_task())
 
         # Connect to IBKR
@@ -384,12 +387,22 @@ class TradingOrchestrator:
             price = trade.orderStatus.avgFillPrice
             print(f"  ✓ Closed @ ${price:.2f}")
 
+            # Log balance after close
+            balance = await self.executor.get_account_balance()
+            if balance and self.balance_logger:
+                self.balance_logger.log_balance(
+                    balance=balance,
+                    side=current_side,
+                    exit_price=price
+                )
+
             if self.notifier:
+                balance_str = f"\nBalance: ${balance:,.2f}" if balance else ""
                 await self.notifier.send_message(
                     f"📤 <b>Position Closed</b>\n\n"
                     f"MNQ {current_side}\n"
                     f"Exit: ${price:.2f}\n"
-                    f"Qty: {current_qty}"
+                    f"Qty: {current_qty}{balance_str}"
                 )
             return True
         else:
@@ -689,6 +702,34 @@ class TradingOrchestrator:
             return "❌ <b>Docker Not Found</b>\n\nDocker or docker compose is not installed."
         except Exception as e:
             return f"❌ Error: {str(e)}"
+
+    async def _handle_plot_command(self, cmd: dict) -> str:
+        """Handle /plot command - generate balance history chart."""
+        try:
+            if not self.balance_logger:
+                return "❌ Balance logger not initialized"
+
+            # Generate plot
+            plot_data = self.balance_logger.generate_plot()
+
+            if not plot_data:
+                return "❌ Not enough data to generate plot (need at least 2 data points)"
+
+            # Send image via Telegram
+            if self.notifier:
+                sent = await self.notifier.send_photo(
+                    photo=plot_data,
+                    caption="📈 Balance History"
+                )
+                if sent:
+                    return ""  # Empty string means don't send text message
+                else:
+                    return "❌ Failed to send plot image"
+
+            return "❌ Notifier not available"
+
+        except Exception as e:
+            return f"❌ Error generating plot: {str(e)}"
 
 
 def load_config() -> dict:
