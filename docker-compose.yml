@@ -27,7 +27,7 @@ services:
     volumes:
       - gateway-settings:/root/Jts
     healthcheck:
-      test: ["CMD-SHELL", "grep -q 'Login has completed' /root/Jts/*/launcher.log 2>/dev/null || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 4003 || nc -z localhost 4004"]
       interval: 10s
       timeout: 5s
       retries: 30
