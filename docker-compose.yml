@@ -9,13 +9,17 @@ services:
       - TRADING_MODE=live  # live or paper
       - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-changeme}
       - TIME_ZONE=America/Los_Angeles
+      - TZ=America/Los_Angeles
       - READ_ONLY_API=no
-      # Auto-restart without 2FA
-      - SAVE_AUTORESTART_FILE=yes  # Save session for restart without 2FA
-      - RELOGIN_AFTER_2FA_TIMEOUT=yes
+      # 2FA Configuration
+      - TWOFA_DEVICE=IB Key
       - TWOFA_TIMEOUT_ACTION=restart
-      # Keep gateway alive through disconnects
-      - EXISTINGSESSIONDETECTED=secondary  # Allow reconnect if session exists
+      - RELOGIN_AFTER_TWOFA_TIMEOUT=yes
+      - TWOFA_EXIT_INTERVAL=60
+      # Session handling
+      - EXISTING_SESSION_DETECTED_ACTION=primary
+      # Daily restart at 11:00 PM LA time
+      - AUTO_RESTART_TIME=23:00
     ports:
       - "127.0.0.1:4001:4003"  # Host 4001 → Container 4003 (live trading API)
       - "127.0.0.1:4002:4004"  # Host 4002 → Container 4004 (paper trading API)
@@ -23,13 +27,11 @@ services:
     volumes:
       - gateway-settings:/root/Jts
     healthcheck:
-      # CRITICAL: Check if IB Gateway has completed authentication
-      # Port opens BEFORE MFA completes, so we check logs instead
       test: ["CMD-SHELL", "grep -q 'Login has completed' /root/Jts/*/launcher.log 2>/dev/null || exit 1"]
-      interval: 10s      # Check every 10 seconds
-      timeout: 5s        # Fail if check takes >5s
-      retries: 30        # Try 30 times (5 minutes) before marking unhealthy
-      start_period: 180s # Allow 3 minutes for MFA approval before checking
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
 
 volumes:
   gateway-settings:
