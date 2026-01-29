@@ -241,7 +241,7 @@ class TradingOrchestrator:
 
             # Handle signal based on current position
             if event.event_type == EventType.NEW:
-                await self._handle_new_signal(event, current_side, current_qty, quantity)
+                await self._handle_new_signal(event, current_side, current_qty, current_avg, quantity)
 
             elif event.event_type == EventType.EXIT or event.event_type == EventType.CLOSE_ALL:
                 await self._handle_exit_signal(event, current_side, current_qty, current_avg)
@@ -256,7 +256,7 @@ class TradingOrchestrator:
             if self.notifier:
                 await self.notifier.send_message(f"❌ Error: {str(e)[:200]}")
 
-    async def _handle_new_signal(self, event: Event, current_side: str, current_qty: int, quantity: int):
+    async def _handle_new_signal(self, event: Event, current_side: str, current_qty: int, current_avg: float, quantity: int):
         """Handle NEW signal based on current position."""
         signal_side = event.position_side.value if event.position_side else None
 
@@ -279,9 +279,9 @@ class TradingOrchestrator:
 
         # Opposite side - flip position
         else:
-            print(f"\n→ FLIP: Closing {current_side} {current_qty}, then opening {signal_side}")
+            print(f"\n→ FLIP: Closing {current_side} {current_qty} @ ${current_avg:.2f}, then opening {signal_side}")
             # Close current position
-            closed = await self._execute_close(current_side, current_qty)
+            closed = await self._execute_close(current_side, current_qty, current_avg)
             if closed:
                 # Open new position
                 await self._execute_entry(event, signal_side, quantity)
@@ -306,8 +306,8 @@ class TradingOrchestrator:
                 )
             return
 
-        print(f"\n→ Closing {current_side} {current_qty} contracts")
-        await self._execute_close(current_side, current_qty)
+        print(f"\n→ Closing {current_side} {current_qty} contracts @ ${current_avg:.2f}")
+        await self._execute_close(current_side, current_qty, current_avg)
 
     async def _handle_add_signal(self, event: Event, current_side: str, current_qty: int, quantity: int):
         """Handle ADD signal based on current position."""
@@ -362,7 +362,7 @@ class TradingOrchestrator:
             if self.notifier:
                 await self.notifier.send_message(f"❌ Entry order timed out")
 
-    async def _execute_close(self, current_side: str, current_qty: int) -> bool:
+    async def _execute_close(self, current_side: str, current_qty: int, entry_price: float = 0.0) -> bool:
         """Execute close order. Returns True if successful."""
         if self.dry_run:
             print(f"  [DRY-RUN] Would close {current_side} {current_qty}")
@@ -384,8 +384,19 @@ class TradingOrchestrator:
         filled = await self.executor._wait_for_fill(trade, timeout=30)
 
         if filled:
-            price = trade.orderStatus.avgFillPrice
-            print(f"  ✓ Closed @ ${price:.2f}")
+            exit_price = trade.orderStatus.avgFillPrice
+
+            # Calculate P&L (MNQ = $2 per point)
+            pnl = None
+            if entry_price > 0:
+                if current_side == "LONG":
+                    pnl = (exit_price - entry_price) * current_qty * 2
+                else:  # SHORT
+                    pnl = (entry_price - exit_price) * current_qty * 2
+                pnl_str = f"${pnl:+,.2f}"
+                print(f"  ✓ Closed @ ${exit_price:.2f} | P&L: {pnl_str}")
+            else:
+                print(f"  ✓ Closed @ ${exit_price:.2f}")
 
             # Log balance after close
             balance = await self.executor.get_account_balance()
@@ -393,16 +404,18 @@ class TradingOrchestrator:
                 self.balance_logger.log_balance(
                     balance=balance,
                     side=current_side,
-                    exit_price=price
+                    exit_price=exit_price,
+                    pnl=pnl
                 )
 
             if self.notifier:
                 balance_str = f"\nBalance: ${balance:,.2f}" if balance else ""
+                pnl_line = f"\n<b>P&L: {pnl_str}</b>" if pnl is not None else ""
+                entry_line = f"\nEntry: ${entry_price:.2f}" if entry_price > 0 else ""
                 await self.notifier.send_message(
                     f"📤 <b>Position Closed</b>\n\n"
-                    f"MNQ {current_side}\n"
-                    f"Exit: ${price:.2f}\n"
-                    f"Qty: {current_qty}{balance_str}"
+                    f"MNQ {current_side} x{current_qty}{entry_line}\n"
+                    f"Exit: ${exit_price:.2f}{pnl_line}{balance_str}"
                 )
             return True
         else:
@@ -548,8 +561,8 @@ class TradingOrchestrator:
                         side, qty, avg = await self.executor.get_mnq_position()
 
                         if side != "FLAT" and qty > 0:
-                            print(f"Closing {side} {qty} contracts...")
-                            closed = await self._execute_close(side, qty)
+                            print(f"Closing {side} {qty} contracts @ ${avg:.2f}...")
+                            closed = await self._execute_close(side, qty, avg)
                             if closed:
                                 print("✓ Friday close complete")
                             else:
@@ -667,10 +680,10 @@ class TradingOrchestrator:
             if side == "FLAT" or qty == 0:
                 return "✅ No position to close"
 
-            # Use the working _execute_close method (which logs balance)
-            text = f"<b>🚨 Emergency Close</b>\n\nClosing {side} x{qty}...\n\n"
+            # Use the working _execute_close method (which logs balance and calculates P&L)
+            text = f"<b>🚨 Emergency Close</b>\n\nClosing {side} x{qty} @ ${avg_price:.2f}...\n\n"
 
-            closed = await self._execute_close(side, qty)
+            closed = await self._execute_close(side, qty, avg_price)
 
             if closed:
                 # Get and display final balance

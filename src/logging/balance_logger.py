@@ -108,8 +108,14 @@ class BalanceLogger:
         # Plot balance line
         ax.plot(timestamps, balances, 'b-', linewidth=2, marker='o', markersize=4)
 
-        # Fill under line with gradient effect
-        ax.fill_between(timestamps, balances, alpha=0.3)
+        # Set y-axis limits based on data range with padding
+        min_bal = min(balances)
+        max_bal = max(balances)
+        padding = (max_bal - min_bal) * 0.1 if max_bal != min_bal else max_bal * 0.05
+        ax.set_ylim(min_bal - padding, max_bal + padding)
+
+        # Fill under line with gradient effect (use min as baseline)
+        ax.fill_between(timestamps, balances, min_bal - padding, alpha=0.3)
 
         # Formatting
         ax.set_title('Account Balance Over Time (Pacific Time)', fontsize=14, fontweight='bold')
