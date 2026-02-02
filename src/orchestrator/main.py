@@ -6,7 +6,7 @@ TradingView webhook is the sole signal source.
 """
 
 import asyncio
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 from typing import Optional
 import pytz
 
@@ -21,8 +21,8 @@ from ..execution import ExecutionEngine
 from ib_insync import MarketOrder
 from ..tradingview_listener import TradingViewListener
 from ..models import Event, EventType
-from ..logging import init_logger, get_logger, DailySnapshotManager, init_balance_logger
-from ..notifications import init_notifier, get_notifier
+from ..logging import init_logger, DailySnapshotManager, init_balance_logger
+from ..notifications import init_notifier
 
 
 class TradingOrchestrator:
@@ -117,7 +117,7 @@ class TradingOrchestrator:
                 f"<b>Commands:</b>\n"
                 f"/status - Check positions\n"
                 f"/plot - Balance history chart\n"
-                f"/closeall - Emergency close\n"
+                f"/close - Emergency close\n"
                 f"/restartgw - Restart IB Gateway"
             )
             sent = await self.notifier.send_message(startup_msg)
@@ -129,7 +129,7 @@ class TradingOrchestrator:
             # Start Telegram command listener early (works even without IBKR)
             print("Starting Telegram command handler...")
             self.notifier.register_command_handler("status", self._handle_status_command)
-            self.notifier.register_command_handler("closeall", self._handle_closeall_command)
+            self.notifier.register_command_handler("close", self._handle_close_command)
             self.notifier.register_command_handler("restartgw", self._handle_restartgw_command)
             self.notifier.register_command_handler("plot", self._handle_plot_command)
             asyncio.create_task(self._telegram_polling_task())
@@ -287,23 +287,11 @@ class TradingOrchestrator:
                 await self._execute_entry(event, signal_side, quantity)
 
     async def _handle_exit_signal(self, event: Event, current_side: str, current_qty: int, current_avg: float):
-        """Handle EXIT signal based on current position."""
-        signal_side = event.position_side.value if event.position_side else None
-
+        """Handle EXIT signal - closes any existing position."""
         if current_side == "FLAT":
-            print(f"⚠️ No position to exit ({signal_side}_EXIT ignored)")
+            print(f"⚠️ EXIT ignored - no open position")
             if self.notifier:
-                await self.notifier.send_message(f"⚠️ {signal_side}_EXIT ignored - no open position")
-            return
-
-        # Only exit if signal side matches current position
-        # e.g., LONG_EXIT only closes LONG, not SHORT
-        if signal_side and current_side != signal_side:
-            print(f"⚠️ {signal_side}_EXIT ignored - current position is {current_side}")
-            if self.notifier:
-                await self.notifier.send_message(
-                    f"⚠️ {signal_side}_EXIT ignored - current position is {current_side}"
-                )
+                await self.notifier.send_message(f"⚠️ EXIT ignored - no open position")
             return
 
         print(f"\n→ Closing {current_side} {current_qty} contracts @ ${current_avg:.2f}")
@@ -665,8 +653,8 @@ class TradingOrchestrator:
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
-    async def _handle_closeall_command(self, cmd: dict) -> str:
-        """Handle /closeall command - emergency close all positions."""
+    async def _handle_close_command(self, cmd: dict) -> str:
+        """Handle /close command - emergency close position."""
         try:
             if self.dry_run:
                 return "❌ Cannot close positions in DRY-RUN mode"

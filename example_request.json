@@ -1,5 +1,5 @@
 {
     "secret": "your_webhook_secret_here",
-    "action": "LONG_NEW",
+    "action": "LONG",
     "ticker": "MNQ1!"
 }

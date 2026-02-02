@@ -521,13 +521,14 @@ class TelegramNotifier:
                                 msg_chat_id = str(message.get("chat", {}).get("id", ""))
 
                                 # Process commands - check chat_id if configured
-                                if text.startswith("/"):
+                                if text.startswith("/") and len(text) > 1:
                                     # If no chat_id configured, accept from any chat
                                     # Otherwise only accept from configured chat
                                     if not self.chat_id or msg_chat_id == str(self.chat_id):
+                                        parts = text.split()
                                         commands.append({
-                                            "command": text.split()[0][1:],  # Remove leading /
-                                            "args": text.split()[1:],
+                                            "command": parts[0][1:],  # Remove leading /
+                                            "args": parts[1:] if len(parts) > 1 else [],
                                             "message": message,
                                             "chat_id": msg_chat_id,
                                         })
@@ -573,7 +574,8 @@ class TelegramNotifier:
                     f"❓ Unknown command: /{command_name}\n\n"
                     f"<b>Available commands:</b>\n"
                     f"📊 /status - Check positions and account\n"
-                    f"🚨 /closeall - Emergency close all positions\n"
+                    f"📈 /plot - Balance history chart\n"
+                    f"🚨 /close - Emergency close position\n"
                     f"🔄 /restartgw - Restart IB Gateway container"
                 )
                 await self.send_message(help_text, chat_id=reply_chat_id)

@@ -78,15 +78,15 @@ class BalanceLogger:
 
     def generate_plot(self) -> Optional[bytes]:
         """
-        Generate a balance plot image in LA timezone.
+        Generate a balance plot image showing last 90 trades.
 
+        X-axis is trade number (evenly spaced), with timestamps as labels.
         Returns PNG image as bytes, or None if no data or matplotlib unavailable.
         """
         try:
             import matplotlib
             matplotlib.use('Agg')  # Non-interactive backend
             import matplotlib.pyplot as plt
-            import matplotlib.dates as mdates
             import pytz
         except ImportError:
             print("matplotlib not installed - cannot generate plot")
@@ -97,16 +97,22 @@ class BalanceLogger:
         if len(history) < 2:
             return None
 
+        # Limit to last 90 trades
+        history = history[-90:]
+
         # Convert timestamps to LA timezone
         la_tz = pytz.timezone('America/Los_Angeles')
         timestamps = [h['timestamp'].astimezone(la_tz) for h in history]
         balances = [h['balance'] for h in history]
 
-        # Create plot
-        fig, ax = plt.subplots(figsize=(10, 6))
+        # Use trade numbers for x-axis (evenly spaced)
+        trade_nums = list(range(1, len(balances) + 1))
 
-        # Plot balance line
-        ax.plot(timestamps, balances, 'b-', linewidth=2, marker='o', markersize=4)
+        # Create plot
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Plot balance line by trade number
+        ax.plot(trade_nums, balances, 'b-', linewidth=2, marker='o', markersize=4)
 
         # Set y-axis limits based on data range with padding
         min_bal = min(balances)
@@ -115,19 +121,30 @@ class BalanceLogger:
         ax.set_ylim(min_bal - padding, max_bal + padding)
 
         # Fill under line with gradient effect (use min as baseline)
-        ax.fill_between(timestamps, balances, min_bal - padding, alpha=0.3)
+        ax.fill_between(trade_nums, balances, min_bal - padding, alpha=0.3)
 
         # Formatting
-        ax.set_title('Account Balance Over Time (Pacific Time)', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Time (PT)', fontsize=12)
+        ax.set_title(f'Balance History (Last {len(balances)} Trades)', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Trade #', fontsize=12)
         ax.set_ylabel('Balance ($)', fontsize=12)
 
         # Format y-axis as currency
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
 
-        # Format x-axis dates in LA timezone
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M', tz=la_tz))
-        plt.xticks(rotation=45)
+        # Set x-axis ticks with time labels
+        # Show ~10 evenly spaced labels to avoid crowding
+        num_labels = min(10, len(trade_nums))
+        step = max(1, len(trade_nums) // num_labels)
+        tick_positions = trade_nums[::step]
+        tick_labels = [timestamps[i].strftime('%m/%d %H:%M') for i in range(0, len(timestamps), step)]
+
+        # Always include the last trade
+        if tick_positions[-1] != trade_nums[-1]:
+            tick_positions.append(trade_nums[-1])
+            tick_labels.append(timestamps[-1].strftime('%m/%d %H:%M'))
+
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=8)
 
         # Add grid
         ax.grid(True, alpha=0.3)

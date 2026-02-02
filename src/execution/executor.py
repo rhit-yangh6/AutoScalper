@@ -523,8 +523,7 @@ class ExecutionEngine:
                 if symbol == "MNQ" or (hasattr(pos.contract, 'localSymbol') and 'MNQ' in pos.contract.localSymbol):
                     qty = int(pos.position)
                     abs_qty = abs(qty)
-                    # avgCost is total cost, divide by quantity to get per-contract price
-                    # For MNQ, also need to account for multiplier (2)
+                    # avgCost is total cost, divide by quantity to get per-contract average price
                     avg_price_per_contract = pos.avgCost / abs_qty if abs_qty > 0 else 0.0
                     if qty > 0:
                         return ("LONG", abs_qty, avg_price_per_contract)

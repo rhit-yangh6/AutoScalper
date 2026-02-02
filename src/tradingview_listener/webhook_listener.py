@@ -31,17 +31,17 @@ class TradingViewListener:
     Expected TradingView Alert JSON format:
     {
         "secret": "your_webhook_secret",
-        "action": "LONG_NEW",      // LONG_NEW, LONG_EXIT, SHORT_NEW, SHORT_EXIT
+        "action": "LONG",          // LONG, SHORT, EXIT (case insensitive)
         "ticker": "MNQ1!"          // TradingView ticker (optional, default MNQ)
     }
 
     Actions:
-    - LONG_NEW: Open a long position
-    - LONG_EXIT: Close a long position
-    - SHORT_NEW: Open a short position
-    - SHORT_EXIT: Close a short position
+    - LONG: Open long position (closes short if exists)
+    - SHORT: Open short position (closes long if exists)
+    - EXIT: Close any existing position
 
     Notes:
+    - Actions are case insensitive
     - Accepts both 'symbol' and 'ticker' fields
     - Parses TradingView format (MNQ1! -> MNQ)
     """
@@ -84,7 +84,7 @@ class TradingViewListener:
         self.running = True
         print(f"✓ TradingView webhook listening on http://0.0.0.0:{self.port}/webhook")
         print(f"  Health check: http://0.0.0.0:{self.port}/health")
-        print(f"  Webhook secret configured: {self.webhook_secret[:8]}...")
+        print(f"  Webhook secret: {'configured' if self.webhook_secret else 'NOT SET'}")
 
     async def stop(self):
         """Stop the webhook server."""
@@ -173,7 +173,7 @@ class TradingViewListener:
         """
         Parse TradingView webhook payload into Event object.
 
-        Actions: LONG_NEW, LONG_EXIT, SHORT_NEW, SHORT_EXIT
+        Actions: LONG, SHORT, EXIT (case insensitive)
 
         Args:
             payload: JSON payload from TradingView
@@ -188,21 +188,21 @@ class TradingViewListener:
                 print(f"❌ Missing required field: action")
                 return None
 
-            action = action.upper()
+            action = action.upper().strip()
 
-            # Parse combined action (e.g., "LONG_NEW" -> side=LONG, type=NEW)
-            valid_actions = {
-                "LONG_NEW": (PositionSide.LONG, EventType.NEW),
-                "LONG_EXIT": (PositionSide.LONG, EventType.EXIT),
-                "SHORT_NEW": (PositionSide.SHORT, EventType.NEW),
-                "SHORT_EXIT": (PositionSide.SHORT, EventType.EXIT),
-            }
-
-            if action not in valid_actions:
-                print(f"❌ Invalid action: {action}. Must be LONG_NEW, LONG_EXIT, SHORT_NEW, or SHORT_EXIT")
+            # Parse action: LONG, SHORT, EXIT
+            if action == "LONG":
+                position_side = PositionSide.LONG
+                event_type = EventType.NEW
+            elif action == "SHORT":
+                position_side = PositionSide.SHORT
+                event_type = EventType.NEW
+            elif action == "EXIT":
+                position_side = None  # Close any position
+                event_type = EventType.EXIT
+            else:
+                print(f"❌ Invalid action: {action}. Must be LONG, SHORT, or EXIT")
                 return None
-
-            position_side, event_type = valid_actions[action]
 
             # Get symbol - accept both 'symbol' and 'ticker' fields
             # TradingView uses format like "MNQ1!" for continuous contract

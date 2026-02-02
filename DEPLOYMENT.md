@@ -284,8 +284,9 @@ docker inspect autoscalper | jq '.[0].State.Health'
 From Telegram, send:
 
 - `/status` - Account balance, positions, open orders
-- `/server` - Bot health, IBKR connection, system resources
-- `/closeall` - Emergency close all positions
+- `/plot` - Balance history chart
+- `/close` - Emergency close position
+- `/restartgw` - Restart IB Gateway container
 
 ### Application Logs
 
@@ -308,7 +309,7 @@ Before going live:
 - [ ] Telegram alerts enabled and tested
 - [ ] VNC access tested (port 5900)
 - [ ] IB Key approval process tested
-- [ ] Emergency `/closeall` command tested
+- [ ] Emergency `/close` command tested
 - [ ] Logs directory mounted and writable
 - [ ] Gateway settings volume persisted
 - [ ] Backup strategy for logs and settings
