@@ -284,8 +284,10 @@ docker inspect autoscalper | jq '.[0].State.Health'
 From Telegram, send:
 
 - `/status` - Account balance, positions, open orders
+- `/long` - Open long position (closes short if exists)
+- `/short` - Open short position (closes long if exists)
+- `/close` - Close any open position
 - `/plot` - Balance history chart
-- `/close` - Emergency close position
 - `/restartgw` - Restart IB Gateway container
 
 ### Application Logs

@@ -116,8 +116,10 @@ class TradingOrchestrator:
                 f"Webhook Port: {self.config['tradingview']['webhook_port']}\n\n"
                 f"<b>Commands:</b>\n"
                 f"/status - Check positions\n"
-                f"/plot - Balance history chart\n"
-                f"/close - Emergency close\n"
+                f"/long - Open long position\n"
+                f"/short - Open short position\n"
+                f"/close - Close position\n"
+                f"/plot - Balance chart\n"
                 f"/restartgw - Restart IB Gateway"
             )
             sent = await self.notifier.send_message(startup_msg)
@@ -129,6 +131,8 @@ class TradingOrchestrator:
             # Start Telegram command listener early (works even without IBKR)
             print("Starting Telegram command handler...")
             self.notifier.register_command_handler("status", self._handle_status_command)
+            self.notifier.register_command_handler("long", self._handle_long_command)
+            self.notifier.register_command_handler("short", self._handle_short_command)
             self.notifier.register_command_handler("close", self._handle_close_command)
             self.notifier.register_command_handler("restartgw", self._handle_restartgw_command)
             self.notifier.register_command_handler("plot", self._handle_plot_command)
@@ -653,8 +657,56 @@ class TradingOrchestrator:
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
+    async def _handle_long_command(self, cmd: dict) -> str:
+        """Handle /long command - open long position (same as LONG signal)."""
+        return await self._handle_direction_command("LONG")
+
+    async def _handle_short_command(self, cmd: dict) -> str:
+        """Handle /short command - open short position (same as SHORT signal)."""
+        return await self._handle_direction_command("SHORT")
+
+    async def _handle_direction_command(self, direction: str) -> str:
+        """Handle /long or /short command - opens position with direction checks."""
+        try:
+            if self.dry_run:
+                return f"❌ Cannot trade in DRY-RUN mode"
+
+            if not self.executor.connected:
+                return "❌ Not connected to IBKR"
+
+            # Get current position
+            current_side, current_qty, current_avg = await self.executor.get_mnq_position()
+
+            # Calculate position size
+            quantity = self.risk_gate.calculate_position_size(None, None)
+            if quantity == 0:
+                return "❌ Position size = 0 (insufficient margin)"
+
+            # Same logic as _handle_new_signal
+            if current_side == "FLAT":
+                # No position - open new
+                await self._execute_entry(None, direction, quantity)
+                return ""  # Notification sent by _execute_entry
+
+            elif current_side == direction:
+                # Already in same direction
+                return f"⚠️ Already {current_side} {current_qty} contracts"
+
+            else:
+                # Opposite direction - flip (close then open)
+                print(f"\n→ FLIP: Closing {current_side} {current_qty} @ ${current_avg:.2f}, then opening {direction}")
+                closed = await self._execute_close(current_side, current_qty, current_avg)
+                if closed:
+                    await self._execute_entry(None, direction, quantity)
+                return ""  # Notifications sent by execute methods
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"❌ Error: {str(e)}"
+
     async def _handle_close_command(self, cmd: dict) -> str:
-        """Handle /close command - emergency close position."""
+        """Handle /close command - close position."""
         try:
             if self.dry_run:
                 return "❌ Cannot close positions in DRY-RUN mode"

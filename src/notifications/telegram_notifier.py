@@ -574,8 +574,10 @@ class TelegramNotifier:
                     f"❓ Unknown command: /{command_name}\n\n"
                     f"<b>Available commands:</b>\n"
                     f"📊 /status - Check positions and account\n"
-                    f"📈 /plot - Balance history chart\n"
-                    f"🚨 /close - Emergency close position\n"
+                    f"📈 /long - Open long position\n"
+                    f"📉 /short - Open short position\n"
+                    f"🚨 /close - Close position\n"
+                    f"📊 /plot - Balance history chart\n"
                     f"🔄 /restartgw - Restart IB Gateway container"
                 )
                 await self.send_message(help_text, chat_id=reply_chat_id)
